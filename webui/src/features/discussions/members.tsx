@@ -1,7 +1,9 @@
+import { Bot, User, Users } from "lucide-react";
 import { useId, useState } from "react";
 import { useOrganization } from "@/app/organization";
 import { Modal } from "@/components/ui/dialog";
 import { Avatar, Button, Chip, Input, toast } from "@/components/ui/index";
+import { StatePanel } from "@/components/ui/state-panel";
 import { backend, type Member } from "@/lib/backend";
 
 export function MemberPicker({
@@ -25,7 +27,14 @@ export function MemberPicker({
       <legend className="p-0 text-xs font-medium text-fg-muted">Members</legend>
       <ul className="flex max-h-[220px] flex-col overflow-y-auto rounded-sm border border-line bg-app">
         {members.length === 0 ? (
-          <li className="p-3 text-xs text-fg-muted">No other Members</li>
+          <li>
+            <StatePanel
+              compact
+              icons={[User, Users, Bot]}
+              title="No other Members"
+              description="Add an Agent from Members to start a Discussion."
+            />
+          </li>
         ) : null}
         {members.map((member) => (
           <li key={member.id}>

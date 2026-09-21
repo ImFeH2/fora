@@ -7,6 +7,8 @@ import {
   SquarePen,
   Trash2,
   User,
+  Users,
+  X,
 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useOrganization } from "@/app/organization";
@@ -26,7 +28,6 @@ import {
   Button,
   Chip,
   CountPill,
-  EmptyState,
   Meter,
   SearchField,
   StateDot,
@@ -34,6 +35,7 @@ import {
 } from "@/components/ui/index";
 import { type MenuAction, OverflowMenu } from "@/components/ui/menu";
 import { Segmented } from "@/components/ui/segmented";
+import { StatePanel } from "@/components/ui/state-panel";
 import { agentStateLabel, canResume } from "@/features/members/state";
 import { AgentCreateDialog } from "@/features/settings/model";
 import { backend, type Member } from "@/lib/backend";
@@ -109,6 +111,10 @@ export function MembersPage({ tokenLimit }: { tokenLimit: number | null }) {
       return !needle || member.name.toLowerCase().includes(needle);
     });
   }, [members, query, filter]);
+  const noAgents =
+    filter === "agents" &&
+    !query.trim() &&
+    !members.some((member) => member.type === "agent");
 
   return (
     <Page>
@@ -139,7 +145,31 @@ export function MembersPage({ tokenLimit }: { tokenLimit: number | null }) {
       <PageBody>
         <CountPill>{plural(shown.length, COUNTED[filter])}</CountPill>
         {shown.length === 0 ? (
-          <EmptyState title="No Members match" />
+          <StatePanel
+            icons={noAgents ? [User, Bot, Users] : [User, Search, Users]}
+            title={noAgents ? "No Agents yet" : "No Members match"}
+            description={
+              noAgents
+                ? "Create an Agent to join your organization."
+                : "Try a different name or clear the filters to see all Members."
+            }
+            action={
+              noAgents
+                ? {
+                    label: "New Agent",
+                    icon: <Plus size={16} />,
+                    onClick: () => setCreating(true),
+                  }
+                : {
+                    label: "Clear filters",
+                    icon: <X size={16} />,
+                    onClick: () => {
+                      setQuery("");
+                      setFilter("all");
+                    },
+                  }
+            }
+          />
         ) : (
           <Table columns={COLUMNS} label="Members">
             {shown.map((member) => (

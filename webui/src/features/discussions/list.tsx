@@ -1,9 +1,12 @@
 import {
   Archive,
   ArchiveRestore,
+  MessageCircle,
   MessageSquare,
+  MessagesSquare,
   Plus,
   Search,
+  X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useOrganization } from "@/app/organization";
@@ -23,12 +26,12 @@ import {
   Chip,
   CountPill,
   Dot,
-  EmptyState,
   IconButton,
   SearchField,
   StatusText,
 } from "@/components/ui/index";
 import { OverflowMenu } from "@/components/ui/menu";
+import { StatePanel } from "@/components/ui/state-panel";
 import { CreateDiscussionDialog } from "@/features/discussions/create";
 import {
   backend,
@@ -87,7 +90,11 @@ export function DiscussionsPage() {
   const navigate = useNavigate();
   const [list, setList] = useState<DiscussionSummary[] | null>(null);
   const [query, setQuery] = useState("");
-  const [results, setResults] = useState<FoundMessage[] | null>(null);
+  const [search, setSearch] = useState<{
+    query: string;
+    items: FoundMessage[];
+  } | null>(null);
+  const results = search?.query === query.trim() ? search.items : null;
   const [archived, setArchived] = useState(false);
   const [creating, setCreating] = useState(false);
   const [connectionRevision, setConnectionRevision] = useState(0);
@@ -124,7 +131,7 @@ export function DiscussionsPage() {
   useEffect(() => {
     const text = query.trim();
     if (!text) {
-      setResults(null);
+      setSearch(null);
       return;
     }
     let live = true;
@@ -132,7 +139,7 @@ export function DiscussionsPage() {
       void backend
         .searchMessages(text)
         .then((found) => {
-          if (live) setResults(found);
+          if (live) setSearch({ query: text, items: found });
         })
         .catch(backend.reportFailure);
     }, 120);
@@ -150,7 +157,7 @@ export function DiscussionsPage() {
   const topicOf = (id: number) =>
     list?.find((item) => item.id === id)?.topic ?? `Discussion ${id}`;
 
-  const searching = results !== null;
+  const searching = query.trim().length > 0;
 
   return (
     <Page>
@@ -180,17 +187,26 @@ export function DiscussionsPage() {
         </IconButton>
       </Toolbar>
       <PageBody>
-        {searching || list ? (
+        {(searching ? results !== null : list !== null) ? (
           <CountPill>
-            {searching
+            {results
               ? plural(results.length, "result")
               : plural(list?.length ?? 0, "Discussion")}
           </CountPill>
         ) : null}
 
         {searching ? (
-          results.length === 0 ? (
-            <EmptyState title="No messages match" />
+          results === null ? null : results.length === 0 ? (
+            <StatePanel
+              icons={[MessageCircle, Search, MessagesSquare]}
+              title="No messages match"
+              description="Try a different search or clear it to see your Discussions."
+              action={{
+                label: "Clear search",
+                icon: <X size={16} />,
+                onClick: () => setQuery(""),
+              }}
+            />
           ) : (
             <Table columns={RESULT_COLUMNS} label="Search results">
               {results.map((result) => (
@@ -227,14 +243,15 @@ export function DiscussionsPage() {
             </Table>
           )
         ) : list === null ? null : list.length === 0 ? (
-          <EmptyState
+          <StatePanel
+            icons={[MessageCircle, MessagesSquare, MessageSquare]}
             title="No Discussions yet"
-            action={
-              <Button variant="primary" onClick={() => setCreating(true)}>
-                <Plus size={16} />
-                New Discussion
-              </Button>
-            }
+            description="Create a Discussion to bring Members together."
+            action={{
+              label: "New Discussion",
+              icon: <Plus size={16} />,
+              onClick: () => setCreating(true),
+            }}
           />
         ) : (
           <Table columns={LIST_COLUMNS} label="Discussions">

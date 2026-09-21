@@ -28,6 +28,7 @@ import {
   StatusText,
 } from "@/components/ui/index";
 import { OverflowMenu } from "@/components/ui/menu";
+import { StatePanel } from "@/components/ui/state-panel";
 import { Tooltip } from "@/components/ui/tooltip";
 import { TreeView } from "@/features/library/tree-view";
 import { agentStateLabel, canResume } from "@/features/members/state";
@@ -222,7 +223,12 @@ function AgentPage({
 
             <Section title="Recent Turns">
               {detail.runs.length === 0 ? (
-                <p className="text-fg-muted">No Turns yet</p>
+                <StatePanel
+                  compact
+                  icons={[Terminal, Play, Gauge]}
+                  title="No Turns yet"
+                  description="This Agent's Turns will appear here."
+                />
               ) : (
                 <ul className="flex flex-col gap-2">
                   {detail.runs.slice(0, 10).map((run) => (
@@ -332,7 +338,12 @@ export function WorkspaceSection({
   return (
     <Section title="Workspace">
       {entries.length === 0 ? (
-        <p className="text-fg-muted">No Workspace files</p>
+        <StatePanel
+          compact
+          icons={[PencilLine, FileText, Terminal]}
+          title="No Workspace files"
+          description="Files created by this Agent will appear here."
+        />
       ) : (
         <TreeView
           entries={entries}
@@ -426,7 +437,9 @@ function TurnCard({ run }: { run: AgentRun }) {
         </StatusText>
         <span className="flex-1 min-w-0 truncate text-xs text-fg-muted">
           {run.effects.length === 0 ? (
-            <span className="text-warning">Produced nothing</span>
+            <span className="text-warning">
+              {run.status === "running" ? "No effects yet" : "Produced nothing"}
+            </span>
           ) : (
             `${plural(run.effects.length, "effect")} · ${tools.join(", ")}`
           )}
@@ -449,7 +462,15 @@ function TurnCard({ run }: { run: AgentRun }) {
             </p>
           ) : null}
           {run.effects.length === 0 ? (
-            <p className="text-fg-muted">Nothing produced.</p>
+            <StatePanel
+              compact
+              icons={[Terminal, Gauge, FileText]}
+              title={
+                run.status === "running"
+                  ? "No effects yet"
+                  : "Nothing produced."
+              }
+            />
           ) : (
             <ul className="flex flex-col gap-1 -ml-1 border-l border-line pl-4">
               {run.effects.map((effect) => (

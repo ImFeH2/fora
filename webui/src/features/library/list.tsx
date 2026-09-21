@@ -1,4 +1,13 @@
-import { FolderPlus, Plus, Search, SquarePen, Trash2 } from "lucide-react";
+import {
+  File,
+  FileText,
+  FolderPlus,
+  Plus,
+  Search,
+  SquarePen,
+  Trash2,
+  X,
+} from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "@/app/router";
 import { Page, PageBody, PageHeader, Toolbar } from "@/components/layout/shell";
@@ -7,11 +16,11 @@ import {
   Button,
   CountPill,
   dismissToast,
-  EmptyState,
   IconButton,
   SearchField,
 } from "@/components/ui/index";
 import type { MenuAction } from "@/components/ui/menu";
+import { StatePanel } from "@/components/ui/state-panel";
 import { expandedFolders } from "@/features/library/tree";
 import { TreeView, type TreeViewProps } from "@/features/library/tree-view";
 import { reportLoadFailure } from "@/features/settings/saver";
@@ -148,10 +157,12 @@ function CreateActions({
 
 export function LibraryContents({
   onCreate,
+  onClearQuery,
   disabled = false,
   ...tree
 }: TreeViewProps & {
   onCreate: (creation: Creation) => void;
+  onClearQuery?: () => void;
   disabled?: boolean;
 }) {
   const needle = tree.query?.trim().toLowerCase() ?? "";
@@ -164,16 +175,43 @@ export function LibraryContents({
     <>
       <CountPill>{plural(count, "document")}</CountPill>
       {empty || (needle && count === 0) ? (
-        <EmptyState
-          title={empty ? "The Library is empty" : "No documents match"}
-          action={
-            empty ? (
-              <div className="flex items-center gap-2">
-                <CreateActions onCreate={onCreate} disabled={disabled} />
-              </div>
-            ) : undefined
-          }
-        />
+        disabled ? null : (
+          <StatePanel
+            icons={
+              needle ? [FileText, Search, File] : [File, FileText, FolderPlus]
+            }
+            title={needle ? "No documents match" : "The Library is empty"}
+            description={
+              needle
+                ? "Try a different name or clear the search to see the Library."
+                : "Create a document or folder to share information with Members."
+            }
+            action={
+              needle
+                ? onClearQuery
+                  ? {
+                      label: "Clear search",
+                      icon: <X size={16} />,
+                      onClick: onClearQuery,
+                    }
+                  : undefined
+                : {
+                    label: "New document",
+                    icon: <Plus size={16} />,
+                    onClick: () => onCreate({ kind: "file", parent: "" }),
+                  }
+            }
+            secondaryAction={
+              needle
+                ? undefined
+                : {
+                    label: "New folder",
+                    icon: <FolderPlus size={16} />,
+                    onClick: () => onCreate({ kind: "directory", parent: "" }),
+                  }
+            }
+          />
+        )
       ) : (
         <TreeView {...tree} />
       )}
@@ -257,6 +295,7 @@ export function LibraryPage({ path }: { path?: string }) {
             }
             onOpen={(file) => navigate({ name: "document", path: file })}
             onCreate={setCreating}
+            onClearQuery={() => setQuery("")}
             rowActions={(entry) =>
               libraryActions(entry, {
                 rename: setRenaming,

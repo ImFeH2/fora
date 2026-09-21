@@ -46,7 +46,12 @@ const entries: LibraryEntry[] = [
 
 const handlers = () => ({ create: vi.fn(), rename: vi.fn(), remove: vi.fn() });
 
-function render(expanded: string[] = [], query = "", data = entries) {
+function render(
+  expanded: string[] = [],
+  query = "",
+  data = entries,
+  disabled = false,
+) {
   return renderToStaticMarkup(
     <TooltipProvider>
       <LibraryContents
@@ -56,6 +61,8 @@ function render(expanded: string[] = [], query = "", data = entries) {
         onToggle={() => {}}
         onOpen={() => {}}
         onCreate={() => {}}
+        onClearQuery={() => {}}
+        disabled={disabled}
         rowActions={(entry) => libraryActions(entry, handlers())}
       />
     </TooltipProvider>,
@@ -115,10 +122,20 @@ describe("Library tree", () => {
     const html = render([], "", []);
     expect(html).toContain("The Library is empty");
     expect(html).toContain("New document");
-    expect(html).toContain('aria-label="New folder"');
+    expect(html).toContain("<span>New folder</span>");
     const filtered = render([], "nothing-matches");
     expect(filtered).toContain("No documents match");
     expect(filtered).not.toContain("New document");
+    expect(filtered).toContain("<span>Clear search</span>");
+  });
+
+  it("suppresses empty results when Library loading has failed", () => {
+    const empty = render([], "", [], true);
+    expect(empty).not.toContain("The Library is empty");
+    expect(empty).not.toContain("New document");
+    const filtered = render([], "nothing-matches", entries, true);
+    expect(filtered).not.toContain("No documents match");
+    expect(filtered).not.toContain("Clear search");
   });
 
   it("does not treat a Library containing only empty folders as empty", () => {

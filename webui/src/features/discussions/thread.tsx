@@ -1,6 +1,14 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { clsx } from "clsx";
-import { Archive, ArchiveRestore, Check, Users } from "lucide-react";
+import {
+  Archive,
+  ArchiveRestore,
+  Check,
+  MessageCircle,
+  MessagesSquare,
+  Send,
+  Users,
+} from "lucide-react";
 import {
   useCallback,
   useEffect,
@@ -17,10 +25,10 @@ import {
   AvatarStack,
   Button,
   Chip,
-  EmptyState,
   toast,
 } from "@/components/ui/index";
 import { OverflowMenu } from "@/components/ui/menu";
+import { StatePanel } from "@/components/ui/state-panel";
 import { Tooltip } from "@/components/ui/tooltip";
 import { Composer } from "@/features/discussions/composer";
 import { DiscussionMembersDialog } from "@/features/discussions/members";
@@ -409,10 +417,38 @@ function ThreadSession({ id }: { id: number }) {
             onPointerDown={stopPositioning}
             aria-busy={thread.loading}
           >
-            {detail && messages.length === 0 ? (
-              <EmptyState title="No messages yet" />
+            {detail &&
+            messages.length === 0 &&
+            !thread.loading &&
+            !loadFailed ? (
+              <div
+                className="flex min-h-full flex-col"
+                style={{ paddingBottom: composerSize + 40 }}
+              >
+                <StatePanel
+                  icons={[MessageCircle, MessagesSquare, Send]}
+                  title="No messages yet"
+                  description="Write the first message to start this Discussion."
+                  action={{
+                    label: "Write a message",
+                    icon: <Send size={16} />,
+                    onClick: () => {
+                      const input =
+                        scroll.current?.parentElement?.querySelector<HTMLTextAreaElement>(
+                          'textarea[aria-label="Message"]',
+                        );
+                      if (!input) throw new Error("Message input is missing");
+                      input.focus();
+                    },
+                  }}
+                />
+              </div>
             ) : null}
-            <ol className="relative" style={{ height: virtual.getTotalSize() }}>
+            <ol
+              className="relative"
+              hidden={messages.length === 0}
+              style={{ height: virtual.getTotalSize() }}
+            >
               {items.map((item) => {
                 const message = messages[item.index];
                 const previousSender =
