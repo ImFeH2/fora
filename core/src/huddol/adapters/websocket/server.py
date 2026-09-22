@@ -272,7 +272,12 @@ class WebServer:
     ) -> web.StreamResponse:
         origin = request.headers.get("Origin")
         if origin is not None and origin not in self._origins:
-            raise web.HTTPForbidden(text="Origin not allowed")
+            if (
+                request.path != "/ws"
+                or request.headers.get("Upgrade", "").lower() == "websocket"
+            ):
+                raise web.HTTPForbidden(text="Origin not allowed")
+            origin = None
         try:
             if request.method == "OPTIONS":
                 response: web.StreamResponse = web.Response(status=204)

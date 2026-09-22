@@ -40,6 +40,80 @@ from huddol.core.errors import DomainError
 from huddol.services.uploads import Uploads
 
 
+@pytest.mark.parametrize("reject", [False, True])
+def test_attachment_and_model_settings_share_outer_transaction(
+    tmp_path: Path, reject: bool
+) -> None:
+    store = SqliteStore(tmp_path / "transaction.sqlite3")
+    try:
+        human = store.create_member("human", "You")
+        reader = store.create_member("agent", "Reader")
+        room = store.create_discussion("Files", [human.id, reader.id])
+        settings = SqliteAgentStore(store._db)
+        settings.set_settings("model", {"agent_configs": {}})
+        uploads = Uploads(store, DirectoryUploads(tmp_path / "uploads"))
+        data = (Path(__file__).parents[2] / "app/icons/icon.ico").read_bytes()
+        upload = uploads.create(
+            room.id, human.id, str(uuid.uuid4()), "icon.ico", len(data), "image/x-icon"
+        )
+        active, target = uploads.begin(upload.id, human.id)
+        with target:
+            target.write(data)
+        uploads.complete(active)
+        uploads.end(active)
+        receipt = str(uuid.uuid4())
+
+        def transaction() -> None:
+            with store._db:
+                agent = store.create_member("agent", "Created")
+                settings.set_settings(
+                    "model", {"agent_configs": {str(agent.id): {"thinking": None}}}
+                )
+                message, _, _ = store.submit_message(
+                    room.id,
+                    human.id,
+                    "@Reader",
+                    attachment_ids=[upload.id],
+                    client_message_id=receipt,
+                )
+                store.mark_read(room.id, reader.id, message.id)
+                store.discussion_page(room.id, reader.id, limit=50)
+                if reject:
+                    raise ValueError("Reject outer transaction")
+
+        if reject:
+            with pytest.raises(ValueError, match="Reject outer transaction"):
+                transaction()
+            assert store.message_count(room.id) == 0
+            assert store.pending(reader.id) == ()
+            assert store.watermark(room.id, reader.id) == 0
+            assert store.message_receipt(room.id, human.id, receipt) is None
+            assert uploads.status(upload.id, human.id).state == "ready"
+            assert settings.get_settings("model") == {"agent_configs": {}}
+            assert len(store.list_members()) == 2
+        else:
+            transaction()
+            message = store.messages(room.id)[0]
+            repeated, _, created = store.submit_message(
+                room.id,
+                human.id,
+                "@Reader",
+                attachment_ids=[upload.id],
+                client_message_id=receipt,
+            )
+            assert repeated.id == message.id and not created
+            assert len(store.pending(reader.id)) == 1
+            assert store.watermark(room.id, reader.id) == message.id
+            assert uploads.status(upload.id, human.id).state == "attached"
+            assert settings.get_settings("model")["agent_configs"]
+            assert len(store.list_members()) == 3
+            assert (
+                len(store.discussion_page(room.id, reader.id, limit=50).messages) == 1
+            )
+    finally:
+        store.close()
+
+
 def test_real_upload_transaction_and_restart(tmp_path: Path) -> None:
     source = Path(__file__).parents[2] / "app/icons/icon.ico"
     image_path = tmp_path / "picture.png"
@@ -247,7 +321,7 @@ def test_http_websocket_diagnosis() -> None:
                 params={"token": token},
                 headers={"Origin": "https://untrusted.example"},
             )
-            assert response.status_code == 403
+            assert response.status_code == 204
             assert "Access-Control-Allow-Origin" not in response.headers
     finally:
         server.stop()

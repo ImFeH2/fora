@@ -43,7 +43,13 @@ function deferred<T>() {
   });
   return { promise, resolve, reject };
 }
-const organization = { id: 1, members: [], human_id: 1, token_limit: 10 };
+const organization = {
+  id: 1,
+  uuid: "test-organization",
+  members: [],
+  human_id: 1,
+  token_limit: 10,
+};
 let events: Set<(event: BackendEvent) => void>;
 let failures: Set<(error: BackendError) => void>;
 let cleanup: (() => void)[];

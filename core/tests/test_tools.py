@@ -1511,9 +1511,9 @@ def test_attachment_tools_check_membership_and_preserve_original(
     assert agent.read_discussion(room)["messages"][0]["attachments"][0] == description
 
 
-@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("failure", [None, "model", "persistence"])
 def test_runner_persists_attachment_results_on_success_and_failure(
-    world, tmp_path, monkeypatch, fail
+    world, tmp_path, monkeypatch, failure
 ) -> None:
     import uuid
     from dataclasses import replace
@@ -1532,6 +1532,7 @@ def test_runner_persists_attachment_results_on_success_and_failure(
 
     from huddol.adapters.files.uploads import DirectoryUploads
     from huddol.adapters.model.runner import PydanticModelRunner
+    from huddol.runtime.reminder import HistoryPersistenceError
     from huddol.services.uploads import Uploads
 
     monkeypatch.setattr(models, "ALLOW_MODEL_REQUESTS", False)
@@ -1558,6 +1559,12 @@ def test_runner_persists_attachment_results_on_success_and_failure(
     snapshots = []
 
     def persist(raw):
+        if failure == "persistence" and any(
+            isinstance(part.content, list)
+            and any(isinstance(item, BinaryContent) for item in part.content)
+            for part in image_parts(ModelMessagesTypeAdapter.validate_json(raw))
+        ):
+            raise OSError("Image history could not be saved")
         world.history.save_progress(MAIN, run.sequence, raw)
         snapshots.append(raw)
 
@@ -1602,24 +1609,37 @@ def test_runner_persists_attachment_results_on_success_and_failure(
                     )
                 ]
             )
-        if fail:
+        if failure == "model":
             raise RuntimeError("Local test failure after image result")
         return ModelResponse(parts=[TextPart("Image received")])
 
     runner = PydanticModelRunner(
         settings, build_model=lambda config: FunctionModel(respond)
     )
-    outcome = runner.run(
-        replace(request(), sequence=run.sequence, persist=persist), agent
-    )
-    assert (outcome.error is not None) == fail
+    run_request = replace(request(), sequence=run.sequence, persist=persist)
+    if failure == "persistence":
+        with pytest.raises(HistoryPersistenceError) as rejected:
+            runner.run(run_request, agent)
+        assert isinstance(rejected.value.__cause__, OSError)
+        assert str(rejected.value.__cause__) == "Image history could not be saved"
+        assert calls == 2
+        assert world.history.latest_messages(MAIN) == snapshots[-1]
+        assert all(
+            isinstance(part.content, str)
+            for part in image_parts(
+                ModelMessagesTypeAdapter.validate_json(snapshots[-1])
+            )
+        )
+        return
+    outcome = runner.run(run_request, agent)
+    assert (outcome.error is not None) == (failure == "model")
     assert any(
         image_parts(ModelMessagesTypeAdapter.validate_json(raw)) for raw in snapshots
     )
     world.history.finish_run(
         MAIN,
         run.sequence,
-        status="failed" if fail else "completed",
+        status="failed" if failure == "model" else "completed",
         messages_json=outcome.messages_json,
         error=outcome.error,
     )
