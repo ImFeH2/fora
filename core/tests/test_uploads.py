@@ -36,9 +36,375 @@ from huddol.adapters.jsonl.protocol import Dispatcher
 from huddol.adapters.model.runner import attachment_result
 from huddol.adapters.sqlite.agent import SqliteAgentStore
 from huddol.adapters.sqlite.store import SqliteStore
-from huddol.adapters.websocket.server import WebServer, resource
+from huddol.adapters.websocket.server import ControlOutbox, WebServer, resource
 from huddol.core.errors import DomainError
 from huddol.services.uploads import Uploads
+
+
+@pytest.mark.parametrize(
+    "phase", ["waiting", "encoding", "conversion", "queued", "sending"]
+)
+def test_control_outbox_close_ownership(phase: str, monkeypatch) -> None:
+    import weakref
+
+    from huddol.adapters.websocket import server
+
+    entered = threading.Event()
+    proceed = threading.Event()
+    original = server.encode
+    references = []
+
+    class Payload(dict):
+        pass
+
+    class Encoded(str):
+        def encode(self, encoding="utf-8", errors="strict"):
+            data = super().encode(encoding, errors)
+            entered.set()
+            assert proceed.wait(5)
+            return data
+
+    def encode(payload):
+        if phase == "encoding":
+            entered.set()
+            assert proceed.wait(5)
+        text = original(payload)
+        return Encoded(text) if phase == "conversion" else text
+
+    monkeypatch.setattr(server, "encode", encode)
+
+    async def exercise():
+        outbox = ControlOutbox()
+        if phase == "waiting":
+            outbox.encoder.acquire()
+
+        def produce():
+            payload = Payload(type="event", text="x" * 1000)
+            references.append(weakref.ref(payload))
+            outbox.broadcast(payload)
+
+        producer = asyncio.create_task(asyncio.to_thread(produce))
+        if phase in ("encoding", "conversion"):
+            assert await asyncio.to_thread(entered.wait, 5)
+        elif phase == "waiting":
+            async with asyncio.timeout(5):
+                while outbox.frames != 1:
+                    await asyncio.sleep(0.001)
+        else:
+            await producer
+        assert outbox.frames == 1 and outbox.used > 0
+        frame = await outbox.take() if phase == "sending" else None
+        outbox.close()
+        if phase in ("waiting", "encoding", "conversion", "sending"):
+            assert outbox.frames == 1 and outbox.used > 0
+        else:
+            assert outbox.frames == outbox.used == 0
+        if phase == "waiting":
+            outbox.encoder.release()
+        proceed.set()
+        await producer
+        if frame is not None:
+            frame.text = ""
+            outbox.release(frame)
+        await asyncio.to_thread(outbox.wait_producers)
+        assert outbox.frames == outbox.used == outbox.producers == 0
+        assert not outbox.items
+        assert all(reference() is None for reference in references)
+
+    asyncio.run(exercise())
+
+
+def test_control_slow_connection_isolated(monkeypatch) -> None:
+    import weakref
+
+    from aiohttp import ClientSession, WSMsgType
+
+    from huddol.adapters.websocket import server as module
+
+    references = []
+    original = module.OutgoingFrame
+
+    def frame(text, cost, completion):
+        value = original(text, cost, completion)
+        references.append(weakref.ref(value))
+        return value
+
+    monkeypatch.setattr(module, "OutgoingFrame", frame)
+    outboxes = []
+
+    def outbox():
+        value = ControlOutbox()
+        outboxes.append(value)
+        return value
+
+    monkeypatch.setattr(module, "ControlOutbox", outbox)
+    dispatcher = Dispatcher()
+    dispatcher.register("large", lambda params: "x" * (32 * 1024 * 1024))
+    server = WebServer(dispatcher, "test-token", None, port=0)
+    server.start()
+
+    async def exercise():
+        address = f"http://127.0.0.1:{server.port}/ws?token=test-token"
+        async with (
+            ClientSession() as session,
+            session.ws_connect(address, max_msg_size=0) as slow,
+            session.ws_connect(address) as normal,
+        ):
+            transport = slow._response.connection.transport
+            transport.pause_reading()
+            try:
+                await slow.send_json({"id": 1, "method": "large"})
+                await asyncio.sleep(0.3)
+                for index in range(300):
+                    await asyncio.to_thread(dispatcher.emit, "event", {"id": index})
+                    await asyncio.sleep(0.002)
+                await normal.send_json({"id": 2, "method": "ping"})
+                async with asyncio.timeout(10):
+                    while True:
+                        message = await normal.receive()
+                        assert message.type == WSMsgType.TEXT
+                        frame = json.loads(message.data)
+                        if frame.get("type") == "response":
+                            assert frame == {
+                                "type": "response",
+                                "id": 2,
+                                "result": {"pong": None},
+                            }
+                            break
+                    while len(server._handlers) != 1:
+                        await asyncio.sleep(0.01)
+                assert len(dispatcher._sinks) == 1
+            finally:
+                transport.abort()
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        server.stop()
+    assert not server._handlers and not dispatcher._sinks
+    assert references and all(reference() is None for reference in references)
+    assert len(outboxes) == 2
+    for value in outboxes:
+        assert value.frames == value.used == value.producers == 0
+        assert not value.responses and not value.items
+
+
+def test_control_heartbeat_during_large_response_and_worker() -> None:
+    from aiohttp import ClientSession, WSMsgType
+
+    dispatcher = Dispatcher()
+    dispatcher.register("large", lambda params: "x" * (32 * 1024 * 1024))
+
+    def delayed(params):
+        time.sleep(45)
+        return {"finished": True}
+
+    dispatcher.register("delayed", delayed)
+    server = WebServer(dispatcher, "test-token", None, port=0)
+    server.start()
+    address = f"http://127.0.0.1:{server.port}/ws?token=test-token"
+
+    async def large(session):
+        async with session.ws_connect(address, max_msg_size=0) as connection:
+            transport = connection._response.connection.transport
+            transport.pause_reading()
+            await connection.send_json({"id": 1, "method": "large"})
+            for _ in range(9):
+                await asyncio.sleep(5)
+                await connection.pong()
+            transport.resume_reading()
+            message = await connection.receive()
+            assert message.type == WSMsgType.TEXT
+            assert len(json.loads(message.data)["result"]) == 32 * 1024 * 1024
+
+    async def long_worker(session):
+        async with session.ws_connect(address) as connection:
+            await connection.send_json({"id": 2, "method": "delayed"})
+            message = await connection.receive()
+            assert message.type == WSMsgType.TEXT
+            assert json.loads(message.data)["result"] == {"finished": True}
+
+    async def missing_pong(session):
+        async with session.ws_connect(address, autoping=False) as connection:
+            started = time.monotonic()
+            message = await connection.receive()
+            assert message.type == WSMsgType.PING
+            message = await connection.receive()
+            assert message.type in (WSMsgType.CLOSED, WSMsgType.CLOSE, WSMsgType.ERROR)
+            assert 29 <= time.monotonic() - started < 36
+
+    async def exercise():
+        async with ClientSession() as session, asyncio.timeout(55):
+            await asyncio.gather(
+                large(session), long_worker(session), missing_pong(session)
+            )
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize("mode", ["worker", "sending"])
+def test_control_owner_cancellation(mode: str, monkeypatch) -> None:
+    import weakref
+
+    from aiohttp import ClientSession
+
+    from huddol.adapters.websocket import server as module
+
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    propagated = threading.Event()
+    observed = threading.Event()
+    outboxes = []
+    references = []
+    state = {}
+    original_control = WebServer._control
+    original_frame = module.OutgoingFrame
+
+    def outbox():
+        value = ControlOutbox()
+        outboxes.append(value)
+        return value
+
+    def frame(text, cost, completion):
+        value = original_frame(text, cost, completion)
+        references.append(weakref.ref(value))
+        return value
+
+    async def control(self, connection):
+        state["transport"] = self._control_transports[connection]
+        task = asyncio.create_task(original_control(self, connection))
+        state["task"] = task
+        try:
+            await task
+        except asyncio.CancelledError:
+            assert finished.is_set()
+            propagated.set()
+            raise
+
+    monkeypatch.setattr(module, "ControlOutbox", outbox)
+    monkeypatch.setattr(module, "OutgoingFrame", frame)
+    monkeypatch.setattr(WebServer, "_control", control)
+    dispatcher = Dispatcher()
+
+    def operation(params):
+        started.set()
+        if mode == "worker":
+            assert release.wait(10)
+        finished.set()
+        return "x" * (32 * 1024 * 1024) if mode == "sending" else "done"
+
+    dispatcher.register("operation", operation)
+    server = WebServer(dispatcher, "test-token", None, port=0)
+    server.start()
+
+    async def cancel_and_observe():
+        task = state["task"]
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        observed.set()
+
+    async def exercise():
+        async with (
+            ClientSession() as session,
+            session.ws_connect(
+                f"http://127.0.0.1:{server.port}/ws?token=test-token", max_msg_size=0
+            ) as connection,
+        ):
+            transport = connection._response.connection.transport
+            if mode == "sending":
+                transport.pause_reading()
+            try:
+                await connection.send_json({"id": 1, "method": "operation"})
+                assert await asyncio.to_thread(started.wait, 5)
+                if mode == "sending":
+                    async with asyncio.timeout(5):
+                        while not state["transport"].get_write_buffer_size():
+                            await asyncio.sleep(0.01)
+                waiter = asyncio.run_coroutine_threadsafe(
+                    cancel_and_observe(), server._loop
+                )
+                if mode == "worker":
+                    await asyncio.sleep(0.1)
+                    assert not propagated.is_set() and not observed.is_set()
+                    assert server._handlers
+                    release.set()
+                await asyncio.wrap_future(waiter)
+                async with asyncio.timeout(7):
+                    while server._handlers:
+                        await asyncio.sleep(0.01)
+                assert propagated.is_set() and observed.is_set()
+                assert state["transport"].is_closing()
+                assert state["transport"].get_write_buffer_size() == 0
+            finally:
+                release.set()
+                transport.abort()
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        release.set()
+        server.stop()
+    assert len(outboxes) == 1
+    value = outboxes[0]
+    assert value.used == value.frames == value.producers == 0
+    assert not value.responses and not value.items
+    assert all(reference() is None for reference in references)
+    assert not dispatcher._sinks
+
+
+def test_control_request_completion_sequence() -> None:
+    dispatcher = Dispatcher()
+    server = WebServer(dispatcher, "test-token", None, port=0)
+    server.start()
+    try:
+        with connect(f"ws://127.0.0.1:{server.port}/ws?token=test-token") as connection:
+            for text, expected in (
+                (" ", None),
+                ("{", "invalid_frame"),
+                ('{"method":"missing"}', "unknown_method"),
+                ('{"method":"ping"}', None),
+            ):
+                connection.send(text)
+                if expected is None:
+                    with pytest.raises(TimeoutError):
+                        connection.recv(timeout=0.1)
+                else:
+                    assert json.loads(connection.recv(timeout=5))["code"] == expected
+                connection.send('{"id":1,"method":"ping"}')
+                assert json.loads(connection.recv(timeout=5)) == {
+                    "type": "response",
+                    "id": 1,
+                    "result": {"pong": None},
+                }
+    finally:
+        server.stop()
+
+
+def test_control_outbox_encoding_failure(monkeypatch) -> None:
+    from huddol.adapters.websocket import server
+
+    def fail(payload):
+        raise ValueError("encoding probe")
+
+    monkeypatch.setattr(server, "encode", fail)
+
+    async def exercise():
+        outbox = ControlOutbox()
+        completion = outbox.register_response()
+        await asyncio.to_thread(outbox.broadcast, {"type": "event"})
+        await asyncio.wait_for(outbox.closing.wait(), 1)
+        outbox.close()
+        with pytest.raises(ConnectionError):
+            await completion
+        assert outbox.frames == outbox.used == outbox.producers == 0
+        assert not outbox.responses
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("reject", [False, True])

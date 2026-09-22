@@ -7,10 +7,11 @@ import secrets
 import socket
 import sys
 import threading
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from concurrent.futures import Future
 from contextlib import asynccontextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import quote, unquote
@@ -24,6 +25,203 @@ from huddol.core.errors import DomainError
 from huddol.services.uploads import Uploads
 
 SocketHandler = Callable[[web.WebSocketResponse], Awaitable[None]]
+
+
+BROADCAST_FRAMES = 256
+BROADCAST_BYTES = 16 * 1024 * 1024
+CLOSE_TIMEOUT = 5
+
+
+def payload_size(value: Any, available: int) -> int:
+    size = sys.getsizeof(value)
+    if size > available:
+        return size
+    if isinstance(value, dict):
+        for key, item in value.items():
+            size += payload_size(key, available - size)
+            if size > available:
+                return size
+            size += payload_size(item, available - size)
+            if size > available:
+                return size
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            size += payload_size(item, available - size)
+            if size > available:
+                return size
+    return size
+
+
+@dataclass
+class OutgoingFrame:
+    text: str
+    cost: int
+    completion: asyncio.Future[None] | None
+
+
+class ControlOutbox:
+    def __init__(self) -> None:
+        self.loop = asyncio.get_running_loop()
+        self.lock = threading.Condition()
+        self.encoder = threading.Lock()
+        self.items: deque[OutgoingFrame] = deque()
+        self.responses: set[asyncio.Future[None]] = set()
+        self.available = asyncio.Event()
+        self.closing = asyncio.Event()
+        self.closed = False
+        self.wake_pending = False
+        self.frames = 0
+        self.used = 0
+        self.producers = 0
+
+    def _wake_locked(self) -> None:
+        if not self.wake_pending:
+            self.wake_pending = True
+            self.loop.call_soon_threadsafe(self._wake)
+
+    def _wake(self) -> None:
+        with self.lock:
+            self.wake_pending = False
+            closed = self.closed
+        self.available.set()
+        if closed:
+            self.closing.set()
+
+    def fail(self) -> None:
+        with self.lock:
+            self.closed = True
+            self._wake_locked()
+
+    def register_response(self) -> asyncio.Future[None]:
+        result = self.loop.create_future()
+        self.responses.add(result)
+        return result
+
+    def complete(self, result: asyncio.Future[None]) -> None:
+        if not result.done():
+            result.set_result(None)
+        self.responses.discard(result)
+
+    def broadcast(self, payload: dict[str, Any]) -> None:
+        self.put(payload)
+
+    def put(
+        self,
+        payload: dict[str, Any],
+        completion: asyncio.Future[None] | None = None,
+    ) -> None:
+        reserved = 0
+        counted = False
+        text: str | None = None
+        data: bytes | None = None
+        frame: OutgoingFrame | None = None
+        with self.lock:
+            if self.closed:
+                return
+            self.producers += 1
+        try:
+            if completion is None:
+                with self.lock:
+                    reserved = payload_size(payload, BROADCAST_BYTES - self.used)
+                    if (
+                        self.frames >= BROADCAST_FRAMES
+                        or self.used + reserved > BROADCAST_BYTES
+                    ):
+                        reserved = 0
+                        self.closed = True
+                        self._wake_locked()
+                        return
+                    self.used += reserved
+                    self.frames += 1
+                    counted = True
+            with self.encoder:
+                with self.lock:
+                    if self.closed:
+                        return
+                text = encode(payload)
+                data = text.encode("utf-8")
+                cost = sys.getsizeof(text) + 2 * sys.getsizeof(data)
+                data = None
+                payload = {}
+                with self.lock:
+                    if self.closed:
+                        return
+                    if (
+                        completion is None
+                        and self.used - reserved + cost > BROADCAST_BYTES
+                    ):
+                        self.closed = True
+                        self._wake_locked()
+                        return
+                    frame = OutgoingFrame(text, cost, completion)
+                    text = None
+                    if completion is None:
+                        self.used += cost - reserved
+                    self.items.append(frame)
+                    frame = None
+                    counted = False
+                    reserved = 0
+                    self._wake_locked()
+        except Exception as error:  # noqa: BLE001
+            self.fail()
+            log.error("Control connection encoding failed: %s", error)
+        finally:
+            payload = {}
+            text = None
+            data = None
+            frame = None
+            with self.lock:
+                if counted:
+                    self.used -= reserved
+                    self.frames -= 1
+                self.producers -= 1
+                self.lock.notify_all()
+
+    async def take(self) -> OutgoingFrame | None:
+        while True:
+            with self.lock:
+                if self.closed:
+                    return None
+                if self.items:
+                    return self.items.popleft()
+                self.available.clear()
+            await self.available.wait()
+
+    def release(self, frame: OutgoingFrame) -> None:
+        if frame.completion is None:
+            with self.lock:
+                self.frames -= 1
+                self.used -= frame.cost
+
+    async def send(self, connection: web.WebSocketResponse) -> None:
+        while (frame := await self.take()) is not None:
+            try:
+                await connection.send_str(frame.text)
+                if frame.completion is not None:
+                    self.complete(frame.completion)
+            finally:
+                frame.text = ""
+                self.release(frame)
+                del frame
+
+    def close(self) -> None:
+        with self.lock:
+            self.closed = True
+            while self.items:
+                frame = self.items.popleft()
+                frame.text = ""
+                self.release(frame)
+                del frame
+        for result in self.responses:
+            if not result.done():
+                result.set_exception(ConnectionError("Control connection closed"))
+        self.responses.clear()
+        self.available.set()
+        self.closing.set()
+
+    def wait_producers(self) -> None:
+        with self.lock:
+            self.lock.wait_for(lambda: self.producers == 0)
 
 
 async def worker[T](operation: Callable[..., T], *args: Any) -> T:
@@ -122,6 +320,7 @@ class WebServer:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop: asyncio.Event | None = None
         self._connections: set[web.WebSocketResponse] = set()
+        self._control_transports: dict[web.WebSocketResponse, asyncio.Transport] = {}
         self._handlers: set[asyncio.Task[Any]] = set()
         self._http: set[asyncio.Task[Any]] = set()
         self._app = web.Application(
@@ -155,7 +354,9 @@ class WebServer:
         async def connected(request: web.Request) -> web.StreamResponse:
             self._authenticate(request, websocket=True)
             connection = web.WebSocketResponse(
-                max_msg_size=max_msg_size, compress=False
+                max_msg_size=max_msg_size,
+                compress=False,
+                heartbeat=20 if path == "/ws" else None,
             )
             if (
                 path == "/ws"
@@ -167,12 +368,18 @@ class WebServer:
             assert task is not None
             self._handlers.add(task)
             self._connections.add(connection)
+            if path == "/ws":
+                assert request.transport is not None
+                self._control_transports[connection] = request.transport
             try:
                 await handler(connection)
             finally:
-                await connection.close()
-                self._connections.discard(connection)
-                self._handlers.discard(task)
+                try:
+                    await self._close_socket(connection)
+                finally:
+                    self._control_transports.pop(connection, None)
+                    self._connections.discard(connection)
+                    self._handlers.discard(task)
             return connection
 
         self._app.router.add_get(path, connected)
@@ -219,7 +426,7 @@ class WebServer:
                     cleanup.cancel()
                     await asyncio.gather(
                         *(
-                            connection.close(code=1001)
+                            self._close_socket(connection, code=1001)
                             for connection in tuple(self._connections)
                         )
                     )
@@ -330,37 +537,83 @@ class WebServer:
             return web.Response(status=404, text="Not found")
         return await worker(static_response, self._directory, request.path)
 
-    async def _control(self, connection: web.WebSocketResponse) -> None:
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[str] = asyncio.Queue()
-
-        def sink(payload: dict[str, Any]) -> None:
-            loop.call_soon_threadsafe(queue.put_nowait, encode(payload))
-
-        async def send() -> None:
-            while True:
-                await connection.send_str(await queue.get())
-
-        self._dispatcher.attach(sink)
+    async def _close_socket(
+        self, connection: web.WebSocketResponse, *, code: int = 1000
+    ) -> None:
+        transport = self._control_transports.get(connection)
+        if transport is None:
+            await connection.close(code=code)
+            return
         try:
-            async with asyncio.TaskGroup() as tasks:
-                sender = tasks.create_task(send())
-                try:
-                    async for message in connection:
-                        if message.type == WSMsgType.TEXT:
-                            await worker(self._dispatcher.receive, message.data, sink)
-                        elif message.type == WSMsgType.BINARY:
-                            await worker(
-                                self._dispatcher.receive,
-                                message.data.decode("utf-8"),
-                                sink,
-                            )
-                        elif message.type == WSMsgType.ERROR:
-                            break
-                finally:
-                    sender.cancel()
+            async with asyncio.timeout(CLOSE_TIMEOUT):
+                await connection.close(code=code)
+        except TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
         finally:
-            self._dispatcher.detach(sink)
+            transport.abort()
+
+    async def _control(self, connection: web.WebSocketResponse) -> None:
+        outbox = ControlOutbox()
+
+        async def receive() -> None:
+            async for message in connection:
+                if message.type not in (WSMsgType.TEXT, WSMsgType.BINARY):
+                    if message.type == WSMsgType.ERROR:
+                        return
+                    continue
+                text = (
+                    message.data
+                    if message.type == WSMsgType.TEXT
+                    else message.data.decode("utf-8")
+                )
+                completion = outbox.register_response()
+                responded = False
+
+                def response(
+                    payload: dict[str, Any],
+                    result: asyncio.Future[None] = completion,
+                ) -> None:
+                    nonlocal responded
+                    responded = True
+                    outbox.put(payload, result)
+
+                try:
+                    await worker(self._dispatcher.receive, text, response)
+                    if not responded:
+                        outbox.complete(completion)
+                    await completion
+                finally:
+                    if completion.done() and not completion.cancelled():
+                        completion.exception()
+
+        self._dispatcher.attach(outbox.broadcast)
+        sender = asyncio.create_task(outbox.send(connection))
+        receiver = asyncio.create_task(receive())
+        closing = asyncio.create_task(outbox.closing.wait())
+        try:
+            finished, _ = await asyncio.wait(
+                (sender, receiver, closing), return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in finished:
+                task.result()
+        except ConnectionError:
+            pass
+        finally:
+            self._dispatcher.detach(outbox.broadcast)
+            outbox.close()
+            sender.cancel()
+            receiver.cancel()
+            closing.cancel()
+            try:
+                await asyncio.gather(sender, closing, return_exceptions=True)
+                await self._close_socket(connection, code=1013)
+            finally:
+                await asyncio.gather(receiver, return_exceptions=True)
+                await worker(outbox.wait_producers)
 
     def _uploads_service(self) -> Uploads:
         if self._uploads is None:
