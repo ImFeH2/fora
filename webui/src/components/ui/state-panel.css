@@ -33,14 +33,17 @@
   display: flex;
   isolation: isolate;
   justify-content: center;
+  width: 144px;
+  max-width: 100%;
 }
 
 .state-icons > span {
   display: grid;
   place-items: center;
   position: relative;
-  width: 48px;
-  height: 48px;
+  flex: 1;
+  min-width: 0;
+  aspect-ratio: 1;
   border-radius: 12px;
   background: rgb(9, 9, 11);
   color: rgb(143, 143, 153);
@@ -54,8 +57,13 @@
     box-shadow 500ms;
 }
 
+.state-icons svg {
+  width: 50%;
+  height: 50%;
+}
+
 .state-icons > span:first-child {
-  transform: translate(10px, 6px) rotate(-6deg);
+  transform: translate(20.833333%, 12.5%) rotate(-6deg);
 }
 
 .state-icons > span:nth-child(2) {
@@ -63,7 +71,7 @@
 }
 
 .state-icons > span:last-child {
-  transform: translate(-10px, 6px) rotate(6deg);
+  transform: translate(-20.833333%, 12.5%) rotate(6deg);
 }
 
 .state-panel:is(:hover, :focus-within) .state-icons > span {
@@ -76,15 +84,15 @@
 }
 
 .state-panel:is(:hover, :focus-within) .state-icons > span:first-child {
-  transform: translate(-10px, 4px) rotate(-12deg);
+  transform: translate(-20.833333%, 8.333333%) rotate(-12deg);
 }
 
 .state-panel:is(:hover, :focus-within) .state-icons > span:nth-child(2) {
-  transform: translateY(-2px);
+  transform: translateY(-4.166667%);
 }
 
 .state-panel:is(:hover, :focus-within) .state-icons > span:last-child {
-  transform: translate(10px, 4px) rotate(12deg);
+  transform: translate(20.833333%, 8.333333%) rotate(12deg);
 }
 
 .state-panel-compact {
@@ -121,7 +129,9 @@
 }
 
 .state-action > button {
+  flex-wrap: wrap;
   max-width: 100%;
+  min-width: 0;
   min-height: 40px;
   height: auto;
   padding: 8px 16px;
