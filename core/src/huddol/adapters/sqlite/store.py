@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+import time
+import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
@@ -9,7 +11,14 @@ from threading import RLock
 from types import TracebackType
 from typing import Any, Self, cast
 
-from huddol.core.discussion import Discussion, Message, MessageMention
+from huddol.core.attachment import (
+    MIB,
+    Attachment,
+    Upload,
+    identifier,
+    validate_attachments,
+)
+from huddol.core.discussion import Discussion, Message, MessageMention, validate_body
 from huddol.core.errors import DomainError
 from huddol.core.member import AgentState, Member, MemberType, name_key
 from huddol.core.mention import Mention, build_mentions
@@ -58,6 +67,43 @@ CREATE TABLE IF NOT EXISTS mentions (
     length INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (discussion_id, message_id, member_id)
 );
+CREATE TABLE IF NOT EXISTS organization_identity (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    uuid TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS uploads (
+    id TEXT PRIMARY KEY,
+    discussion_id INTEGER NOT NULL REFERENCES discussions(id),
+    owner_id INTEGER NOT NULL REFERENCES members(id),
+    client_upload_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    media_type TEXT NOT NULL,
+    requested_type TEXT NOT NULL,
+    state TEXT NOT NULL,
+    expires_at REAL NOT NULL,
+    sha256 TEXT NOT NULL DEFAULT '',
+    width INTEGER,
+    height INTEGER,
+    UNIQUE(owner_id, client_upload_id)
+);
+CREATE TABLE IF NOT EXISTS message_attachments (
+    discussion_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    attachment_id TEXT NOT NULL UNIQUE REFERENCES uploads(id),
+    ordinal INTEGER NOT NULL,
+    PRIMARY KEY(discussion_id, message_id, ordinal),
+    FOREIGN KEY(discussion_id, message_id) REFERENCES messages(discussion_id, id)
+);
+CREATE TABLE IF NOT EXISTS message_receipts (
+    discussion_id INTEGER NOT NULL,
+    owner_id INTEGER NOT NULL,
+    client_message_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    PRIMARY KEY(discussion_id, owner_id, client_message_id),
+    FOREIGN KEY(discussion_id, message_id) REFERENCES messages(discussion_id, id)
+);
+CREATE INDEX IF NOT EXISTS uploads_expiry ON uploads(state, expires_at);
 CREATE INDEX IF NOT EXISTS mentions_by_member ON mentions (member_id);
 CREATE TABLE IF NOT EXISTS acks (
     discussion_id INTEGER NOT NULL,
@@ -323,6 +369,10 @@ class SqliteStore:
                 self._db.execute(
                     "ALTER TABLE agent_runs ADD COLUMN reminded_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            self._db.execute(
+                "INSERT OR IGNORE INTO organization_identity(id, uuid) VALUES (1, ?)",
+                (str(uuid.uuid4()),),
+            )
             self._db.commit()
             with self._db:
                 if "pending_revision" not in {
@@ -343,6 +393,239 @@ class SqliteStore:
 
     def close(self) -> None:
         self._db.close()
+
+    def organization_uuid(self) -> str:
+        row = first(
+            self._db.execute("SELECT uuid FROM organization_identity WHERE id = 1")
+        )
+        assert row is not None
+        return str(row["uuid"])
+
+    @staticmethod
+    def _upload(row: sqlite3.Row) -> Upload:
+        return Upload(
+            *(
+                row[key]
+                for key in (
+                    "id",
+                    "discussion_id",
+                    "owner_id",
+                    "client_upload_id",
+                    "name",
+                    "size",
+                    "media_type",
+                    "state",
+                    "expires_at",
+                )
+            )
+        )
+
+    @staticmethod
+    def _attachment(row: sqlite3.Row) -> Attachment:
+        return Attachment(
+            *(
+                row[key]
+                for key in (
+                    "id",
+                    "name",
+                    "size",
+                    "media_type",
+                    "sha256",
+                    "width",
+                    "height",
+                )
+            )
+        )
+
+    def create_upload(
+        self,
+        discussion_id: int,
+        owner_id: int,
+        client_upload_id: str,
+        name: str,
+        size: int,
+        media_type: str,
+    ) -> Upload:
+        with self._write() as db:
+            self._member_discussion(discussion_id, owner_id)
+            previous = first(
+                db.execute(
+                    "SELECT * FROM uploads WHERE owner_id = ? AND client_upload_id = ?",
+                    (owner_id, client_upload_id),
+                )
+            )
+            if previous is not None:
+                result = self._upload(previous)
+                if (
+                    result.discussion_id,
+                    result.name,
+                    result.size,
+                    previous["requested_type"],
+                ) != (
+                    discussion_id,
+                    name,
+                    size,
+                    media_type,
+                ):
+                    raise DomainError(
+                        "upload_conflict", "This upload ID has different file details"
+                    )
+                return result
+            usage = first(
+                db.execute(
+                    "SELECT COUNT(*) AS count, COALESCE(SUM(size), 0) AS total,"
+                    " COALESCE(SUM(CASE WHEN owner_id = ? THEN size ELSE 0 END), 0) AS owned"
+                    " FROM uploads WHERE state NOT IN ('attached', 'expired')",
+                    (owner_id,),
+                )
+            )
+            assert usage is not None
+            if (
+                usage["count"] >= 40
+                or usage["total"] + size > 200 * MIB
+                or usage["owned"] + size > 100 * MIB
+            ):
+                raise DomainError(
+                    "upload_capacity",
+                    "Cancel unused uploads before uploading more files",
+                )
+            upload_id = str(uuid.uuid4())
+            db.execute(
+                "INSERT INTO uploads(id, discussion_id, owner_id, client_upload_id, name, size, media_type, requested_type, state, expires_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?)",
+                (
+                    upload_id,
+                    discussion_id,
+                    owner_id,
+                    client_upload_id,
+                    name,
+                    size,
+                    media_type,
+                    media_type,
+                    time.time() + 60,
+                ),
+            )
+            return self.get_upload(upload_id, owner_id)
+
+    def get_upload(self, upload_id: str, owner_id: int) -> Upload:
+        row = first(
+            self._db.execute(
+                "SELECT * FROM uploads WHERE id = ? AND owner_id = ?",
+                (upload_id, owner_id),
+            )
+        )
+        if row is None:
+            raise DomainError("not_found", "Upload not found")
+        return self._upload(row)
+
+    def ready_attachment(self, upload_id: str, owner_id: int) -> Attachment:
+        row = first(
+            self._db.execute(
+                "SELECT * FROM uploads WHERE id = ? AND owner_id = ? AND state = 'ready'",
+                (upload_id, owner_id),
+            )
+        )
+        if row is None:
+            raise DomainError("attachment_not_ready", "Upload this file before sending")
+        return self._attachment(row)
+
+    def start_upload(self, upload_id: str, owner_id: int) -> Upload:
+        with self._write() as db:
+            record = self.get_upload(upload_id, owner_id)
+            self._member_discussion(record.discussion_id, owner_id)
+            if record.state != "reserved" or record.expires_at <= time.time():
+                raise DomainError(
+                    "upload_not_reserved", "Create a new upload for this file"
+                )
+            db.execute(
+                "UPDATE uploads SET state = 'receiving', expires_at = ? WHERE id = ?",
+                (time.time() + 120, upload_id),
+            )
+            return self.get_upload(upload_id, owner_id)
+
+    def finish_upload(self, upload: Upload, attachment: Attachment) -> None:
+        with self._write() as db:
+            self._member_discussion(upload.discussion_id, upload.owner_id)
+            current = self.get_upload(upload.id, upload.owner_id)
+            if current.state != "receiving" or current.expires_at <= time.time():
+                raise DomainError(
+                    "upload_cancelled", "The upload was cancelled or expired"
+                )
+            db.execute(
+                "UPDATE uploads SET state = 'ready', expires_at = ?, media_type = ?, sha256 = ?, width = ?, height = ? WHERE id = ?",
+                (
+                    time.time() + 86400,
+                    attachment.media_type,
+                    attachment.sha256,
+                    attachment.width,
+                    attachment.height,
+                    upload.id,
+                ),
+            )
+
+    def cancel_upload(self, upload_id: str, owner_id: int) -> Upload:
+        with self._write() as db:
+            record = self.get_upload(upload_id, owner_id)
+            if record.state == "attached":
+                raise DomainError(
+                    "already_attached", "This file belongs to a sent message"
+                )
+            if record.state != "expired":
+                db.execute(
+                    "UPDATE uploads SET state = 'deleting' WHERE id = ?", (upload_id,)
+                )
+            return self.get_upload(upload_id, owner_id)
+
+    def abandoned_uploads(self, *, restart: bool = False) -> tuple[Upload, ...]:
+        with self._write() as db:
+            db.execute(
+                "UPDATE uploads SET state = 'deleting' WHERE state IN ('reserved', 'receiving', 'ready')"
+                " AND (expires_at <= ? OR (? AND state = 'receiving'))",
+                (time.time(), restart),
+            )
+            return tuple(
+                self._upload(row)
+                for row in db.execute("SELECT * FROM uploads WHERE state = 'deleting'")
+            )
+
+    def release_upload(self, upload_id: str) -> None:
+        with self._write() as db:
+            db.execute(
+                "UPDATE uploads SET state = 'expired' WHERE id = ? AND state = 'deleting'",
+                (upload_id,),
+            )
+
+    def attachment(
+        self,
+        discussion_id: int,
+        message_id: int,
+        attachment_id: str,
+        member_id: int,
+    ) -> Attachment:
+        with self._db.lock:
+            self._member_discussion(discussion_id, member_id)
+            row = first(
+                self._db.execute(
+                    "SELECT u.* FROM uploads u JOIN message_attachments a ON a.attachment_id = u.id"
+                    " WHERE a.discussion_id = ? AND a.message_id = ? AND a.attachment_id = ? AND u.state = 'attached'",
+                    (discussion_id, message_id, attachment_id),
+                )
+            )
+            if row is None:
+                raise DomainError("not_found", "Attachment not found in this message")
+            return self._attachment(row)
+
+    def message_receipt(
+        self, discussion_id: int, owner_id: int, client_message_id: str
+    ) -> Message | None:
+        with self._db.lock:
+            self._member_discussion(discussion_id, owner_id)
+            rows = self._messages(
+                "SELECT m.* FROM messages m JOIN message_receipts r ON r.discussion_id = m.discussion_id AND r.message_id = m.id"
+                " WHERE r.discussion_id = ? AND r.owner_id = ? AND r.client_message_id = ?",
+                (discussion_id, owner_id, client_message_id),
+            )
+            return rows[0] if rows else None
 
     @contextmanager
     def _write(self) -> Iterator[LockedConnection]:
@@ -550,6 +833,16 @@ class SqliteStore:
             mentions.setdefault((row["discussion_id"], row["message_id"]), []).append(
                 MessageMention(row["member_id"], row["position"], row["length"])
             )
+        attachments: dict[tuple[int, int], list[Attachment]] = {}
+        for attachment in self._db.execute(
+            "SELECT u.*, a.message_id FROM uploads u JOIN message_attachments a ON a.attachment_id = u.id"
+            f" JOIN ({sql}) selected ON selected.discussion_id = a.discussion_id AND selected.id = a.message_id"
+            " ORDER BY a.ordinal",
+            params,
+        ):
+            attachments.setdefault(
+                (attachment["discussion_id"], attachment["message_id"]), []
+            ).append(self._attachment(attachment))
         return tuple(
             Message(
                 discussion_id=int(row["discussion_id"]),
@@ -559,6 +852,9 @@ class SqliteStore:
                 body=str(row["body"]),
                 created_at=str(row["created_at"]),
                 mentions=tuple(mentions.get((row["discussion_id"], row["id"]), ())),
+                attachments=tuple(
+                    attachments.get((row["discussion_id"], row["id"]), ())
+                ),
             )
             for row in rows
         )
@@ -566,58 +862,107 @@ class SqliteStore:
     def append_message(
         self, discussion_id: int, sender_id: int, body: str
     ) -> tuple[Message, tuple[Mention, ...]]:
-        sender = self.get_member(sender_id)
-        assert sender is not None
-        discussion = self.get_discussion(discussion_id)
-        assert discussion is not None
-        members = [
-            member
-            for member in self.list_members()
-            if member.id in discussion.member_ids
-        ]
-        row = first(
-            self._db.execute(
-                "SELECT COALESCE(MAX(id), 0) + 1 AS v FROM messages WHERE discussion_id = ?",
-                (discussion_id,),
-            )
-        )
-        assert row is not None
-        message_id = int(row["v"])
-        mentions = build_mentions(
-            discussion_id, message_id, body, members, sender_id=sender_id
-        )
-        message = Message(
-            discussion_id=discussion_id,
-            id=message_id,
-            sender_id=sender_id,
-            sender_name=sender.name,
-            body=body,
-            created_at=now(),
-            mentions=tuple(
-                MessageMention(item.member_id, item.position, item.length)
-                for item in mentions
-            ),
-        )
+        message, mentions, _ = self.submit_message(discussion_id, sender_id, body)
+        return message, mentions
+
+    def submit_message(
+        self,
+        discussion_id: int,
+        sender_id: int,
+        body: str,
+        *,
+        attachment_ids: Sequence[str] = (),
+        client_message_id: str | None = None,
+        mark_read: bool = False,
+    ) -> tuple[Message, tuple[Mention, ...], bool]:
+        validate_body(body, has_attachments=bool(attachment_ids))
+        if client_message_id is not None:
+            identifier(client_message_id)
+        if len(attachment_ids) > 10 or len(set(attachment_ids)) != len(attachment_ids):
+            raise DomainError("invalid_attachments", "Choose up to 10 distinct files")
+        for upload_id in attachment_ids:
+            identifier(upload_id)
         with self._write() as db:
+            discussion = self._member_discussion(discussion_id, sender_id)
+            if client_message_id is not None:
+                previous = self.message_receipt(
+                    discussion_id, sender_id, client_message_id
+                )
+                if previous is not None:
+                    if previous.body != body or tuple(
+                        item.id for item in previous.attachments
+                    ) != tuple(attachment_ids):
+                        raise DomainError(
+                            "message_conflict",
+                            "This send ID has different message content",
+                        )
+                    return previous, (), False
+            attachments = []
+            for upload_id in attachment_ids:
+                record = self.get_upload(upload_id, sender_id)
+                if (
+                    record.discussion_id != discussion_id
+                    or record.state != "ready"
+                    or record.expires_at <= time.time()
+                ):
+                    raise DomainError(
+                        "attachment_not_ready",
+                        "Upload each file in this Discussion before sending",
+                    )
+                row = first(
+                    db.execute("SELECT * FROM uploads WHERE id = ?", (upload_id,))
+                )
+                assert row is not None
+                attachments.append(self._attachment(row))
+            validate_attachments(tuple(attachments))
+            sender = self.get_member(sender_id)
+            assert sender is not None
+            members = [
+                member
+                for member in self.list_members()
+                if member.id in discussion.member_ids
+            ]
+            row = first(
+                db.execute(
+                    "SELECT COALESCE(MAX(id), 0) + 1 AS v FROM messages WHERE discussion_id = ?",
+                    (discussion_id,),
+                )
+            )
+            assert row is not None
+            message_id = int(row["v"])
+            mentions = build_mentions(
+                discussion_id, message_id, body, members, sender_id=sender_id
+            )
+            message = Message(
+                discussion_id=discussion_id,
+                id=message_id,
+                sender_id=sender_id,
+                sender_name=sender.name,
+                body=body,
+                created_at=now(),
+                mentions=tuple(
+                    MessageMention(item.member_id, item.position, item.length)
+                    for item in mentions
+                ),
+                attachments=tuple(attachments),
+            )
             db.execute(
-                "INSERT INTO messages (discussion_id, id, sender_id, sender_name, body,"
-                " created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO messages (discussion_id, id, sender_id, sender_name, body, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (
-                    message.discussion_id,
-                    message.id,
-                    message.sender_id,
-                    message.sender_name,
-                    message.body,
+                    discussion_id,
+                    message_id,
+                    sender_id,
+                    sender.name,
+                    body,
                     message.created_at,
                 ),
             )
             db.executemany(
-                "INSERT INTO mentions (discussion_id, message_id, member_id, position, length)"
-                " VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO mentions (discussion_id, message_id, member_id, position, length) VALUES (?, ?, ?, ?, ?)",
                 [
                     (
-                        item.discussion_id,
-                        item.message_id,
+                        discussion_id,
+                        message_id,
                         item.member_id,
                         item.position,
                         item.length,
@@ -625,7 +970,23 @@ class SqliteStore:
                     for item in mentions
                 ],
             )
-        return message, mentions
+            for ordinal, attachment in enumerate(attachments):
+                db.execute(
+                    "UPDATE uploads SET state = 'attached' WHERE id = ?",
+                    (attachment.id,),
+                )
+                db.execute(
+                    "INSERT INTO message_attachments(discussion_id, message_id, attachment_id, ordinal) VALUES (?, ?, ?, ?)",
+                    (discussion_id, message_id, attachment.id, ordinal),
+                )
+            if client_message_id is not None:
+                db.execute(
+                    "INSERT INTO message_receipts(discussion_id, owner_id, client_message_id, message_id) VALUES (?, ?, ?, ?)",
+                    (discussion_id, sender_id, client_message_id, message_id),
+                )
+            if mark_read:
+                self._advance_read(discussion_id, sender_id, message_id)
+            return message, mentions, True
 
     def messages(
         self,

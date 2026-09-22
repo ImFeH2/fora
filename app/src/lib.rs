@@ -49,6 +49,7 @@ pub fn run() {
             };
             app.manage(Kernel(Mutex::new(child)));
             WebviewWindowBuilder::new(app, "main", WebviewUrl::App(url.into()))
+                .disable_drag_drop_handler()
                 .title("Huddol")
                 .build()?;
             Ok(())

@@ -118,7 +118,10 @@ def test_sql_pending_matches_the_core_formula_under_random_operations(
         member = rng.choice(everyone)
         if action < 0.45:
             target = rng.choice(agents)
-            store.append_message(room.id, member.id, f"hello @{target.name} please")
+            current = store.get_discussion(room.id)
+            assert current is not None
+            sender_id = member.id if member.id in current.member_ids else human.id
+            store.append_message(room.id, sender_id, f"hello @{target.name} please")
         elif action < 0.6:
             pending = store.pending(member.id)
             if pending:
@@ -352,7 +355,7 @@ def test_the_connection_survives_concurrent_threads(store: SqliteStore) -> None:
     assert store.message_count(room.id) == 40
 
 
-def test_mentions_round_trip_in_two_queries_and_stay_with_their_message(
+def test_message_relations_round_trip_in_three_queries(
     store: SqliteStore, monkeypatch
 ) -> None:
     human = store.create_member("human", "You")
@@ -394,10 +397,10 @@ def test_mentions_round_trip_in_two_queries_and_stay_with_their_message(
     ):
         calls.clear()
         assert store.messages(rooms[0].id, **params) == expected
-        assert len(calls) == 2
+        assert len(calls) == 3
     calls.clear()
     assert store.search_messages("Hi") == (first, plain, second)
-    assert len(calls) == 2
+    assert len(calls) == 3
 
 
 def test_old_mentions_table_gains_length_without_reparsing(tmp_path: Path) -> None:

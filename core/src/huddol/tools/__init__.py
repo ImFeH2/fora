@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from huddol.core.attachment import ViewedAttachment, identifier
 from huddol.core.context import advance_watermark, context_window
 from huddol.core.discussion import Discussion, Message, validate_body, validate_topic
 from huddol.core.errors import DomainError
@@ -16,6 +17,7 @@ from huddol.ports.files import ConflictError, FileTree
 from huddol.ports.store import OrganizationStore
 from huddol.services.history import History
 from huddol.services.library import Library
+from huddol.services.uploads import Uploads
 from huddol.services.workspace import Workspace
 from huddol.tools.authorize import Actor, Authorizer
 
@@ -29,6 +31,7 @@ class Dependencies:
     library_tree: FileTree
     workspace_tree_for: Callable[[int], FileTree]
     agent_directory_for: Callable[[int], Path]
+    uploads: Uploads | None = None
 
 
 @dataclass(frozen=True)
@@ -327,8 +330,7 @@ class AgentTools:
             "messages": [self._message(item) for item in selected],
         }
 
-    @staticmethod
-    def _message(item: Message) -> dict[str, Any]:
+    def _message(self, item: Message) -> dict[str, Any]:
         return {
             "id": item.id,
             "sender_id": item.sender_id,
@@ -336,6 +338,15 @@ class AgentTools:
             "body": item.body,
             "created_at": item.created_at,
             "mentions": [asdict(mention) for mention in item.mentions],
+            "attachments": [
+                asdict(attachment)
+                | (
+                    {"path": self._uploads().files.path(attachment.id)}
+                    if self._actor.is_agent
+                    else {}
+                )
+                for attachment in item.attachments
+            ],
         }
 
     def _human_discussion(self, capability: str, discussion_id: int) -> None:
@@ -441,8 +452,88 @@ class AgentTools:
         )
         return asdict(result)
 
+    def view_attachment(
+        self, discussion_id: int, message_id: int, attachment_id: str
+    ) -> ViewedAttachment:
+        self._check("discussion.read", discussion_id)
+        self._check("view_attachment", discussion_id)
+        self._require_membership(discussion_id)
+        result = self._uploads().view(
+            discussion_id, message_id, attachment_id, self._actor.member_id
+        )
+        self._record(
+            "view_attachment",
+            f"Discussion {discussion_id}: message {message_id}, attachment {attachment_id}",
+        )
+        return result
+
+    def organization_uuid(self) -> str:
+        self._check("organization.get")
+        return self._deps.store.organization_uuid()
+
+    def _uploads(self) -> Uploads:
+        assert self._deps.uploads is not None, "Uploads service is required"
+        return self._deps.uploads
+
+    def create_upload(
+        self,
+        discussion_id: int,
+        client_upload_id: str,
+        name: str,
+        size: int,
+        media_type: str,
+    ) -> dict[str, Any]:
+        self._human_discussion("upload.create", discussion_id)
+        self._require_membership(discussion_id)
+        return asdict(
+            self._uploads().create(
+                discussion_id,
+                self._actor.member_id,
+                client_upload_id,
+                name,
+                size,
+                media_type,
+            )
+        )
+
+    def upload_status(self, upload_ids: Sequence[str]) -> list[dict[str, Any]]:
+        self._check("upload.status")
+        if len(upload_ids) > 40:
+            raise DomainError("invalid_uploads", "Query at most 40 uploads")
+        result = []
+        for upload_id in upload_ids:
+            record = self._uploads().store.get_upload(
+                identifier(upload_id), self._actor.member_id
+            )
+            self._require_membership(record.discussion_id)
+            result.append(
+                asdict(self._uploads().status(record.id, self._actor.member_id))
+            )
+        return result
+
+    def cancel_uploads(self, upload_ids: Sequence[str]) -> dict[str, int]:
+        self._check("upload.cancel")
+        self.upload_status(upload_ids)
+        for upload_id in upload_ids:
+            self._uploads().cancel(upload_id, self._actor.member_id)
+        return {"cancelled": len(upload_ids)}
+
+    def send_status(self, discussion_id: int, client_message_id: str) -> dict[str, Any]:
+        self._check("discussion.send_status", discussion_id)
+        self._require_membership(discussion_id)
+        result = self._deps.store.message_receipt(
+            discussion_id, self._actor.member_id, identifier(client_message_id)
+        )
+        return {"message": self._message(result) if result is not None else None}
+
     def send_message(
-        self, discussion_id: int, body: str, *, mark_read: bool = True
+        self,
+        discussion_id: int,
+        body: str,
+        *,
+        mark_read: bool = True,
+        attachment_ids: Sequence[str] = (),
+        client_message_id: str | None = None,
     ) -> dict[str, Any]:
         self._check("discussion.send", discussion_id)
         self._require_membership(discussion_id)
@@ -451,14 +542,26 @@ class AgentTools:
                 "not_permitted",
                 "Only the Human interface can send without marking read",
             )
-        validated = validate_body(body)
-        message, mentions = self._deps.store.append_message(
-            discussion_id, self._actor.member_id, validated
+        validated = validate_body(body, has_attachments=bool(attachment_ids))
+        if len(attachment_ids) > 10:
+            raise DomainError("invalid_attachments", "Choose up to 10 distinct files")
+        for upload_id in attachment_ids:
+            self._uploads().status(upload_id, self._actor.member_id)
+        message, mentions, created = self._deps.store.submit_message(
+            discussion_id,
+            self._actor.member_id,
+            validated,
+            attachment_ids=attachment_ids,
+            client_message_id=client_message_id,
+            mark_read=mark_read,
         )
-        if mark_read:
-            self._deps.store.set_watermark(
-                discussion_id, self._actor.member_id, message.id
-            )
+        if not created:
+            return {
+                "discussion_id": discussion_id,
+                "id": message.id,
+                "created_at": message.created_at,
+                "mentioned": [],
+            }
         self._record(
             "send",
             f"Discussion {discussion_id}: message {message.id}"
@@ -578,6 +681,7 @@ class AgentTools:
                 "sender_name": item.sender_name,
                 "body": item.body,
                 "mentions": [asdict(mention) for mention in item.mentions],
+                "attachments": self._message(item)["attachments"],
             }
             for item in found
             if item.discussion_id in mine

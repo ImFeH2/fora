@@ -33,6 +33,26 @@ class PendingAcknowledgement:
 
 
 class OrganizationStore(Protocol):
+    def organization_uuid(self) -> str: ...
+
+    def submit_message(
+        self,
+        discussion_id: int,
+        sender_id: int,
+        body: str,
+        *,
+        attachment_ids: Sequence[str] = (),
+        client_message_id: str | None = None,
+        mark_read: bool = False,
+    ) -> tuple[Message, tuple[Mention, ...], bool]: ...
+
+    def message_receipt(
+        self,
+        discussion_id: int,
+        owner_id: int,
+        client_message_id: str,
+    ) -> Message | None: ...
+
     def list_members(self, *, include_deleted: bool = False) -> tuple[Member, ...]: ...
 
     def get_member(self, member_id: int) -> Member | None: ...

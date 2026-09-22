@@ -1,26 +1,54 @@
 from __future__ import annotations
 
-import email.utils
-import http
+import asyncio
 import logging
+import os
 import secrets
+import socket
 import sys
 import threading
+from collections.abc import AsyncIterator, Awaitable, Callable
+from concurrent.futures import Future
+from contextlib import asynccontextmanager
+from dataclasses import asdict
 from pathlib import Path
-from typing import Any
-from urllib.parse import parse_qs, unquote, urlsplit
+from typing import Any, BinaryIO
+from urllib.parse import quote, unquote
 
-from websockets.datastructures import Headers
-from websockets.exceptions import ConnectionClosed
-from websockets.http11 import Request, Response
-from websockets.sync.server import Server, ServerConnection, serve
+from aiohttp import WSMsgType, web
 
 from huddol.adapters.jsonl.protocol import Dispatcher, encode
 from huddol.adapters.websocket.access_error import ACCESS_ERROR_PAGE
+from huddol.core.attachment import Upload
+from huddol.core.errors import DomainError
+from huddol.services.uploads import Uploads
 
-APP_ORIGINS = frozenset(
-    {"http://localhost:1420", "http://tauri.localhost", "tauri://localhost"}
-)
+SocketHandler = Callable[[web.WebSocketResponse], Awaitable[None]]
+
+
+async def worker[T](operation: Callable[..., T], *args: Any) -> T:
+    task = asyncio.create_task(asyncio.to_thread(operation, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
+
+
+@asynccontextmanager
+async def resource[T](
+    operation: Callable[..., T],
+    release: Callable[[T], None],
+    *args: Any,
+) -> AsyncIterator[T]:
+    task = asyncio.create_task(asyncio.to_thread(operation, *args))
+    try:
+        result = await asyncio.shield(task)
+        yield result
+    finally:
+        result = await task
+        await worker(release, result)
+
 
 HOST = "127.0.0.1"
 CONTENT_TYPES = {
@@ -53,39 +81,21 @@ def webui_directory(override: str | None = None) -> Path | None:
     return None
 
 
-def _response(status: http.HTTPStatus, content_type: str, body: bytes) -> Response:
-    headers = Headers(
-        [
-            ("Date", email.utils.formatdate(usegmt=True)),
-            ("Connection", "close"),
-            ("Content-Length", str(len(body))),
-            ("Content-Type", content_type),
-        ]
-    )
-    return Response(status.value, status.phrase, headers, body)
-
-
-def _plain(status: http.HTTPStatus, text: str) -> Response:
-    return _response(status, "text/plain; charset=utf-8", text.encode())
-
-
-def static_response(directory: Path, path: str) -> Response:
+def static_response(directory: Path, path: str) -> web.Response:
     if not directory.is_dir():
-        return _plain(http.HTTPStatus.SERVICE_UNAVAILABLE, "Frontend not built")
+        return web.Response(status=503, text="Frontend not built")
     relative = unquote(path).lstrip("/")
     target = directory / "index.html"
     if "." in relative:
         target = (directory / relative).resolve()
         if not target.is_relative_to(directory.resolve()) or not target.is_file():
-            return _plain(http.HTTPStatus.NOT_FOUND, "Not found")
+            return web.Response(status=404, text="Not found")
     if not target.is_file():
-        return _plain(http.HTTPStatus.SERVICE_UNAVAILABLE, "Frontend not built")
+        return web.Response(status=503, text="Frontend not built")
     content_type = CONTENT_TYPES.get(target.suffix.lower(), "application/octet-stream")
-    return _response(http.HTTPStatus.OK, content_type, target.read_bytes())
-
-
-def _close_reason(reason: str | None) -> str | None:
-    return reason if reason in (None, "", "keepalive ping timeout") else "[redacted]"
+    return web.Response(
+        headers={"Content-Type": content_type}, body=target.read_bytes()
+    )
 
 
 class WebServer:
@@ -95,103 +105,346 @@ class WebServer:
         token: str,
         directory: Path | None,
         port: int = 0,
+        *,
+        uploads: Uploads | None = None,
     ) -> None:
         self._dispatcher = dispatcher
         self._token = token
         self._directory = directory
-        logging.getLogger("websockets.server").setLevel(logging.WARNING)
-        self._server: Server = serve(
-            self._handle,
-            HOST,
-            port,
-            process_request=self._process_request,
+        self._uploads = uploads
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._socket.bind((HOST, port))
+        self._socket.listen(128)
+        self._socket.setblocking(False)
+        self._port = int(self._socket.getsockname()[1])
+        self._ready: Future[None] = Future()
+        self._finished: Future[None] = Future()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._stop: asyncio.Event | None = None
+        self._connections: set[web.WebSocketResponse] = set()
+        self._handlers: set[asyncio.Task[Any]] = set()
+        self._http: set[asyncio.Task[Any]] = set()
+        self._app = web.Application(
+            middlewares=[self._boundary], client_max_size=20 * 1024 * 1024
         )
-        self._thread = threading.Thread(
-            target=self._server.serve_forever, name="huddol-web"
+        self._thread = threading.Thread(target=self._run, name="huddol-web")
+        self._origins = {
+            f"http://127.0.0.1:{self._port}",
+            f"http://localhost:{self._port}",
+            "http://localhost:1420",
+            "tauri://localhost",
+            "http://tauri.localhost",
+        }
+        self.add_websocket_route("/ws", self._control, max_msg_size=2**20)
+        self._app.router.add_put("/uploads/{upload_id}/content", self._upload)
+        self._app.router.add_get(
+            "/discussions/{discussion_id}/messages/{message_id}/attachments/{attachment_id}/content",
+            self._download,
         )
-        self._connections: set[ServerConnection] = set()
-        self._lock = threading.Lock()
 
     @property
     def port(self) -> int:
-        return int(self._server.socket.getsockname()[1])
+        return self._port
 
-    def start(self) -> None:
-        self._thread.start()
+    def add_websocket_route(
+        self, path: str, handler: SocketHandler, *, max_msg_size: int
+    ) -> None:
+        if self._thread.is_alive():
+            raise RuntimeError("Register routes before starting the server")
 
-    def stop(self) -> None:
-        self._server.shutdown()
-        with self._lock:
-            connections = list(self._connections)
-        for connection in connections:
-            connection.close()
-        self._thread.join()
-
-    def _process_request(
-        self, connection: ServerConnection, request: Request
-    ) -> Response | None:
-        url = urlsplit(request.path)
-        if url.path == "/ws":
-            supplied = parse_qs(url.query).get("token", [""])[0]
-            authenticated = bool(supplied) and secrets.compare_digest(
-                supplied.encode(), self._token.encode()
+        async def connected(request: web.Request) -> web.StreamResponse:
+            self._authenticate(request, websocket=True)
+            connection = web.WebSocketResponse(
+                max_msg_size=max_msg_size, compress=False
             )
             if (
-                authenticated
-                and request.headers.get("Upgrade", "").lower() == "websocket"
+                path == "/ws"
+                and request.headers.get("Upgrade", "").lower() != "websocket"
             ):
-                return None
-            response = _response(
-                http.HTTPStatus.NO_CONTENT
-                if authenticated
-                else http.HTTPStatus.UNAUTHORIZED,
-                "text/html; charset=utf-8",
-                b"" if authenticated else ACCESS_ERROR_PAGE,
-            )
-            if authenticated:
-                del response.headers["Content-Length"]
-            response.headers["Cache-Control"] = "no-store"
-            response.headers["Referrer-Policy"] = "no-referrer"
-            response.headers["Vary"] = "Origin"
-            origin = request.headers.get("Origin")
-            if origin in APP_ORIGINS:
-                response.headers["Access-Control-Allow-Origin"] = origin
-            return response
-        if self._directory is None:
-            return _plain(http.HTTPStatus.NOT_FOUND, "Not found")
-        return static_response(self._directory, url.path)
-
-    def _handle(self, connection: ServerConnection) -> None:
-        def sink(payload: dict[str, Any]) -> None:
-            try:
-                connection.send(encode(payload))
-            except ConnectionClosed:
-                pass
-
-        with self._lock:
+                return web.Response(status=204)
+            await connection.prepare(request)
+            task = asyncio.current_task()
+            assert task is not None
+            self._handlers.add(task)
             self._connections.add(connection)
+            try:
+                await handler(connection)
+            finally:
+                await connection.close()
+                self._connections.discard(connection)
+                self._handlers.discard(task)
+            return connection
+
+        self._app.router.add_get(path, connected)
+
+    def start(self) -> None:
+        self._app.router.add_route("*", "/{path:.*}", self._static)
+        self._thread.start()
+        self._ready.result()
+
+    def stop(self) -> None:
+        assert self._loop is not None and self._stop is not None
+        self._loop.call_soon_threadsafe(self._stop.set)
+        self._thread.join()
+        self._finished.result()
+
+    def _run(self) -> None:
+        try:
+            asyncio.run(self._serve())
+        except BaseException as error:
+            log.exception("Web server failed")
+            if not self._ready.done():
+                self._ready.set_exception(error)
+            self._finished.set_exception(error)
+        else:
+            self._finished.set_result(None)
+        finally:
+            self._socket.close()
+
+    async def _serve(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._stop = asyncio.Event()
+        runner = web.AppRunner(self._app, access_log=None, shutdown_timeout=130)
+        await runner.setup()
+        site = web.SockSite(runner, self._socket)
+        try:
+            await site.start()
+            async with asyncio.TaskGroup() as tasks:
+                cleanup = tasks.create_task(self._cleanup())
+                self._ready.set_result(None)
+                try:
+                    await self._stop.wait()
+                finally:
+                    await site.stop()
+                    cleanup.cancel()
+                    await asyncio.gather(
+                        *(
+                            connection.close(code=1001)
+                            for connection in tuple(self._connections)
+                        )
+                    )
+                    handlers = tuple(self._handlers)
+                    requests = tuple(self._http)
+                    for task in requests:
+                        task.cancel()
+                    results = await asyncio.gather(
+                        *handlers,
+                        *requests,
+                        return_exceptions=True,
+                    )
+                    errors = [
+                        result
+                        for result in results
+                        if isinstance(result, BaseException)
+                        and not isinstance(result, asyncio.CancelledError)
+                    ]
+                    if errors:
+                        raise BaseExceptionGroup("Request shutdown failed", errors)
+        finally:
+            await runner.cleanup()
+
+    async def _cleanup(self) -> None:
+        while True:
+            await asyncio.sleep(15)
+            if self._uploads is not None:
+                await worker(self._uploads.cleanup)
+
+    def _authenticate(self, request: web.Request, *, websocket: bool = False) -> None:
+        supplied = (
+            request.query.get("token", "")
+            if websocket
+            else request.headers.get("Authorization", "").removeprefix("Bearer ")
+        )
+        if not supplied or not secrets.compare_digest(
+            supplied.encode(), self._token.encode()
+        ):
+            if request.path == "/ws":
+                raise web.HTTPUnauthorized(
+                    text=ACCESS_ERROR_PAGE.decode(), content_type="text/html"
+                )
+            raise web.HTTPUnauthorized(text="Unauthorized")
+
+    @web.middleware
+    async def _boundary(
+        self,
+        request: web.Request,
+        handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
+    ) -> web.StreamResponse:
+        origin = request.headers.get("Origin")
+        if origin is not None and origin not in self._origins:
+            raise web.HTTPForbidden(text="Origin not allowed")
+        try:
+            if request.method == "OPTIONS":
+                response: web.StreamResponse = web.Response(status=204)
+            else:
+                response = await handler(request)
+        except web.HTTPException as error:
+            response = web.Response(
+                status=error.status,
+                reason=error.reason,
+                headers=error.headers,
+                body=error.body,
+            )
+        except DomainError as error:
+            response = web.json_response(
+                {"error": {"code": error.code, "message": str(error)}}, status=400
+            )
+        except TimeoutError:
+            response = web.json_response(
+                {
+                    "error": {
+                        "code": "upload_timeout",
+                        "message": "Upload timed out; your draft is preserved",
+                    }
+                },
+                status=408,
+            )
+        if request.path == "/ws" and not isinstance(response, web.WebSocketResponse):
+            response.headers.update(
+                {
+                    "Cache-Control": "no-store",
+                    "Referrer-Policy": "no-referrer",
+                    "Vary": "Origin",
+                }
+            )
+        if origin is not None:
+            response.headers.update(
+                {
+                    "Access-Control-Allow-Origin": origin,
+                    "Vary": "Origin",
+                    "Access-Control-Allow-Methods": "GET, PUT, OPTIONS",
+                    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+                }
+            )
+        return response
+
+    async def _static(self, request: web.Request) -> web.Response:
+        if request.method != "GET":
+            raise web.HTTPMethodNotAllowed(request.method, ["GET"])
+        if self._directory is None:
+            return web.Response(status=404, text="Not found")
+        return await worker(static_response, self._directory, request.path)
+
+    async def _control(self, connection: web.WebSocketResponse) -> None:
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[str] = asyncio.Queue()
+
+        def sink(payload: dict[str, Any]) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, encode(payload))
+
+        async def send() -> None:
+            while True:
+                await connection.send_str(await queue.get())
+
         self._dispatcher.attach(sink)
         try:
-            for message in connection:
-                text = (
-                    message.decode("utf-8") if isinstance(message, bytes) else message
-                )
-                self._dispatcher.receive(text, sink)
-        except ConnectionClosed:
-            pass
+            async with asyncio.TaskGroup() as tasks:
+                sender = tasks.create_task(send())
+                try:
+                    async for message in connection:
+                        if message.type == WSMsgType.TEXT:
+                            await worker(self._dispatcher.receive, message.data, sink)
+                        elif message.type == WSMsgType.BINARY:
+                            await worker(
+                                self._dispatcher.receive,
+                                message.data.decode("utf-8"),
+                                sink,
+                            )
+                        elif message.type == WSMsgType.ERROR:
+                            break
+                finally:
+                    sender.cancel()
         finally:
-            sent = connection.protocol.close_sent
-            received = connection.protocol.close_rcvd
-            log.info(
-                "WebSocket closed connection=%s code=%s sent_code=%s sent_reason=%r "
-                "received_code=%s received_reason=%r",
-                connection.id,
-                connection.close_code,
-                sent.code if sent else None,
-                _close_reason(sent.reason if sent else None),
-                received.code if received else None,
-                _close_reason(received.reason if received else None),
-            )
             self._dispatcher.detach(sink)
-            with self._lock:
-                self._connections.discard(connection)
+
+    def _uploads_service(self) -> Uploads:
+        if self._uploads is None:
+            raise web.HTTPNotFound()
+        return self._uploads
+
+    async def _upload(self, request: web.Request) -> web.Response:
+        self._authenticate(request)
+        uploads = self._uploads_service()
+        task = asyncio.current_task()
+        assert task is not None
+        self._http.add(task)
+
+        def release(result: tuple[Upload, BinaryIO]) -> None:
+            record, target = result
+            try:
+                target.close()
+            finally:
+                uploads.end(record)
+
+        try:
+            async with resource(
+                uploads.begin,
+                release,
+                request.match_info["upload_id"],
+                1,
+            ) as (record, target):
+                async with asyncio.timeout(120):
+                    if (
+                        request.content_length is not None
+                        and request.content_length != record.size
+                    ):
+                        raise DomainError(
+                            "upload_size_mismatch",
+                            "The request size does not match the file",
+                        )
+                    received = 0
+                    while True:
+                        async with asyncio.timeout(30):
+                            chunk = await request.content.read(64 * 1024)
+                        if not chunk:
+                            break
+                        received += len(chunk)
+                        if received > record.size:
+                            raise DomainError(
+                                "file_too_large",
+                                "The request exceeds the declared file size",
+                            )
+                        await worker(target.write, chunk)
+                    await worker(target.flush)
+                    await worker(os.fsync, target.fileno())
+                    await worker(target.close)
+                    result = await worker(uploads.complete, record)
+                    return web.json_response(asdict(result))
+        finally:
+            self._http.discard(task)
+
+    async def _download(self, request: web.Request) -> web.StreamResponse:
+        self._authenticate(request)
+        uploads = self._uploads_service()
+        task = asyncio.current_task()
+        assert task is not None
+        self._http.add(task)
+        try:
+            async with resource(
+                uploads.read,
+                lambda result: result[1].close(),
+                int(request.match_info["discussion_id"]),
+                int(request.match_info["message_id"]),
+                request.match_info["attachment_id"],
+                1,
+            ) as (metadata, source):
+                response = web.StreamResponse(
+                    headers={
+                        "Content-Type": metadata.media_type,
+                        "Content-Length": str(metadata.size),
+                        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(metadata.name, safe='')}",
+                        "Cache-Control": "no-store",
+                        "X-Content-Type-Options": "nosniff",
+                    }
+                )
+                origin = request.headers.get("Origin")
+                if origin is not None:
+                    response.headers["Access-Control-Allow-Origin"] = origin
+                    response.headers["Vary"] = "Origin"
+                await response.prepare(request)
+                while chunk := await worker(source.read, 64 * 1024):
+                    await response.write(chunk)
+                await response.write_eof()
+                return response
+        finally:
+            self._http.discard(task)

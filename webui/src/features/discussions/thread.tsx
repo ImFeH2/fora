@@ -30,6 +30,7 @@ import {
 import { OverflowMenu } from "@/components/ui/menu";
 import { StatePanel } from "@/components/ui/state-panel";
 import { Tooltip } from "@/components/ui/tooltip";
+import { MessageAttachment } from "@/features/discussions/attachments";
 import { Composer } from "@/features/discussions/composer";
 import { DiscussionMembersDialog } from "@/features/discussions/members";
 import { useThreadData } from "@/features/discussions/thread-data";
@@ -255,11 +256,15 @@ function ThreadSession({ id }: { id: number }) {
 
   const load = thread.invalidate;
 
-  const send = async (body: string) => {
+  const send = async (
+    body: string,
+    attachmentIds: string[],
+    clientMessageId: string,
+  ) => {
     setBusy(true);
     let sent = false;
     try {
-      await backend.sendVisible(id, body);
+      await backend.sendVisible(id, body, attachmentIds, clientMessageId);
       sent = true;
       if (!thread.live.current) return true;
       await thread.request("after");
@@ -478,6 +483,7 @@ function ThreadSession({ id }: { id: number }) {
                       </div>
                     ) : null}
                     <MessageRow
+                      discussionId={id}
                       message={message}
                       compact={compact}
                       fresh={false}
@@ -509,6 +515,7 @@ function ThreadSession({ id }: { id: number }) {
           ) : null}
 
           <Composer
+            discussionId={id}
             members={members}
             memberIds={memberIds}
             busy={busy}
@@ -537,6 +544,7 @@ function ThreadSession({ id }: { id: number }) {
 }
 
 export function MessageRow({
+  discussionId,
   message,
   compact,
   fresh,
@@ -546,6 +554,7 @@ export function MessageRow({
   onAck,
   onRevoke,
 }: {
+  discussionId: number;
   message: Message;
   compact: boolean;
   fresh: boolean;
@@ -589,6 +598,14 @@ export function MessageRow({
         <div className="whitespace-pre-wrap wrap-anywhere [&_mark]:bg-blue-500/25 [&_mark]:text-blue-100 [&_mark]:rounded-xs [&_mark]:px-[3px] [&_mark]:font-medium">
           {renderMentions(message.body, message.mentions, members)}
         </div>
+        {message.attachments.map((attachment) => (
+          <MessageAttachment
+            key={attachment.id}
+            discussionId={discussionId}
+            messageId={message.id}
+            attachment={attachment}
+          />
+        ))}
         {pending ? (
           <div className="mt-2 flex items-center gap-2">
             <Chip tone="warning">Mentions you</Chip>

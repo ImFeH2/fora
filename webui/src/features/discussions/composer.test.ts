@@ -97,6 +97,7 @@ describe("composer layout", () => {
   it("renders a real compact input, an inaccessible measuring probe and disabled send", () => {
     const html = renderToStaticMarkup(
       createElement(Composer, {
+        discussionId: 1,
         members: [],
         memberIds: new Set<number>(),
         busy: false,
@@ -113,7 +114,8 @@ describe("composer layout", () => {
     expect(html).toContain('tabindex="-1"');
     expect(html).toContain("motion-reduce:transition-none");
     expect(html).not.toContain("Open prompt input");
-    expect(html).not.toContain('type="file"');
+    expect(html).toContain('type="file"');
+    expect(html).toContain('aria-label="Choose attachments"');
     expect(html).toContain("@[601px]:w-3/4");
     expect(html).not.toContain("max-width");
     expect(html).toContain("--composer-card:oklch(20.5% 0 0)");

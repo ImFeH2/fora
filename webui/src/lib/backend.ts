@@ -71,12 +71,35 @@ export type MessageMention = {
   length: number;
 };
 
+export type Attachment = {
+  id: string;
+  name: string;
+  size: number;
+  media_type: string;
+  sha256: string;
+  width: number | null;
+  height: number | null;
+};
+
+export type UploadRecord = {
+  id: string;
+  state:
+    | "reserved"
+    | "receiving"
+    | "ready"
+    | "attached"
+    | "deleting"
+    | "expired";
+  expires_at: number;
+};
+
 export type Message = {
   id: number;
   sender_id: number;
   sender_name: string;
   body: string;
   mentions: MessageMention[];
+  attachments: Attachment[];
   created_at: string;
 };
 
@@ -403,6 +426,7 @@ export class Backend {
   #locate: () => Connection;
   #socket: (url: string) => Socket;
   #nextId = 1;
+  #connectionUrl: URL | null = null;
   #pending = new Map<number, Pending>();
   #listeners = new Set<(event: BackendEvent) => void>();
   #ready: Promise<Socket> | null = null;
@@ -481,6 +505,7 @@ export class Backend {
         "This page was opened without access credentials.",
         true,
       );
+    this.#connectionUrl = new URL(connection.url);
     return new Promise<Socket>((resolve, reject) => {
       const socket = this.#socket(connection.url);
       const generation = this.#generation;
@@ -717,6 +742,7 @@ export class Backend {
   organization() {
     return this.call<{
       id: number;
+      uuid: string;
       members: Member[];
       human_id: number;
       token_limit: number | null;
@@ -799,12 +825,144 @@ export class Backend {
     }>("discussion.ack_pending", { discussion_id, through_message_id });
   }
 
-  sendVisible(discussion_id: number, body: string) {
+  sendVisible(
+    discussion_id: number,
+    body: string,
+    attachment_ids: string[] = [],
+    client_message_id?: string,
+  ) {
     return this.call<{ id: number }>("discussion.send", {
       discussion_id,
       body,
+      attachment_ids,
+      client_message_id,
       mark_read: false,
     });
+  }
+
+  sendStatus(discussion_id: number, client_message_id: string) {
+    return this.call<{ message: Message | null }>("discussion.send_status", {
+      discussion_id,
+      client_message_id,
+    });
+  }
+
+  createUpload(discussion_id: number, client_upload_id: string, file: File) {
+    return this.call<UploadRecord>("upload.create", {
+      discussion_id,
+      client_upload_id,
+      name: file.name,
+      size: file.size,
+      media_type: file.type,
+    });
+  }
+
+  uploadStatus(upload_ids: string[]) {
+    return this.call<UploadRecord[]>("upload.status", { upload_ids });
+  }
+
+  cancelUploads(upload_ids: string[]) {
+    return this.call<{ cancelled: number }>("upload.cancel", { upload_ids });
+  }
+
+  async #fileConnection(path: string) {
+    await this.#open();
+    if (!this.#connectionUrl) throw new Error("Connection address is missing");
+    const url = new URL(this.#connectionUrl);
+    const token = url.searchParams.get("token");
+    if (!token)
+      throw new BackendError(
+        "unauthorized",
+        "Connection authentication is missing",
+      );
+    url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+    url.pathname = path;
+    url.search = "";
+    return { url: url.toString(), authorization: `Bearer ${token}` };
+  }
+
+  async uploadFile(
+    id: string,
+    file: File,
+    signal: AbortSignal,
+    progress: (sent: number) => void,
+  ) {
+    const connection = await this.#fileConnection(
+      `/uploads/${encodeURIComponent(id)}/content`,
+    );
+    signal.throwIfAborted();
+    return new Promise<Attachment>((resolve, reject) => {
+      const request = new XMLHttpRequest();
+      const abort = () => request.abort();
+      const finish = () => signal.removeEventListener("abort", abort);
+      request.open("PUT", connection.url);
+      request.setRequestHeader("Authorization", connection.authorization);
+      request.setRequestHeader("Content-Type", "application/octet-stream");
+      request.timeout = 125_000;
+      request.responseType = "json";
+      request.upload.onprogress = (event) => progress(event.loaded);
+      request.onload = () => {
+        finish();
+        if (request.status >= 200 && request.status < 300)
+          resolve(request.response as Attachment);
+        else
+          reject(
+            new BackendError(
+              request.response?.error?.code ?? "upload_failed",
+              request.response?.error?.message ??
+                `Upload failed (${request.status})`,
+            ),
+          );
+      };
+      request.onerror = () => {
+        finish();
+        reject(new Error("Upload interrupted. Your draft is preserved."));
+      };
+      request.ontimeout = () => {
+        finish();
+        reject(new Error("Upload timed out. Your draft is preserved."));
+      };
+      request.onabort = () => {
+        finish();
+        reject(new DOMException("Upload cancelled", "AbortError"));
+      };
+      signal.addEventListener("abort", abort, { once: true });
+      request.send(file);
+    });
+  }
+
+  async attachmentFile(
+    discussion: number,
+    message: number,
+    attachment: Attachment,
+    signal: AbortSignal,
+  ) {
+    const connection = await this.#fileConnection(
+      `/discussions/${discussion}/messages/${message}/attachments/${encodeURIComponent(attachment.id)}/content`,
+    );
+    const response = await fetch(connection.url, {
+      headers: { Authorization: connection.authorization },
+      signal,
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      const error = response.headers
+        .get("content-type")
+        ?.includes("application/json")
+        ? await response.json()
+        : null;
+      throw new BackendError(
+        error?.error?.code ?? "download_failed",
+        error?.error?.message ??
+          `Could not read attachment (${response.status})`,
+      );
+    }
+    if (response.headers.get("content-length") !== String(attachment.size))
+      throw new Error("Attachment size does not match");
+    const blob = await response.blob();
+    if (blob.size !== attachment.size)
+      throw new Error("Attachment download is incomplete");
+    return blob;
   }
 
   send(discussion_id: number, body: string) {

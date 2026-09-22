@@ -10,6 +10,8 @@ import {
   useState,
 } from "react";
 import { Avatar, autoGrowHeight, Textarea } from "@/components/ui/index";
+import { DraftAttachments } from "@/features/discussions/attachments";
+import { type SendDraft, useDraft } from "@/features/discussions/draft";
 import {
   candidatesFor,
   completeMention,
@@ -154,6 +156,7 @@ export function composerKey(
 }
 
 export function Composer({
+  discussionId,
   members,
   memberIds,
   busy,
@@ -161,20 +164,39 @@ export function Composer({
   onSend,
   onHeightChange,
 }: {
+  discussionId: number;
   members: Member[];
   memberIds: ReadonlySet<number>;
   busy: boolean;
   placeholder: string;
-  onSend: (body: string) => Promise<boolean>;
+  onSend: SendDraft;
   onHeightChange: (height: number) => void;
 }) {
-  const [body, setBody] = useState("");
+  const { controller, view, error: draftError } = useDraft(discussionId);
+  const body = view?.draft.body ?? "";
+  const files = view?.draft.files ?? [];
+  const setBody = (value: string) => controller?.setBody(value);
+  const sending = busy || !!view?.busy;
+  const canSend =
+    !!controller && !!(body.trim() || files.length || view?.draft.pending);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const extra = useRef<HTMLDivElement>(null);
+  const [extraHeight, setExtraHeight] = useState(0);
+  useLayoutEffect(() => {
+    const element = extra.current;
+    if (!element) return;
+    const update = () => setExtraHeight(element.getBoundingClientRect().height);
+    const observer = new ResizeObserver(update);
+    update();
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
   const [caret, setCaret] = useState(0);
   const [highlighted, setHighlighted] = useState(0);
   const [dismissed, setDismissed] = useState(false);
   const input = useRef<HTMLTextAreaElement>(null);
   const menuId = useId();
-  const card = useRef<HTMLDivElement>(null);
+  const card = useRef<HTMLFieldSetElement>(null);
   const probe = useRef<HTMLTextAreaElement>(null);
   const topFade = useRef<HTMLDivElement>(null);
   const bottomFade = useRef<HTMLDivElement>(null);
@@ -188,7 +210,8 @@ export function Composer({
     );
     topFade.current.style.opacity = String(fades.top);
     bottomFade.current.style.opacity = String(fades.bottom);
-    bottomFade.current.style.top = `${element.offsetHeight - 32}px`;
+    topFade.current.style.top = `${element.offsetTop}px`;
+    bottomFade.current.style.top = `${element.offsetTop + element.offsetHeight - 32}px`;
   }, []);
   const [layout, setLayout] = useState({
     expanded: false,
@@ -207,12 +230,15 @@ export function Composer({
         Number.parseFloat(compactStyle.paddingTop) +
         Number.parseFloat(compactStyle.paddingBottom);
       measureInput.style.height = "auto";
-      const expanded = composerMultiline(
-        element.value,
-        measureInput.scrollHeight,
-        compactLine,
-        compactPadding,
-      );
+      const expanded =
+        files.length > 0 ||
+        !!view?.draft.pending ||
+        composerMultiline(
+          element.value,
+          measureInput.scrollHeight,
+          compactLine,
+          compactPadding,
+        );
       element.style.paddingBlock = expanded ? "14px" : "12px";
       const style = getComputedStyle(element);
       const line = Number.parseFloat(style.lineHeight);
@@ -266,7 +292,7 @@ export function Composer({
       mounted = false;
       observer.disconnect();
     };
-  }, [body, updateFades]);
+  }, [body, files.length, view?.draft.pending, extraHeight, updateFades]);
 
   useLayoutEffect(() => {
     const element = card.current;
@@ -317,11 +343,9 @@ export function Composer({
   };
 
   const submit = async () => {
-    const text = body.trim();
-    if (!text || busy) return;
-    if (!(await onSend(text)) || input.current?.value !== body) return;
-    setBody("");
-    setCaret(0);
+    if (!canSend || sending || !controller) return;
+    await controller.send(onSend);
+    if (!controller.snapshot().draft.body) setCaret(0);
   };
 
   return (
@@ -336,27 +360,126 @@ export function Composer({
         <Textarea
           ref={probe}
           variant="composer"
+          style={{ paddingLeft: 44 }}
           value={body}
           readOnly
           rows={1}
           tabIndex={-1}
         />
       </div>
-      <div
+      <fieldset
         ref={card}
+        aria-label="Message composer"
+        onDragOver={(event) => {
+          if (event.dataTransfer.types.includes("Files"))
+            event.preventDefault();
+        }}
+        onDrop={(event) => {
+          if (!event.dataTransfer.files.length) return;
+          event.preventDefault();
+          controller?.addFiles(Array.from(event.dataTransfer.files));
+        }}
         data-expanded={layout.expanded}
         className={clsx(
           "pointer-events-auto relative w-full rounded-[24px] border border-(--composer-border) bg-(--composer-card) text-(--composer-foreground) shadow-[0_1px_3px_0_rgb(0_0_0/0.1),0_1px_2px_-1px_rgb(0_0_0/0.1)] focus-within:border-(--composer-ring)/40 focus-within:ring-1 focus-within:ring-(--composer-ring)/20 hover:border-(--composer-border)/80 transition-[width,height] motion-reduce:transition-none",
           layout.expanded ? "@[601px]:w-[90%]" : "@[601px]:w-3/4",
         )}
         style={{
-          height: layout.height,
+          height: layout.height + extraHeight,
           transitionDuration: layout.smooth ? "0.4s, 0.15s" : "0.4s, 0.4s",
           transitionTimingFunction: layout.smooth
             ? "cubic-bezier(0.175,0.885,0.32,1.275), ease-out"
             : "cubic-bezier(0.175,0.885,0.32,1.275)",
         }}
       >
+        <input
+          ref={fileInput}
+          type="file"
+          multiple
+          hidden
+          aria-label="Choose attachments"
+          onChange={(event) => {
+            controller?.addFiles(Array.from(event.currentTarget.files ?? []));
+            event.currentTarget.value = "";
+          }}
+        />
+        <div ref={extra}>
+          {files.length ? (
+            <DraftAttachments
+              files={files}
+              onRemove={(id) => controller?.removeFile(id)}
+            />
+          ) : null}
+          {draftError || view?.storageError || view?.error ? (
+            <div role="alert" className="px-4 pt-3 text-sm text-red-300">
+              {draftError ?? view?.storageError ?? view?.error}
+              {view?.storageError ? (
+                <button
+                  type="button"
+                  className="ml-2 underline"
+                  onClick={() => controller?.saveAgain()}
+                >
+                  Retry saving draft
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+          {view?.draft.pending ? (
+            <div className="px-4 pt-2 text-xs">
+              <div className="truncate">
+                Saved send attempt: {view.draft.pending.body || "Files"} ·{" "}
+                {view.draft.pending.files.length} files
+              </div>
+              {sending ? (
+                view.draft.pending.phase === "uploading" ? (
+                  <button
+                    type="button"
+                    className="mt-1 underline"
+                    onClick={() => controller?.cancel()}
+                  >
+                    Cancel upload
+                  </button>
+                ) : null
+              ) : (
+                <div className="mt-1 flex gap-3">
+                  <button
+                    type="button"
+                    className="underline"
+                    onClick={() => void submit()}
+                  >
+                    Retry saved send
+                  </button>
+                  {view.draft.pending.phase === "sending" ? (
+                    <button
+                      type="button"
+                      className="underline"
+                      onClick={() => void controller?.checkResult()}
+                    >
+                      Check send result
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="underline"
+                    onClick={() => void controller?.discardAttempt()}
+                  >
+                    Discard send attempt
+                  </button>
+                </div>
+              )}
+            </div>
+          ) : null}
+          {body || files.length || view?.progress ? (
+            <div role="status" className="px-4 pt-2 text-xs opacity-70">
+              {view?.progress ??
+                (view?.saving
+                  ? "Saving draft…"
+                  : view?.storageError
+                    ? "Draft not saved"
+                    : "Draft saved")}
+            </div>
+          ) : null}
+        </div>
         {suggesting ? (
           <div
             className="absolute bottom-full mb-2 left-0 right-0 z-(--layer-popover) max-h-66 overflow-y-auto rounded-sm bg-surface-raised p-1 shadow-popover origin-bottom animate-pop-in"
@@ -416,6 +539,17 @@ export function Composer({
           <Textarea
             ref={input}
             value={body}
+            disabled={!controller}
+            style={{ paddingLeft: layout.expanded ? undefined : 44 }}
+            onPaste={(event) => {
+              const images = Array.from(event.clipboardData.files).filter(
+                (file) => file.type.startsWith("image/"),
+              );
+              if (!images.length) return;
+              if (!event.clipboardData.getData("text/plain"))
+                event.preventDefault();
+              controller?.addFiles(images);
+            }}
             rows={1}
             variant="composer"
             onScroll={updateFades}
@@ -494,22 +628,33 @@ export function Composer({
         >
           <button
             type="button"
-            disabled
-            aria-label="Attach files · Coming soon"
-            title="Attach files · Coming soon"
+            disabled={!controller}
+            onClick={() => fileInput.current?.click()}
+            aria-label="Attach files"
+            title="Attach files"
             className="ml-auto flex size-7 flex-none items-center justify-center rounded-full text-(--composer-foreground)/50 outline-none cursor-default disabled:opacity-40"
           >
             <PlusIcon />
           </button>
         </div>
+        {!layout.expanded ? (
+          <button
+            type="button"
+            aria-label="Attach files"
+            title="Attach files"
+            disabled={!controller}
+            onClick={() => fileInput.current?.click()}
+            className="absolute left-2 bottom-2 z-10 flex size-8 items-center justify-center rounded-full hover:bg-white/10"
+          >
+            <PlusIcon />
+          </button>
+        ) : null}
         <button
           type="button"
           className="absolute right-2 bottom-2 z-10 flex size-8 items-center justify-center rounded-full bg-(--composer-primary) text-(--composer-primary-foreground) transition-all duration-300 hover:enabled:opacity-90 outline-none focus-visible:ring-2 focus-visible:ring-(--composer-ring) cursor-default motion-reduce:transition-none"
-          aria-label={
-            body.trim() ? "Send · Enter" : "Voice input · Coming soon"
-          }
-          title={body.trim() ? "Send · Enter" : "Voice input · Coming soon"}
-          disabled={busy || !body.trim()}
+          aria-label={canSend ? "Send · Enter" : "Voice input · Coming soon"}
+          title={canSend ? "Send · Enter" : "Voice input · Coming soon"}
+          disabled={sending || !canSend}
           onClick={() => void submit()}
         >
           <span
@@ -519,7 +664,7 @@ export function Composer({
             <span
               className={clsx(
                 "absolute inset-0 flex items-center justify-center transition-all duration-300 ease-[cubic-bezier(0.175,0.885,0.32,1.275)] motion-reduce:transition-none",
-                body.trim()
+                canSend
                   ? "opacity-100 scale-100 rotate-0 blur-none"
                   : "opacity-0 scale-50 rotate-45 blur-[1px] pointer-events-none",
               )}
@@ -529,7 +674,7 @@ export function Composer({
             <span
               className={clsx(
                 "absolute inset-0 flex items-center justify-center transition-all duration-300 ease-[cubic-bezier(0.175,0.885,0.32,1.275)] motion-reduce:transition-none",
-                body.trim()
+                canSend
                   ? "opacity-0 scale-50 -rotate-45 blur-[1px] pointer-events-none"
                   : "opacity-100 scale-100 rotate-0 blur-none",
               )}
@@ -538,7 +683,7 @@ export function Composer({
             </span>
           </span>
         </button>
-      </div>
+      </fieldset>
     </div>
   );
 }

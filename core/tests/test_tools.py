@@ -1431,3 +1431,205 @@ def test_ui_operations_require_human_membership_and_valid_message(world) -> None
             human.ack_pending(room, message)
     assert world.store.watermark(room, HUMAN) == 0
     assert human.discussion_page(room)["messages"][0]["id"] == 1
+
+
+def test_attachment_tools_check_membership_and_preserve_original(
+    world, tmp_path
+) -> None:
+    import hashlib
+    import uuid
+    from io import BytesIO
+
+    from PIL import Image
+
+    from huddol.adapters.files.uploads import DirectoryUploads
+    from huddol.services.uploads import Uploads
+
+    world.uploads = Uploads(world.store, DirectoryUploads(tmp_path / "uploads"))
+    human = tools_for(world, HUMAN)
+    agent = tools_for(world, MAIN)
+    room = human.create_discussion("Images", [MAIN])["id"]
+    source = Path(__file__).parents[2] / "app/icons/icon.ico"
+    with Image.open(source) as image:
+        buffer = BytesIO()
+        image.convert("RGB").save(buffer, format="PNG")
+    data = buffer.getvalue()
+    upload = human.create_upload(
+        room, str(uuid.uuid4()), "picture.png", len(data), "image/png"
+    )
+    record, target = world.uploads.begin(upload["id"], HUMAN)
+    with target:
+        target.write(data)
+    world.uploads.complete(record)
+    world.uploads.end(record)
+    with pytest.raises(DomainError, match="Attachment not found"):
+        agent.view_attachment(room, 1, record.id)
+    send_id = str(uuid.uuid4())
+    sent = human.send_message(
+        room, "@Main image", attachment_ids=[record.id], client_message_id=send_id
+    )
+    assert sent["mentioned"] == [MAIN]
+    assert (
+        human.send_message(
+            room, "@Main image", attachment_ids=[record.id], client_message_id=send_id
+        )["id"]
+        == sent["id"]
+    )
+    assert len(world.store.pending(MAIN)) == 1
+    description = agent.read_discussion(room)["messages"][0]["attachments"][0]
+    assert "data" not in description
+    assert Path(description["path"]).is_absolute()
+    assert Path(description["path"]).read_bytes() == data
+    assert "path" not in human.read_discussion(room)["messages"][0]["attachments"][0]
+    assert agent.search_messages("image")[0]["attachments"][0] == description
+    result = agent.view_attachment(room, sent["id"], record.id)
+    assert result.image.data == data
+    assert result.attachment.sha256 == hashlib.sha256(data).hexdigest()
+    for actor, message in ((tools_for(world, OTHER), sent["id"]), (agent, 999)):
+        with pytest.raises(DomainError):
+            actor.view_attachment(room, message, record.id)
+    denied = tools_for(
+        world,
+        MAIN,
+        authorizer=Authorizer(
+            lambda actor, capability, target: (
+                "deny" if capability == "discussion.read" else "allow"
+            )
+        ),
+    )
+    with pytest.raises(DomainError, match="not permitted"):
+        denied.view_attachment(room, sent["id"], record.id)
+    human.remove_members(room, [MAIN])
+    with pytest.raises(DomainError, match="do not belong"):
+        agent.view_attachment(room, sent["id"], record.id)
+    human.add_members(room, [MAIN])
+    human.archive_discussion(room)
+    assert agent.view_attachment(room, sent["id"], record.id).image.data == data
+    Path(description["path"]).write_bytes(data[::-1])
+    with pytest.raises(DomainError, match="content has changed"):
+        agent.view_attachment(room, sent["id"], record.id)
+    assert agent.read_discussion(room)["messages"][0]["attachments"][0] == description
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_runner_persists_attachment_results_on_success_and_failure(
+    world, tmp_path, monkeypatch, fail
+) -> None:
+    import uuid
+    from dataclasses import replace
+    from io import BytesIO
+
+    from PIL import Image
+    from pydantic_ai import BinaryContent, ModelMessagesTypeAdapter, models
+    from pydantic_ai.messages import (
+        ModelResponse,
+        TextPart,
+        ToolCallPart,
+        ToolReturnPart,
+    )
+    from pydantic_ai.models.function import FunctionModel
+    from test_runner import FakeSettings, model_values, request
+
+    from huddol.adapters.files.uploads import DirectoryUploads
+    from huddol.adapters.model.runner import PydanticModelRunner
+    from huddol.services.uploads import Uploads
+
+    monkeypatch.setattr(models, "ALLOW_MODEL_REQUESTS", False)
+    world.uploads = Uploads(world.store, DirectoryUploads(tmp_path / "uploads"))
+    human = tools_for(world, HUMAN)
+    agent = tools_for(world, MAIN)
+    room = human.create_discussion("Image history", [MAIN])["id"]
+    with Image.open(Path(__file__).parents[2] / "app/icons/icon.ico") as source:
+        buffer = BytesIO()
+        source.convert("RGB").save(buffer, format="PNG")
+    data = buffer.getvalue()
+    upload = human.create_upload(
+        room, str(uuid.uuid4()), "picture.png", len(data), "image/png"
+    )
+    record, target = world.uploads.begin(upload["id"], HUMAN)
+    with target:
+        target.write(data)
+    world.uploads.complete(record)
+    world.uploads.end(record)
+    sent = human.send_message(room, "", attachment_ids=[record.id])
+    settings = FakeSettings()
+    settings.set_settings("model", model_values("local"))
+    run = world.history.start_run(MAIN)
+    snapshots = []
+
+    def persist(raw):
+        world.history.save_progress(MAIN, run.sequence, raw)
+        snapshots.append(raw)
+
+    def image_parts(messages):
+        return [
+            part
+            for message in messages
+            for part in message.parts
+            if isinstance(part, ToolReturnPart) and part.tool_name == "view_attachment"
+        ]
+
+    calls = 0
+
+    def respond(messages, info):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "view_attachment",
+                        {
+                            "discussion_id": room,
+                            "message_id": sent["id"],
+                            "attachment_id": record.id,
+                        },
+                        "image-call",
+                    )
+                ]
+            )
+        parts = image_parts(messages)
+        assert len(parts) == 1
+        assert parts[0].tool_call_id == "image-call"
+        description, image = parts[0].content
+        assert description["attachment_id"] == record.id
+        assert isinstance(image, BinaryContent) and image.data == data
+        if calls == 2:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "organization", {"action": "list_members"}, "members-call"
+                    )
+                ]
+            )
+        if fail:
+            raise RuntimeError("Local test failure after image result")
+        return ModelResponse(parts=[TextPart("Image received")])
+
+    runner = PydanticModelRunner(
+        settings, build_model=lambda config: FunctionModel(respond)
+    )
+    outcome = runner.run(
+        replace(request(), sequence=run.sequence, persist=persist), agent
+    )
+    assert (outcome.error is not None) == fail
+    assert any(
+        image_parts(ModelMessagesTypeAdapter.validate_json(raw)) for raw in snapshots
+    )
+    world.history.finish_run(
+        MAIN,
+        run.sequence,
+        status="failed" if fail else "completed",
+        messages_json=outcome.messages_json,
+        error=outcome.error,
+    )
+    restored = SqliteStore(tmp_path / "huddol.sqlite3")
+    try:
+        raw = SqliteAgentStore(restored._db).latest_messages(MAIN)
+        parts = image_parts(ModelMessagesTypeAdapter.validate_json(raw))
+        assert len(parts) == 1 and parts[0].tool_call_id == "image-call"
+        description, image = parts[0].content
+        assert description["attachment_id"] == record.id
+        assert isinstance(image, BinaryContent) and image.data == data
+    finally:
+        restored.close()

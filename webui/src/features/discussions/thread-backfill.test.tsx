@@ -90,6 +90,7 @@ function data(count = 3, hasBefore = true, unread: number | null = 148) {
         sender_name: "Helper",
         body: "Short",
         mentions: [],
+        attachments: [],
         created_at: "now",
       })),
       latest_id: count ? 150 : 0,

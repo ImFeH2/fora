@@ -25,6 +25,7 @@ const result: DiscussionPage = {
       sender_name: "Helper",
       body: "Unread",
       mentions: [],
+      attachments: [],
       created_at: "now",
     },
   ],

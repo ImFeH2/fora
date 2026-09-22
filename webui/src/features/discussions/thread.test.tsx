@@ -38,12 +38,14 @@ function render(
     <TooltipProvider>
       <OrganizationProvider value={organization}>
         <MessageRow
+          discussionId={1}
           message={{
             id: 1,
             sender_id: 2,
             sender_name: "Helper",
             body: "@You please review",
             mentions,
+            attachments: [],
             created_at: "2026-01-01T00:00:00Z",
           }}
           compact={false}
@@ -66,12 +68,14 @@ describe("message avatar", () => {
         <TooltipProvider>
           <OrganizationProvider value={{ ...organization, members: [] }}>
             <MessageRow
+              discussionId={1}
               message={{
                 id: 10,
                 sender_id: 42,
                 sender_name: senderName,
                 body: "Historical message",
                 mentions: [],
+                attachments: [],
                 created_at: "2026-01-01T00:00:00Z",
               }}
               compact={false}

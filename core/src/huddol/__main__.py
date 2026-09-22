@@ -205,6 +205,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from huddol.adapters.execution.manager import ExecutionManager
     from huddol.adapters.files.tree import DirectoryTree
+    from huddol.adapters.files.uploads import DirectoryUploads
     from huddol.adapters.jsonl.api import HUMAN_ID, Api
     from huddol.adapters.jsonl.protocol import Dispatcher
     from huddol.adapters.model.runner import PydanticModelRunner
@@ -212,6 +213,7 @@ def main(argv: list[str] | None = None) -> int:
     from huddol.adapters.sqlite.store import SqliteStore
     from huddol.adapters.websocket.server import WebServer, webui_directory
     from huddol.runtime.scheduler import Scheduler
+    from huddol.services.uploads import Uploads
     from huddol.tools import Dependencies
 
     directory = data_directory(options.data_dir)
@@ -239,8 +241,16 @@ def main(argv: list[str] | None = None) -> int:
         store = SqliteStore(directory / "huddol.sqlite3")
         resources.callback(store.close)
         agent_store = SqliteAgentStore(store._db)
+        agent_store.mark_interrupted()
+        agent_store.mark_session_start()
+
+        uploads = Uploads(store, DirectoryUploads(directory / "uploads"))
+        uploads.cleanup(restart=True)
         if store.get_member(HUMAN_ID) is None:
             store.create_member("human", "You")
+        for member in store.list_members():
+            if member.is_agent and member.state == "running":
+                store.set_agent_state(member.id, "idle")
 
         def agent_directory_for(member_id: int) -> Path:
             path = directory / "agents" / str(member_id)
@@ -267,6 +277,7 @@ def main(argv: list[str] | None = None) -> int:
             settings=agent_store,
             execution=execution,
             agent_directory_for=agent_directory_for,
+            uploads=uploads,
             library_tree=DirectoryTree(directory / "library"),
             workspace_tree_for=lambda member_id: DirectoryTree(
                 directory / "agents" / str(member_id) / "workspace"
@@ -306,6 +317,7 @@ def main(argv: list[str] | None = None) -> int:
                 token,
                 webui_directory(options.webui_dir),
                 port=options.port,
+                uploads=uploads,
             )
             resources.callback(server.stop)
             server.start()

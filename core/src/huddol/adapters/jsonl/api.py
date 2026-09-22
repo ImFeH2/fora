@@ -68,6 +68,7 @@ class Api:
                 member["tokens"] = usage["total_tokens"]
             return {
                 "id": 1,
+                "uuid": self._human().organization_uuid(),
                 "members": members,
                 "human_id": HUMAN_ID,
                 **self._scheduler.statistics(),
@@ -174,7 +175,34 @@ class Api:
                 int(params["discussion_id"]),
                 str(params.get("body", "")),
                 mark_read=params.get("mark_read", True),
+                attachment_ids=params.get("attachment_ids", []),
+                client_message_id=params.get("client_message_id"),
             )
+
+        def upload_create(params: dict[str, Any]) -> Any:
+            return self._human().create_upload(
+                params["discussion_id"],
+                params["client_upload_id"],
+                params["name"],
+                params["size"],
+                params.get("media_type", ""),
+            )
+
+        register("upload.create", upload_create)
+        register(
+            "upload.status",
+            lambda params: self._human().upload_status(params["upload_ids"]),
+        )
+        register(
+            "upload.cancel",
+            lambda params: self._human().cancel_uploads(params["upload_ids"]),
+        )
+        register(
+            "discussion.send_status",
+            lambda params: self._human().send_status(
+                params["discussion_id"], params["client_message_id"]
+            ),
+        )
 
         def discussion_ack(params: dict[str, Any]) -> Any:
             return self._human().ack(

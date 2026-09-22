@@ -62,10 +62,15 @@ export function mergePage(
     if (
       previous &&
       (previous.body !== message.body ||
-        previous.sender_id !== message.sender_id)
+        previous.sender_id !== message.sender_id ||
+        JSON.stringify(previous.attachments) !==
+          JSON.stringify(message.attachments))
     )
       throw new Error("Immutable message changed");
-    messages.set(message.id, message);
+    messages.set(
+      message.id,
+      previous ? { ...message, attachments: previous.attachments } : message,
+    );
   }
   const metadata = page.metadata ?? current;
   if (!metadata) throw new Error("Initial discussion page is missing metadata");

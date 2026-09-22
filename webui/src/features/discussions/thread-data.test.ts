@@ -14,6 +14,7 @@ function page(
       sender_name: "Helper",
       body: `Message ${id}`,
       mentions: [],
+      attachments: [],
       created_at: "2026-09-17T00:00:00Z",
     })),
     read_through: 5,

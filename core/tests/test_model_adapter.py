@@ -1040,4 +1040,5 @@ def test_the_full_tool_surface_matches_the_specification() -> None:
         "edit",
         "history",
         "web_search",
+        "view_attachment",
     }

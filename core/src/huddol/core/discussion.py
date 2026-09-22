@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from huddol.core.attachment import Attachment
 from huddol.core.errors import DomainError
 
 MAX_TOPIC_LENGTH = 200
@@ -24,6 +25,7 @@ class Message:
     body: str
     created_at: str
     mentions: tuple[MessageMention, ...] = ()
+    attachments: tuple[Attachment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -50,10 +52,10 @@ def validate_topic(value: object) -> str:
     return topic
 
 
-def validate_body(value: object) -> str:
+def validate_body(value: object, *, has_attachments: bool = False) -> str:
     if not isinstance(value, str):
         raise DomainError("invalid_body", "Message body must be a string")
-    if not value.strip():
+    if not value.strip() and not has_attachments:
         raise DomainError("invalid_body", "Message body must not be empty")
     if len(value) > MAX_BODY_LENGTH:
         raise DomainError(
