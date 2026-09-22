@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import secrets
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -603,7 +604,10 @@ def test_missing_ready_files_can_be_uploaded_again(tmp_path: Path) -> None:
         store.close()
 
 
-def test_process_shutdown_releases_incomplete_upload(tmp_path: Path) -> None:
+@pytest.mark.parametrize("invalid_settings", [False, True])
+def test_process_shutdown_releases_incomplete_upload(
+    tmp_path: Path, invalid_settings: bool
+) -> None:
     from test_sidecar_process import Client, Kernel
 
     environment = {name: str(tmp_path) for name in ("TMPDIR", "TEMP", "TMP")}
@@ -657,10 +661,57 @@ def test_process_shutdown_releases_incomplete_upload(tmp_path: Path) -> None:
                     break
                 assert time.monotonic() < deadline
                 time.sleep(0.01)
+            if invalid_settings:
+                database = sqlite3.connect(data_directory / "huddol.sqlite3")
+                try:
+                    with database:
+                        database.execute(
+                            "INSERT INTO settings (section, values_json) "
+                            "VALUES ('agent', ?) ON CONFLICT(section) "
+                            "DO UPDATE SET values_json = excluded.values_json",
+                            ('{"token_limit":-1}',),
+                        )
+                    log_path = data_directory / "logs" / "huddol.log"
+                    deadline = time.monotonic() + 10
+                    while (
+                        "Scheduler stopped after a runtime failure"
+                        not in log_path.read_text()
+                    ):
+                        assert time.monotonic() < deadline
+                        time.sleep(0.01)
+                    result = client.call(
+                        {
+                            "id": 5,
+                            "method": "settings.get",
+                            "params": {"section": "agent"},
+                        }
+                    )
+                    assert result["error"]["code"] == "invalid_parameter"
+                    diagnosis = httpx.get(
+                        f"http://127.0.0.1:{kernel.port}/ws",
+                        params={"token": kernel.token},
+                    )
+                    assert diagnosis.status_code == 204
+                    assert (
+                        httpx.get(f"http://127.0.0.1:{kernel.port}/ws").status_code
+                        == 401
+                    )
+                    assert client.call({"id": 6, "method": "ping"})["result"] == {
+                        "pong": None
+                    }
+                finally:
+                    database.close()
             assert kernel.shutdown() == 0, kernel.stderr
         finally:
             connection.close()
     assert not (data_directory / "uploads" / f"{upload['id']}.part").exists()
+    if invalid_settings:
+        database = sqlite3.connect(data_directory / "huddol.sqlite3")
+        try:
+            with database:
+                database.execute("DELETE FROM settings WHERE section = 'agent'")
+        finally:
+            database.close()
     with (
         Kernel(data_directory, env=environment) as restarted,
         restarted.connect() as control,
