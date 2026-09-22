@@ -521,10 +521,24 @@ class AgentTools:
     def send_status(self, discussion_id: int, client_message_id: str) -> dict[str, Any]:
         self._check("discussion.send_status", discussion_id)
         self._require_membership(discussion_id)
-        result = self._deps.store.message_receipt(
+        state, result = self._deps.store.send_outcome(
             discussion_id, self._actor.member_id, identifier(client_message_id)
         )
-        return {"message": self._message(result) if result is not None else None}
+        return {
+            "state": state,
+            "message": self._message(result) if result is not None else None,
+        }
+
+    def cancel_send(self, discussion_id: int, client_message_id: str) -> dict[str, Any]:
+        self._check("discussion.cancel_send", discussion_id)
+        self._require_membership(discussion_id)
+        state, result = self._deps.store.cancel_send(
+            discussion_id, self._actor.member_id, identifier(client_message_id)
+        )
+        return {
+            "state": state,
+            "message": self._message(result) if result is not None else None,
+        }
 
     def send_message(
         self,
@@ -545,8 +559,27 @@ class AgentTools:
         validated = validate_body(body, has_attachments=bool(attachment_ids))
         if len(attachment_ids) > 10:
             raise DomainError("invalid_attachments", "Choose up to 10 distinct files")
-        for upload_id in attachment_ids:
-            self._uploads().status(upload_id, self._actor.member_id)
+        state = "unknown"
+        if client_message_id is not None:
+            state, _ = self._deps.store.send_outcome(
+                discussion_id, self._actor.member_id, identifier(client_message_id)
+            )
+        if state == "cancelled":
+            raise DomainError("send_cancelled", "This send attempt was cancelled")
+        if state == "unknown":
+            try:
+                for upload_id in attachment_ids:
+                    self._uploads().status(upload_id, self._actor.member_id)
+            except (DomainError, OSError):
+                if client_message_id is not None:
+                    state, _ = self._deps.store.send_outcome(
+                        discussion_id, self._actor.member_id, client_message_id
+                    )
+                    if state == "cancelled":
+                        raise DomainError(
+                            "send_cancelled", "This send attempt was cancelled"
+                        ) from None
+                raise
         message, mentions, created = self._deps.store.submit_message(
             discussion_id,
             self._actor.member_id,

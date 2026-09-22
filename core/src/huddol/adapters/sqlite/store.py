@@ -99,7 +99,10 @@ CREATE TABLE IF NOT EXISTS message_receipts (
     discussion_id INTEGER NOT NULL,
     owner_id INTEGER NOT NULL,
     client_message_id TEXT NOT NULL,
-    message_id INTEGER NOT NULL,
+    message_id INTEGER,
+    state TEXT NOT NULL DEFAULT 'sent',
+    CHECK ((state = 'sent' AND message_id IS NOT NULL) OR
+           (state = 'cancelled' AND message_id IS NULL)),
     PRIMARY KEY(discussion_id, owner_id, client_message_id),
     FOREIGN KEY(discussion_id, message_id) REFERENCES messages(discussion_id, id)
 );
@@ -357,6 +360,29 @@ class SqliteStore:
             connection.execute("PRAGMA foreign_keys=ON")
             self._db = LockedConnection(connection)
             self._db.executescript(SCHEMA)
+            if "state" not in {
+                row["name"]
+                for row in self._db.execute("PRAGMA table_info(message_receipts)")
+            }:
+                with self._db:
+                    self._db.execute(
+                        "ALTER TABLE message_receipts RENAME TO sent_receipts"
+                    )
+                    self._db.execute(
+                        "CREATE TABLE message_receipts ("
+                        "discussion_id INTEGER NOT NULL, owner_id INTEGER NOT NULL, "
+                        "client_message_id TEXT NOT NULL, message_id INTEGER, "
+                        "state TEXT NOT NULL DEFAULT 'sent', "
+                        "CHECK ((state = 'sent' AND message_id IS NOT NULL) OR "
+                        "(state = 'cancelled' AND message_id IS NULL)), "
+                        "PRIMARY KEY(discussion_id, owner_id, client_message_id), "
+                        "FOREIGN KEY(discussion_id, message_id) REFERENCES messages(discussion_id, id))"
+                    )
+                    self._db.execute(
+                        "INSERT INTO message_receipts "
+                        "SELECT discussion_id, owner_id, client_message_id, message_id, 'sent' FROM sent_receipts"
+                    )
+                    self._db.execute("DROP TABLE sent_receipts")
             if "length" not in {
                 row["name"] for row in self._db.execute("PRAGMA table_info(mentions)")
             }:
@@ -627,6 +653,35 @@ class SqliteStore:
             )
             return rows[0] if rows else None
 
+    def send_outcome(
+        self, discussion_id: int, owner_id: int, client_message_id: str
+    ) -> tuple[str, Message | None]:
+        identifier(client_message_id)
+        with self._db.transaction(immediate=False):
+            self._member_discussion(discussion_id, owner_id)
+            row = first(
+                self._db.execute(
+                    "SELECT state FROM message_receipts WHERE discussion_id = ? AND owner_id = ? AND client_message_id = ?",
+                    (discussion_id, owner_id, client_message_id),
+                )
+            )
+            state = str(row["state"]) if row is not None else "unknown"
+            message = self.message_receipt(discussion_id, owner_id, client_message_id)
+            return state, message
+
+    def cancel_send(
+        self, discussion_id: int, owner_id: int, client_message_id: str
+    ) -> tuple[str, Message | None]:
+        identifier(client_message_id)
+        with self._write() as db:
+            self._member_discussion(discussion_id, owner_id)
+            db.execute(
+                "INSERT INTO message_receipts(discussion_id, owner_id, client_message_id, state) VALUES (?, ?, ?, 'cancelled') "
+                "ON CONFLICT(discussion_id, owner_id, client_message_id) DO NOTHING",
+                (discussion_id, owner_id, client_message_id),
+            )
+            return self.send_outcome(discussion_id, owner_id, client_message_id)
+
     @contextmanager
     def _write(self) -> Iterator[LockedConnection]:
         with self._db as connection:
@@ -885,9 +940,13 @@ class SqliteStore:
         with self._write() as db:
             discussion = self._member_discussion(discussion_id, sender_id)
             if client_message_id is not None:
-                previous = self.message_receipt(
+                state, previous = self.send_outcome(
                     discussion_id, sender_id, client_message_id
                 )
+                if state == "cancelled":
+                    raise DomainError(
+                        "send_cancelled", "This send attempt was cancelled"
+                    )
                 if previous is not None:
                     if previous.body != body or tuple(
                         item.id for item in previous.attachments

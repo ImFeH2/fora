@@ -270,6 +270,8 @@ function ThreadSession({ id }: { id: number }) {
       await thread.request("after");
       return true;
     } catch (failure) {
+      if (failure instanceof BackendError && failure.code === "send_cancelled")
+        return "cancelled" as const;
       if (sent) {
         if (thread.live.current) backend.reportFailure(failure);
         return true;

@@ -841,10 +841,17 @@ export class Backend {
   }
 
   sendStatus(discussion_id: number, client_message_id: string) {
-    return this.call<{ message: Message | null }>("discussion.send_status", {
-      discussion_id,
-      client_message_id,
-    });
+    return this.call<{
+      state: "sent" | "cancelled" | "unknown";
+      message: Message | null;
+    }>("discussion.send_status", { discussion_id, client_message_id });
+  }
+
+  cancelSend(discussion_id: number, client_message_id: string) {
+    return this.call<{
+      state: "sent" | "cancelled";
+      message: Message | null;
+    }>("discussion.cancel_send", { discussion_id, client_message_id });
   }
 
   createUpload(discussion_id: number, client_upload_id: string, file: File) {

@@ -151,6 +151,7 @@ function prepareApplication() {
   vi.spyOn(backend, "onFailure").mockReturnValue(vi.fn());
   vi.spyOn(backend, "organization").mockResolvedValue({
     id: 1,
+    uuid: "test-organization",
     members: [],
     human_id: 1,
     token_limit: null,

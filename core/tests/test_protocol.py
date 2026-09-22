@@ -3,21 +3,28 @@ from __future__ import annotations
 import io
 import json
 import sqlite3
+import threading
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import pytest
+from websockets.sync.client import connect
 
 from huddol.adapters.execution.manager import ExecutionManager
 from huddol.adapters.files.tree import DirectoryTree
+from huddol.adapters.files.uploads import DirectoryUploads
 from huddol.adapters.jsonl.api import HUMAN_ID, Api
 from huddol.adapters.jsonl.protocol import Dispatcher, parse, wait_for_shutdown
 from huddol.adapters.model.runner import PydanticModelRunner
 from huddol.adapters.sqlite.agent import SqliteAgentStore
 from huddol.adapters.sqlite.store import SqliteStore
+from huddol.adapters.websocket.server import WebServer
+from huddol.core.errors import DomainError
 from huddol.core.parameters import AgentParameters
 from huddol.runtime.scheduler import Scheduler
+from huddol.services.uploads import Uploads
 from huddol.tools import Dependencies
 
 
@@ -101,6 +108,223 @@ def call(dispatcher: Dispatcher, output: Capture, method: str, **params: Any) ->
     responses = [item for item in frames if item.get("type") == "response"]
     assert responses, f"no response for {method}"
     return responses[-1]
+
+
+@pytest.mark.parametrize(
+    "reuse_id,cancel", [(False, False), (True, False), (False, True)]
+)
+def test_send_receipt_before_disconnected_worker_commits(
+    server, monkeypatch, reuse_id: bool, cancel: bool
+) -> None:
+    dispatcher, _, deps = server
+    store = deps.store
+    room = store.create_discussion("Send recovery", [HUMAN_ID])
+    original = store.submit_message
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+    first_id = str(uuid.uuid4())
+    second_id = first_id if reuse_id else str(uuid.uuid4())
+    first = True
+
+    def paused(*args, **kwargs):
+        nonlocal first
+        if first:
+            first = False
+            entered.set()
+            assert release.wait(10)
+            try:
+                return original(*args, **kwargs)
+            finally:
+                completed.set()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "submit_message", paused)
+    token = str(uuid.uuid4())
+    web = WebServer(dispatcher, token, None)
+    web.start()
+    url = f"ws://127.0.0.1:{web.port}/ws?token={token}"
+
+    def request(connection, request_id, method, **params):
+        connection.send(
+            json.dumps({"id": request_id, "method": method, "params": params})
+        )
+        while True:
+            frame = json.loads(connection.recv(timeout=5))
+            if frame.get("type") == "response" and frame.get("id") == request_id:
+                return frame
+
+    try:
+        with connect(url, close_timeout=0.1) as old:
+            old.send(
+                json.dumps(
+                    {
+                        "id": 1,
+                        "method": "discussion.send",
+                        "params": {
+                            "discussion_id": room.id,
+                            "body": "Pending message",
+                            "client_message_id": first_id,
+                        },
+                    }
+                )
+            )
+            assert entered.wait(5)
+        with connect(url) as current:
+            status = request(
+                current,
+                2,
+                "discussion.send_status",
+                discussion_id=room.id,
+                client_message_id=first_id,
+            )
+            assert status["result"] == {"state": "unknown", "message": None}
+            if cancel:
+                cancelled = request(
+                    current,
+                    4,
+                    "discussion.cancel_send",
+                    discussion_id=room.id,
+                    client_message_id=first_id,
+                )
+                assert cancelled["result"] == {"state": "cancelled", "message": None}
+                assert store.message_count(room.id) == 0
+            sent = request(
+                current,
+                3,
+                "discussion.send",
+                discussion_id=room.id,
+                body="Pending message",
+                client_message_id=second_id,
+            )
+            assert "result" in sent
+            assert store.message_count(room.id) == 1
+            release.set()
+            assert completed.wait(5)
+            expected = 1 if reuse_id or cancel else 2
+            assert store.message_count(room.id) == expected
+            assert [message.body for message in store.messages(room.id)] == [
+                "Pending message"
+            ] * expected
+            final = request(
+                current,
+                5,
+                "discussion.send_status",
+                discussion_id=room.id,
+                client_message_id=first_id,
+            )
+            assert final["result"]["state"] == ("cancelled" if cancel else "sent")
+    finally:
+        release.set()
+        web.stop()
+
+
+@pytest.mark.parametrize("during_validation", [False, True])
+def test_cancelled_send_after_attachment_cleanup(
+    server, tmp_path: Path, monkeypatch, during_validation: bool
+) -> None:
+    dispatcher, output, deps = server
+    store = deps.store
+    reader = store.create_member("agent", "Reader")
+    room = store.create_discussion("Files", [HUMAN_ID, reader.id])
+    files = DirectoryUploads(tmp_path / "uploads")
+    uploads = Uploads(store, files)
+    deps.uploads = uploads
+    data = b"A real attachment"
+    record = uploads.create(
+        room.id, HUMAN_ID, str(uuid.uuid4()), "file.txt", len(data), "text/plain"
+    )
+    active, target = uploads.begin(record.id, HUMAN_ID)
+    with target:
+        target.write(data)
+    uploads.complete(active)
+    uploads.end(active)
+    attempt = str(uuid.uuid4())
+
+    def cancel():
+        response = call(
+            dispatcher,
+            output,
+            "discussion.cancel_send",
+            discussion_id=room.id,
+            client_message_id=attempt,
+        )
+        assert response["result"] == {"state": "cancelled", "message": None}
+        uploads.cancel(record.id, HUMAN_ID)
+
+    if during_validation:
+
+        def status(*args):
+            cancel()
+            raise DomainError("attachment_missing", "Attachment removed")
+
+        monkeypatch.setattr(uploads, "status", status)
+    else:
+        cancel()
+    result = call(
+        dispatcher,
+        output,
+        "discussion.send",
+        discussion_id=room.id,
+        body="@Reader",
+        attachment_ids=[record.id],
+        client_message_id=attempt,
+    )
+    assert result["error"]["code"] == "send_cancelled"
+    assert store.message_count(room.id) == 0
+    assert store.pending(reader.id) == ()
+    assert store.watermark(room.id, HUMAN_ID) == 0
+    assert store.get_upload(record.id, HUMAN_ID).state == "expired"
+    assert not list((tmp_path / "uploads").rglob("*.part"))
+    assert store.send_outcome(room.id, HUMAN_ID, attempt) == ("cancelled", None)
+
+
+def test_cancel_response_loss_and_cleanup_failure(
+    server, tmp_path: Path, monkeypatch
+) -> None:
+    dispatcher, output, deps = server
+    store = deps.store
+    room = store.create_discussion("Cancel", [HUMAN_ID])
+    files = DirectoryUploads(tmp_path / "uploads")
+    uploads = Uploads(store, files)
+    deps.uploads = uploads
+    record = uploads.create(
+        room.id, HUMAN_ID, str(uuid.uuid4()), "file.txt", 4, "text/plain"
+    )
+    attempt = str(uuid.uuid4())
+    request = parse(
+        json.dumps(
+            {
+                "id": 7,
+                "method": "discussion.cancel_send",
+                "params": {"discussion_id": room.id, "client_message_id": attempt},
+            }
+        )
+    )
+    assert request is not None
+    dispatcher.handle(request, lambda response: None)
+    repeated = call(
+        dispatcher,
+        output,
+        "discussion.cancel_send",
+        discussion_id=room.id,
+        client_message_id=attempt,
+    )
+    assert repeated["result"] == {"state": "cancelled", "message": None}
+    original = files.discard
+
+    def fail(upload_id):
+        raise OSError("Cannot remove file")
+
+    monkeypatch.setattr(files, "discard", fail)
+    with pytest.raises(OSError, match="Cannot remove"):
+        uploads.cancel(record.id, HUMAN_ID)
+    assert store.send_outcome(room.id, HUMAN_ID, attempt) == ("cancelled", None)
+    assert store.get_upload(record.id, HUMAN_ID).state == "deleting"
+    monkeypatch.setattr(files, "discard", original)
+    uploads.cancel(record.id, HUMAN_ID)
+    assert store.get_upload(record.id, HUMAN_ID).state == "expired"
+    assert store.message_count(room.id) == 0
 
 
 def test_bad_json_produces_an_error_event_not_a_crash(server) -> None:

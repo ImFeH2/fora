@@ -11,6 +11,7 @@ vi.mock("idb", () => ({
 vi.mock("@/lib/backend", () => ({
   backend: {
     sendStatus: vi.fn(),
+    cancelSend: vi.fn(),
     createUpload: vi.fn(),
     uploadStatus: vi.fn(),
     uploadFile: vi.fn(),
@@ -69,6 +70,7 @@ describe("persistent send attempts", () => {
     expect(attempt?.phase).toBe("sending");
     expect(controller.snapshot().draft.body).toBe("First message");
     vi.mocked(backend.sendStatus).mockResolvedValue({
+      state: "sent",
       message: { id: 9 },
     } as Awaited<ReturnType<typeof backend.sendStatus>>);
     await controller.send(onSend);
@@ -91,6 +93,7 @@ describe("persistent send attempts", () => {
     );
     storage.put.mockResolvedValue();
     vi.mocked(backend.sendStatus).mockResolvedValue({
+      state: "sent",
       message: { id: 9 },
     } as Awaited<ReturnType<typeof backend.sendStatus>>);
     await controller.checkResult();
@@ -115,7 +118,7 @@ describe("persistent send attempts", () => {
     const send = vi.fn();
     await controller.send(send);
     expect(send).not.toHaveBeenCalled();
-    response.resolve({ message: null });
+    response.resolve({ state: "unknown", message: null });
     await check;
     expect(controller.snapshot().busy).toBe(false);
     expect(controller.snapshot().draft.pending?.id).toBe("attempt");
@@ -230,6 +233,163 @@ describe("persistent send attempts", () => {
     expect(controller.snapshot().draft.pending?.files[0].file).toBe(file);
     expect(controller.snapshot().busy).toBe(false);
     expect(controller.snapshot().error).toBeTruthy();
+  });
+
+  it("keeps an unknown attempt until cancellation is confirmed", async () => {
+    const controller = new DraftController(1, draft());
+    const send = vi.fn().mockResolvedValue(false);
+    await controller.send(send);
+    const attempt = controller.snapshot().draft.pending;
+    const response = deferred<Awaited<ReturnType<typeof backend.cancelSend>>>();
+    vi.mocked(backend.cancelSend).mockReturnValue(response.promise);
+    const cancellation = controller.discardAttempt();
+    controller.setBody("Edited while cancelling");
+    controller.addFiles([new File(["new"], "new.txt")]);
+    expect(controller.snapshot().draft.pending).toEqual(attempt);
+    await controller.send(send);
+    expect(send).toHaveBeenCalledOnce();
+    response.resolve({ state: "cancelled", message: null });
+    await cancellation;
+    expect(controller.snapshot().draft.pending).toBeNull();
+    expect(controller.snapshot().draft.body).toBe("Edited while cancelling");
+    expect(controller.snapshot().draft.files).toHaveLength(1);
+    expect(backend.cancelSend).toHaveBeenCalledWith(1, attempt?.id);
+    controller.removeFile(controller.snapshot().draft.files[0].id);
+    send.mockResolvedValue(true);
+    await controller.send(send);
+    expect(send.mock.calls[1][2]).not.toBe(attempt?.id);
+  });
+
+  it("keeps the attempt when cancelling loses its response and recovers by status", async () => {
+    const controller = new DraftController(1, draft());
+    await controller.send(vi.fn().mockResolvedValue(false));
+    const attempt = controller.snapshot().draft.pending;
+    vi.mocked(backend.cancelSend).mockRejectedValue(new Error("Disconnected"));
+    await controller.discardAttempt();
+    expect(controller.snapshot().draft.pending).toEqual(attempt);
+    vi.mocked(backend.sendStatus).mockResolvedValue({
+      state: "unknown",
+      message: null,
+    });
+    await controller.checkResult();
+    expect(controller.snapshot().draft.pending).toEqual(attempt);
+    expect(controller.snapshot().error).toContain("unconfirmed");
+    vi.mocked(backend.sendStatus).mockResolvedValue({
+      state: "cancelled",
+      message: null,
+    });
+    await controller.checkResult();
+    expect(controller.snapshot().draft.pending).toBeNull();
+    expect(controller.snapshot().draft.body).toBe("First message");
+  });
+
+  it("keeps edits when cancellation finds the message already sent", async () => {
+    const controller = new DraftController(1, draft());
+    await controller.send(vi.fn().mockResolvedValue(false));
+    controller.setBody("Next message");
+    vi.mocked(backend.cancelSend).mockResolvedValue({
+      state: "sent",
+      message: { id: 9 },
+    } as Awaited<ReturnType<typeof backend.cancelSend>>);
+    await controller.discardAttempt();
+    expect(controller.snapshot().draft.pending).toBeNull();
+    expect(controller.snapshot().draft.body).toBe("Next message");
+    expect(backend.cancelUploads).not.toHaveBeenCalled();
+    expect(controller.snapshot().progress).toBe("Message sent");
+  });
+
+  it("retains cancelled attempts when IndexedDB fails", async () => {
+    const controller = new DraftController(1, draft());
+    await controller.send(vi.fn().mockResolvedValue(false));
+    const attempt = controller.snapshot().draft.pending;
+    controller.setBody("Current edit");
+    storage.put.mockRejectedValue(new Error("Storage unavailable"));
+    vi.mocked(backend.cancelSend).mockResolvedValue({
+      state: "cancelled",
+      message: null,
+    });
+    await controller.discardAttempt();
+    expect(controller.snapshot().draft.pending).toEqual(attempt);
+    expect(controller.snapshot().draft.body).toBe("Current edit");
+    expect(controller.snapshot().storageError).toContain("Storage unavailable");
+    storage.put.mockResolvedValue();
+    vi.mocked(backend.sendStatus).mockResolvedValue({
+      state: "cancelled",
+      message: null,
+    });
+    await controller.checkResult();
+    expect(controller.snapshot().draft.pending).toBeNull();
+    expect(controller.snapshot().draft.body).toBe("Current edit");
+  });
+
+  it("retries attachment cleanup before completing a cancelled attempt", async () => {
+    const initial = draft();
+    const item = {
+      id: "file",
+      clientId: "upload-client",
+      file: new File(["content"], "file.txt"),
+      upload: { id: "uploaded", state: "ready" as const, expires_at: 0 },
+    };
+    initial.files = [item];
+    initial.pending = {
+      id: "attempt",
+      body: initial.body,
+      bodyRevision: 0,
+      files: [item],
+      phase: "sending",
+    };
+    const controller = new DraftController(1, initial);
+    vi.mocked(backend.sendStatus).mockResolvedValue({
+      state: "cancelled",
+      message: null,
+    });
+    vi.mocked(backend.cancelUploads).mockRejectedValueOnce(
+      new Error("Cleanup failed"),
+    );
+    await controller.checkResult();
+    expect(controller.snapshot().draft.pending?.id).toBe("attempt");
+    expect(controller.snapshot().draft.files[0].file).toBe(item.file);
+    vi.mocked(backend.cancelUploads).mockResolvedValue({ cancelled: 1 });
+    const send = vi.fn();
+    await controller.send(send);
+    expect(send).not.toHaveBeenCalled();
+    expect(controller.snapshot().draft.pending).toBeNull();
+    expect(controller.snapshot().draft.files[0].file).toBe(item.file);
+    expect(controller.snapshot().draft.files[0].upload).toBeUndefined();
+    expect(controller.snapshot().draft.files[0].clientId).not.toBe(
+      item.clientId,
+    );
+  });
+
+  it("uses the saved attachment IDs while retrying an unknown send", async () => {
+    const initial = draft();
+    const item = {
+      id: "file",
+      clientId: "upload-client",
+      file: new File(["data"], "file.txt"),
+      upload: { id: "uploaded", state: "ready" as const, expires_at: 0 },
+    };
+    initial.files = [item];
+    initial.pending = {
+      id: "attempt",
+      body: initial.body,
+      bodyRevision: 0,
+      files: [item],
+      phase: "sending",
+    };
+    const controller = new DraftController(1, initial);
+    vi.mocked(backend.sendStatus).mockResolvedValue({
+      state: "unknown",
+      message: null,
+    });
+    const send = vi.fn().mockResolvedValue("cancelled");
+    await controller.send(send);
+    expect(send).toHaveBeenCalledWith("First message", ["uploaded"], "attempt");
+    expect(backend.uploadStatus).not.toHaveBeenCalled();
+    expect(backend.createUpload).not.toHaveBeenCalled();
+    expect(controller.snapshot().draft.pending).toBeNull();
+    expect(controller.snapshot().draft.files[0].file).toBe(item.file);
+    expect(controller.snapshot().draft.body).toBe("First message");
   });
 
   it("does not transmit when saving the attempt fails", async () => {

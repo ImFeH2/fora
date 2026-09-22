@@ -204,6 +204,13 @@ class Api:
             ),
         )
 
+        register(
+            "discussion.cancel_send",
+            lambda params: self._human().cancel_send(
+                params["discussion_id"], params["client_message_id"]
+            ),
+        )
+
         def discussion_ack(params: dict[str, Any]) -> Any:
             return self._human().ack(
                 int(params["discussion_id"]), list(params.get("message_ids", []))

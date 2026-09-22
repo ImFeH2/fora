@@ -481,6 +481,156 @@ def test_attachment_and_model_settings_share_outer_transaction(
         store.close()
 
 
+@pytest.mark.parametrize("sent_first", [False, True])
+def test_send_cancellation_receipts_survive_restart(
+    tmp_path: Path, sent_first: bool
+) -> None:
+    database = tmp_path / "cancel.sqlite3"
+    store = SqliteStore(database)
+    human = store.create_member("human", "You")
+    reader = store.create_member("agent", "Reader")
+    room = store.create_discussion("Cancel", [human.id, reader.id])
+    other = store.create_discussion("Other", [human.id])
+    attempt = str(uuid.uuid4())
+    try:
+        assert store.send_outcome(room.id, human.id, attempt) == ("unknown", None)
+        if sent_first:
+            store.submit_message(
+                room.id, human.id, "@Reader", client_message_id=attempt, mark_read=True
+            )
+        state, message = store.cancel_send(room.id, human.id, attempt)
+        assert state == ("sent" if sent_first else "cancelled")
+        assert (message is not None) == sent_first
+        assert store.cancel_send(room.id, human.id, attempt) == (state, message)
+        assert store.message_count(room.id) == int(sent_first)
+        assert len(store.pending(reader.id)) == int(sent_first)
+        assert store.watermark(room.id, human.id) == int(sent_first)
+        assert store.send_outcome(room.id, reader.id, attempt) == ("unknown", None)
+        assert store.send_outcome(other.id, human.id, attempt) == ("unknown", None)
+        with pytest.raises(DomainError):
+            store.send_outcome(other.id, reader.id, attempt)
+        with pytest.raises(DomainError):
+            store.cancel_send(other.id, reader.id, attempt)
+    finally:
+        store.close()
+    restored = SqliteStore(database)
+    try:
+        assert restored.send_outcome(room.id, human.id, attempt)[0] == state
+        if sent_first:
+            repeated, _, created = restored.submit_message(
+                room.id, human.id, "@Reader", client_message_id=attempt
+            )
+            assert not created and repeated == message
+            with pytest.raises(DomainError, match="different message content"):
+                restored.submit_message(
+                    room.id, human.id, "Changed", client_message_id=attempt
+                )
+        else:
+            with pytest.raises(DomainError, match="cancelled"):
+                restored.submit_message(
+                    room.id, human.id, "@Reader", client_message_id=attempt
+                )
+        assert restored.message_count(room.id) == int(sent_first)
+    finally:
+        restored.close()
+
+
+def _verify_cancelled_send_in_process(
+    database: Path, discussion_id: int, owner_id: int, attempt: str
+) -> None:
+    store = SqliteStore(database)
+    try:
+        assert store.send_outcome(discussion_id, owner_id, attempt) == (
+            "cancelled",
+            None,
+        )
+        with pytest.raises(DomainError, match="cancelled"):
+            store.submit_message(
+                discussion_id, owner_id, "Late send", client_message_id=attempt
+            )
+        assert store.message_count(discussion_id) == 0
+    finally:
+        store.close()
+
+
+def test_cancelled_send_in_new_process(tmp_path: Path) -> None:
+    database = tmp_path / "process.sqlite3"
+    store = SqliteStore(database)
+    human = store.create_member("human", "You")
+    room = store.create_discussion("Cancel", [human.id])
+    attempt = str(uuid.uuid4())
+    store.cancel_send(room.id, human.id, attempt)
+    store.close()
+    worker = multiprocessing.get_context("spawn").Process(
+        target=_verify_cancelled_send_in_process,
+        args=(database, room.id, human.id, attempt),
+    )
+    worker.start()
+    try:
+        worker.join(20)
+        assert worker.exitcode == 0
+    finally:
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(5)
+        worker.close()
+
+
+@pytest.mark.parametrize("phase", ["BEFORE", "AFTER"])
+def test_cancel_receipt_write_failure_is_atomic(tmp_path: Path, phase: str) -> None:
+    store = SqliteStore(tmp_path / "rollback.sqlite3")
+    try:
+        human = store.create_member("human", "You")
+        room = store.create_discussion("Cancel", [human.id])
+        attempt = str(uuid.uuid4())
+        store._db.execute(
+            f"CREATE TRIGGER reject_cancel {phase} INSERT ON message_receipts "
+            "WHEN NEW.state = 'cancelled' BEGIN SELECT RAISE(ABORT, 'cancel failed'); END"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="cancel failed"):
+            store.cancel_send(room.id, human.id, attempt)
+        assert store.send_outcome(room.id, human.id, attempt) == ("unknown", None)
+        assert store.message_count(room.id) == 0
+        store._db.execute("DROP TRIGGER reject_cancel")
+        assert store.cancel_send(room.id, human.id, attempt) == ("cancelled", None)
+    finally:
+        store.close()
+
+
+def test_existing_sent_receipts_migrate(tmp_path: Path) -> None:
+    database = tmp_path / "migrate.sqlite3"
+    store = SqliteStore(database)
+    human = store.create_member("human", "You")
+    room = store.create_discussion("Migration", [human.id])
+    attempt = str(uuid.uuid4())
+    message, _, _ = store.submit_message(
+        room.id, human.id, "Saved", client_message_id=attempt
+    )
+    with store._db:
+        store._db.execute("ALTER TABLE message_receipts RENAME TO current_receipts")
+        store._db.execute(
+            "CREATE TABLE message_receipts (discussion_id INTEGER NOT NULL, "
+            "owner_id INTEGER NOT NULL, client_message_id TEXT NOT NULL, message_id INTEGER NOT NULL, "
+            "PRIMARY KEY(discussion_id, owner_id, client_message_id), "
+            "FOREIGN KEY(discussion_id, message_id) REFERENCES messages(discussion_id, id))"
+        )
+        store._db.execute(
+            "INSERT INTO message_receipts SELECT discussion_id, owner_id, client_message_id, message_id FROM current_receipts"
+        )
+        store._db.execute("DROP TABLE current_receipts")
+    store.close()
+    restored = SqliteStore(database)
+    try:
+        assert restored.send_outcome(room.id, human.id, attempt) == ("sent", message)
+        assert restored.cancel_send(room.id, human.id, str(uuid.uuid4())) == (
+            "cancelled",
+            None,
+        )
+        assert restored._db.execute("PRAGMA foreign_key_check") == []
+    finally:
+        restored.close()
+
+
 def test_real_upload_transaction_and_restart(tmp_path: Path) -> None:
     source = Path(__file__).parents[2] / "app/icons/icon.ico"
     image_path = tmp_path / "picture.png"

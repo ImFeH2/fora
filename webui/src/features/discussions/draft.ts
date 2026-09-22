@@ -98,7 +98,7 @@ export type SendDraft = (
   body: string,
   attachments: string[],
   id: string,
-) => Promise<boolean>;
+) => Promise<boolean | "cancelled">;
 
 export class DraftController {
   #view: DraftView;
@@ -223,17 +223,43 @@ export class DraftController {
     this.#notify({ error: null, progress: "Message sent" });
   }
 
+  async #cancelled(submission: Submission) {
+    const ids = submission.files.flatMap((item) =>
+      item.upload ? [item.upload.id] : [],
+    );
+    if (ids.length) await backend.cancelUploads(ids);
+    const current = this.#view.draft;
+    const cancelled = new Set(submission.files.map((item) => item.id));
+    const saved = await this.#persist({
+      ...current,
+      files: current.files.map((item) =>
+        cancelled.has(item.id)
+          ? { ...item, clientId: crypto.randomUUID(), upload: undefined }
+          : item,
+      ),
+      pending: null,
+    });
+    if (!saved) {
+      this.#notify({ draft: { ...this.#view.draft, pending: submission } });
+      throw new Error(
+        "Send attempt cancelled. Save the draft to finish recovery.",
+      );
+    }
+    this.#notify({ error: null, progress: "Send attempt cancelled" });
+  }
+
   async checkResult() {
     const pending = this.#view.draft.pending;
     if (pending?.phase !== "sending" || this.#view.busy) return;
     this.#notify({ busy: true });
     try {
       const result = await backend.sendStatus(this.discussionId, pending.id);
-      if (result.message) await this.#finish(pending);
+      if (result.state === "sent") await this.#finish(pending);
+      else if (result.state === "cancelled") await this.#cancelled(pending);
       else
         this.#notify({
           error:
-            "This message has not been sent. Retry the saved send attempt.",
+            "Send result is unconfirmed. Retry or cancel the saved send attempt.",
         });
     } catch (error) {
       this.#notify({
@@ -250,18 +276,13 @@ export class DraftController {
     this.#notify({ busy: true });
     try {
       if (pending.phase === "sending") {
-        const result = await backend.sendStatus(this.discussionId, pending.id);
-        if (result.message) {
+        const result = await backend.cancelSend(this.discussionId, pending.id);
+        if (result.state === "sent") {
           await this.#finish(pending);
           return;
         }
       }
-      const ids = pending.files.flatMap((item) =>
-        item.upload ? [item.upload.id] : [],
-      );
-      if (ids.length) await backend.cancelUploads(ids);
-      await this.#persist({ ...this.#view.draft, pending: null });
-      this.#notify({ error: null, progress: null });
+      await this.#cancelled(pending);
     } catch (error) {
       this.#notify({
         error: error instanceof Error ? error.message : String(error),
@@ -291,13 +312,21 @@ export class DraftController {
           this.discussionId,
           submission.id,
         );
-        if (result.message) {
+        if (result.state === "sent") {
           await this.#finish(submission);
+          return;
+        }
+        if (result.state === "cancelled") {
+          await this.#cancelled(submission);
           return;
         }
       }
       await this.#pending(submission);
-      for (let index = 0; index < submission.files.length; index++) {
+      for (
+        let index = 0;
+        submission.phase === "uploading" && index < submission.files.length;
+        index++
+      ) {
         abort.signal.throwIfAborted();
         let item = submission.files[index];
         let upload = item.upload
@@ -360,7 +389,12 @@ export class DraftController {
         if (!item.upload) throw new Error("An uploaded file is missing its ID");
         return item.upload.id;
       });
-      if (!(await onSend(submission.body, ids, submission.id)))
+      const result = await onSend(submission.body, ids, submission.id);
+      if (result === "cancelled") {
+        await this.#cancelled(submission);
+        return;
+      }
+      if (!result)
         throw new Error(
           "Send result is unconfirmed. Check the saved send attempt before retrying.",
         );
