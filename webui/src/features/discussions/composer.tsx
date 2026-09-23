@@ -197,35 +197,85 @@ export function Composer({
   const [voiceError, setVoiceError] = useState("");
   const [levels, setLevels] = useState([0, 0, 0, 0, 0]);
   const recording = useRef<VoiceRecording | null>(null);
+  const submissionUnsubscribe = useRef<(() => void) | null>(null);
   const recordingActive = voiceState !== "closed";
+  const releaseSubmission = () => {
+    submissionUnsubscribe.current?.();
+    submissionUnsubscribe.current = null;
+  };
   const cancelRecording = () => {
     const active = recording.current;
     recording.current = null;
+    releaseSubmission();
     active?.cancel();
     setVoiceState("closed");
   };
+  const currentDraft = useRef({ controller, discussionId });
+  currentDraft.current = { controller, discussionId };
   useEffect(
     () => () => {
       const active = recording.current;
       recording.current = null;
+      releaseSubmission();
       active?.cancel();
+      if (
+        currentDraft.current.controller !== controller ||
+        currentDraft.current.discussionId !== discussionId
+      )
+        setVoiceState("closed");
     },
     [controller, discussionId],
   );
-  const currentDraft = useRef({ controller, discussionId });
-  currentDraft.current = { controller, discussionId };
   const startRecording = () => {
     if (!controller || recording.current) return;
+    releaseSubmission();
     const target = controller;
     const initial = target.snapshot();
-    let revision = initial.draft.bodyRevision;
-    let prefix =
-      initial.busy &&
-      initial.draft.pending?.bodyRevision === revision &&
-      initial.draft.body.trim() === initial.draft.pending.body
-        ? ""
+    const revision = initial.draft.bodyRevision;
+    const pending = initial.draft.pending;
+    const voiceOrigin = initial.draft.voiceSubmission;
+    const startsFromSubmission =
+      pending?.bodyRevision === revision &&
+      initial.draft.body.trim() === pending.body;
+    const continuesSubmission = pending && voiceOrigin?.id === pending.id;
+    const submission =
+      startsFromSubmission || continuesSubmission ? pending : null;
+    const submittedBody = submission
+      ? startsFromSubmission
+        ? initial.draft.body
+        : (voiceOrigin?.submittedBody ?? "")
+      : "";
+    const voiceBase =
+      submission && initial.draft.body.startsWith(submittedBody)
+        ? initial.draft.body.slice(submittedBody.length)
         : initial.draft.body;
-    let appliedBody = initial.draft.body;
+    const session: {
+      submittedBody: string;
+      voiceBase: string;
+      bodyRevision: number;
+      submissionId: string | null;
+      submissionState: "pending" | "sent" | "cancelled" | null;
+    } = {
+      submittedBody,
+      voiceBase,
+      bodyRevision: revision,
+      submissionId: submission?.id ?? null,
+      submissionState: submission ? "pending" : null,
+    };
+    if (submission) {
+      let unsubscribe!: () => void;
+      const updateResult = () => {
+        const result = target.snapshot().submissionResult;
+        if (result?.id !== submission.id) return;
+        session.submissionState = result.state;
+        unsubscribe();
+        if (submissionUnsubscribe.current === unsubscribe)
+          submissionUnsubscribe.current = null;
+      };
+      unsubscribe = target.subscribe(updateResult);
+      submissionUnsubscribe.current = unsubscribe;
+      updateResult();
+    }
     setVoiceError("");
     setLevels([0, 0, 0, 0, 0]);
     const active = new VoiceRecording((event) => {
@@ -239,16 +289,27 @@ export function Composer({
         setVoiceState(event.state);
         if (event.state === "closed") recording.current = null;
       } else if (event.type === "transcript") {
-        if (target.snapshot().draft.bodyRevision !== revision) {
+        if (target.snapshot().draft.bodyRevision !== session.bodyRevision) {
           cancelRecording();
           return;
         }
-        const currentBody = target.snapshot().draft.body;
-        if (currentBody !== appliedBody) prefix = currentBody;
-        const text = prefix + event.text;
-        target.setBody(text);
-        revision = target.snapshot().draft.bodyRevision;
-        appliedBody = text;
+        const snapshot = target.snapshot();
+        const retainsSubmission =
+          session.submissionId !== null &&
+          session.submissionState !== "sent" &&
+          snapshot.draft.body.startsWith(session.submittedBody) &&
+          (snapshot.draft.pending?.id === session.submissionId ||
+            session.submissionState === "cancelled");
+        const submittedBody = retainsSubmission ? session.submittedBody : "";
+        const text = submittedBody + session.voiceBase + event.text;
+        const voiceSubmission =
+          session.submissionId !== null &&
+          snapshot.draft.pending?.id === session.submissionId &&
+          retainsSubmission
+            ? { id: session.submissionId, submittedBody }
+            : null;
+        target.setVoiceBody(text, voiceSubmission);
+        session.bodyRevision = target.snapshot().draft.bodyRevision;
         setCaret(text.length);
       } else if (event.type === "level") {
         setLevels((previous) => [...previous.slice(1), event.level]);

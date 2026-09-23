@@ -22,6 +22,7 @@ export type Draft = {
   bodyRevision: number;
   files: DraftFile[];
   pending: Submission | null;
+  voiceSubmission?: { id: string; submittedBody: string } | null;
 };
 interface DraftDatabase extends DBSchema {
   drafts: { key: string; value: Draft };
@@ -89,6 +90,7 @@ export function fileProblem(file: File, existing: DraftFile[]): string | null {
 export type DraftView = {
   draft: Draft;
   busy: boolean;
+  submissionResult: { id: string; state: "sent" | "cancelled" } | null;
   saving: boolean;
   storageError: string | null;
   error: string | null;
@@ -114,6 +116,7 @@ export class DraftController {
     this.#view = {
       draft,
       busy: false,
+      submissionResult: null,
       saving: false,
       storageError: null,
       error: null,
@@ -167,6 +170,20 @@ export class DraftController {
       ...draft,
       body,
       bodyRevision: draft.bodyRevision + 1,
+      voiceSubmission: null,
+    });
+  };
+
+  setVoiceBody = (body: string, voiceSubmission: Draft["voiceSubmission"]) => {
+    const draft = this.#view.draft;
+    if (voiceSubmission && !body.startsWith(voiceSubmission.submittedBody))
+      throw new Error("Voice draft must retain its pending submission prefix");
+    if (!this.#view.busy) this.#notify({ progress: null });
+    void this.#persist({
+      ...draft,
+      body,
+      bodyRevision: draft.bodyRevision + 1,
+      voiceSubmission: voiceSubmission ?? null,
     });
   };
 
@@ -205,14 +222,28 @@ export class DraftController {
   }
 
   async #finish(submission: Submission) {
+    this.#notify({
+      submissionResult: { id: submission.id, state: "sent" },
+    });
     const current = this.#view.draft;
     const sent = new Set(submission.files.map((file) => file.id));
+    const voiceSubmission =
+      current.voiceSubmission?.id === submission.id
+        ? current.voiceSubmission
+        : null;
+    const body = voiceSubmission
+      ? current.body.startsWith(voiceSubmission.submittedBody)
+        ? current.body.slice(voiceSubmission.submittedBody.length)
+        : current.body
+      : current.bodyRevision === submission.bodyRevision
+        ? ""
+        : current.body;
     const saved = await this.#persist({
       ...current,
-      body:
-        current.bodyRevision === submission.bodyRevision ? "" : current.body,
+      body,
       files: current.files.filter((file) => !sent.has(file.id)),
       pending: null,
+      voiceSubmission: null,
     });
     if (!saved) {
       this.#notify({ draft: { ...this.#view.draft, pending: submission } });
@@ -220,10 +251,17 @@ export class DraftController {
         "Message sent. Its local receipt could not be saved; check the send result to finish saving.",
       );
     }
-    this.#notify({ error: null, progress: "Message sent" });
+    this.#notify({
+      error: null,
+      progress: "Message sent",
+      submissionResult: { id: submission.id, state: "sent" },
+    });
   }
 
   async #cancelled(submission: Submission) {
+    this.#notify({
+      submissionResult: { id: submission.id, state: "cancelled" },
+    });
     const ids = submission.files.flatMap((item) =>
       item.upload ? [item.upload.id] : [],
     );
@@ -238,6 +276,10 @@ export class DraftController {
           : item,
       ),
       pending: null,
+      voiceSubmission:
+        current.voiceSubmission?.id === submission.id
+          ? null
+          : current.voiceSubmission,
     });
     if (!saved) {
       this.#notify({ draft: { ...this.#view.draft, pending: submission } });
@@ -245,7 +287,11 @@ export class DraftController {
         "Send attempt cancelled. Save the draft to finish recovery.",
       );
     }
-    this.#notify({ error: null, progress: "Send attempt cancelled" });
+    this.#notify({
+      error: null,
+      progress: "Send attempt cancelled",
+      submissionResult: { id: submission.id, state: "cancelled" },
+    });
   }
 
   async checkResult() {
@@ -296,7 +342,12 @@ export class DraftController {
     if (this.#view.busy) return;
     const draft = this.#view.draft;
     if (!draft.pending && !draft.body.trim() && !draft.files.length) return;
-    this.#notify({ busy: true, error: null, progress: null });
+    this.#notify({
+      busy: true,
+      error: null,
+      progress: null,
+      submissionResult: null,
+    });
     const abort = new AbortController();
     this.#abort = abort;
     let submission: Submission = draft.pending ?? {

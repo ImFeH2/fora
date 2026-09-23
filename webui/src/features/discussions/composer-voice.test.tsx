@@ -1,5 +1,7 @@
-import { Children, isValidElement, type ReactNode } from "react";
-import { beforeEach, expect, it, vi } from "vitest";
+// @vitest-environment jsdom
+import { act, useSyncExternalStore } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { Composer } from "@/features/discussions/composer";
 import { type Draft, DraftController } from "@/features/discussions/draft";
 import { backend } from "@/lib/backend";
@@ -7,40 +9,40 @@ import type { VoiceEvent } from "@/lib/voice";
 
 const harness = vi.hoisted(() => ({
   controller: null as DraftController | null,
-  effects: [] as (() => (() => void) | undefined)[],
+  controllers: new Map<number, DraftController>(),
   callbacks: [] as ((event: VoiceEvent) => void)[],
   cancel: vi.fn(),
   put: vi.fn(),
-}));
-vi.mock("react", async (original) => ({
-  ...(await original<typeof import("react")>()),
-  useState: (value: unknown) => [value, vi.fn()],
-  useRef: (value: unknown) => ({ current: value }),
-  useCallback: (value: unknown) => value,
-  useMemo: (factory: () => unknown) => factory(),
-  useId: () => "voice-test",
-  useLayoutEffect: () => {},
-  useEffect: (effect: () => (() => void) | undefined) =>
-    harness.effects.push(effect),
 }));
 vi.mock("idb", () => ({
   openDB: async () => ({ put: harness.put, close: () => {} }),
 }));
 vi.mock("@/features/discussions/draft", async (original) => ({
   ...(await original<typeof import("@/features/discussions/draft")>()),
-  useDraft: () => ({
-    controller: harness.controller,
-    view: harness.controller?.snapshot(),
-    error: null,
-  }),
+  useDraft: (discussionId: number) => {
+    const controller =
+      (discussionId === 1 ? harness.controller : null) ??
+      harness.controllers.get(discussionId) ??
+      null;
+    const snapshot = controller?.snapshot ?? (() => null);
+    const subscribe = controller?.subscribe ?? (() => () => {});
+    const view = useSyncExternalStore(subscribe, snapshot, snapshot);
+    return { controller, view, error: null };
+  },
 }));
 vi.mock("@/lib/voice", () => ({
   VoiceRecording: class {
+    #callback: (event: VoiceEvent) => void;
     constructor(callback: (event: VoiceEvent) => void) {
+      this.#callback = callback;
       harness.callbacks.push(callback);
     }
-    start = async () => {};
-    stop = vi.fn();
+    start = async () => {
+      this.#callback({ type: "state", state: "recording" });
+    };
+    stop = vi.fn(() => {
+      this.#callback({ type: "state", state: "closed" });
+    });
     cancel = harness.cancel;
   },
 }));
@@ -55,46 +57,66 @@ function draft(body = "Saved message"): Draft {
     pending: null,
   };
 }
-function button(node: ReactNode, label: string): (() => void) | undefined {
-  let found: (() => void) | undefined;
-  Children.forEach(node, (child) => {
-    if (
-      !isValidElement<{
-        children?: ReactNode;
-        "aria-label"?: string;
-        onClick?: () => void;
-      }>(child)
-    )
-      return;
-    if (child.props["aria-label"] === label) found = child.props.onClick;
-    found ??= button(child.props.children, label);
-  });
-  return found;
-}
-function mount() {
-  const node = Composer({
-    discussionId: 1,
-    members: [],
-    memberIds: new Set(),
-    busy: false,
-    placeholder: "Message",
-    onSend: async () => true,
-    onHeightChange: () => {},
-  });
-  const cleanups = harness.effects.splice(0).map((effect) => effect());
-  const start = button(node, "Start voice input");
-  if (!start) throw new Error("Voice input start button is missing");
+function mount(discussionId = 1) {
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root: Root = createRoot(container);
+  let currentDiscussion = discussionId;
+  const render = (id: number) => {
+    currentDiscussion = id;
+    act(() =>
+      root.render(
+        <Composer
+          discussionId={id}
+          members={[]}
+          memberIds={new Set()}
+          busy={false}
+          placeholder="Message"
+          onSend={async () => true}
+          onHeightChange={() => {}}
+        />,
+      ),
+    );
+  };
+  render(discussionId);
+  let callback: ((event: VoiceEvent) => void) | undefined;
+  const start = () => {
+    const button = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Start voice input"]',
+    );
+    if (!button) throw new Error("Voice input start button is missing");
+    act(() => button.click());
+    callback = harness.callbacks[harness.callbacks.length - 1];
+    if (!callback) throw new Error("Voice recording callback is missing");
+  };
   start();
-  const emit = harness.callbacks[harness.callbacks.length - 1];
-  if (!emit) throw new Error("Voice recording callback is missing");
   return {
-    emit,
+    container,
+    render,
+    start,
+    emit: (event: VoiceEvent) =>
+      act(async () => {
+        callback?.(event);
+        const controller =
+          (currentDiscussion === 1 ? harness.controller : null) ??
+          harness.controllers.get(currentDiscussion);
+        if (controller)
+          await vi.waitFor(() =>
+            expect(controller.snapshot().saving).toBe(false),
+          );
+      }),
     close: () => {
-      cleanups.forEach((cleanup) => {
-        cleanup?.();
-      });
+      act(() => root.unmount());
+      container.remove();
     },
   };
+}
+function body(voice: ReturnType<typeof mount>) {
+  const input = voice.container.querySelector<HTMLTextAreaElement>(
+    'textarea[aria-label="Message"]',
+  );
+  if (!input) throw new Error("Composer textarea is missing");
+  return input.value;
 }
 function transcript(text: string): VoiceEvent {
   return { type: "transcript", text };
@@ -102,11 +124,35 @@ function transcript(text: string): VoiceEvent {
 
 beforeEach(() => {
   vi.restoreAllMocks();
-  harness.effects = [];
+  harness.controllers.clear();
   harness.callbacks = [];
   harness.cancel.mockReset();
   harness.put.mockReset().mockResolvedValue(undefined);
   harness.controller = new DraftController(1, draft());
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      disconnect() {}
+    },
+  );
+  vi.stubGlobal("requestAnimationFrame", () => 1);
+  vi.stubGlobal("getComputedStyle", () => ({
+    lineHeight: "20px",
+    paddingTop: "0px",
+    paddingBottom: "0px",
+    borderTopWidth: "0px",
+    borderBottomWidth: "0px",
+  }));
+  Object.defineProperty(document, "fonts", {
+    configurable: true,
+    value: { ready: Promise.resolve() },
+  });
+});
+afterEach(() => {
+  vi.unstubAllGlobals();
+  document.body.replaceChildren();
 });
 
 it("persists partial and final while keeping the active submission snapshot", async () => {
@@ -123,11 +169,18 @@ it("persists partial and final while keeping the active submission snapshot", as
   await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
   const pending = structuredClone(controller.snapshot().draft.pending);
   const voice = mount();
-  voice.emit(transcript(" partial"));
-  voice.emit(transcript(" final"));
+  expect(voice.container.textContent).toContain("Listening…");
+  expect(voice.container.textContent).toContain("Cancel");
+  expect(voice.container.textContent).toContain(
+    "Saved send attempt: Saved message",
+  );
+  await voice.emit(transcript(" partial"));
+  await voice.emit(transcript(" final"));
   expect(controller.snapshot().draft.pending).toEqual(pending);
-  finish(true);
-  await operation;
+  await act(async () => {
+    finish(true);
+    await operation;
+  });
   expect(controller.snapshot().draft.body).toBe(" final");
   expect(controller.snapshot().draft.pending).toBeNull();
   expect(harness.put).toHaveBeenLastCalledWith(
@@ -152,10 +205,12 @@ it("keeps only new voice text when sending finishes before the first transcript"
   await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
   const pending = structuredClone(controller.snapshot().draft.pending);
   const voice = mount();
-  finish(true);
-  await operation;
+  await act(async () => {
+    finish(true);
+    await operation;
+  });
   expect(controller.snapshot().draft.body).toBe("");
-  voice.emit(transcript("New words"));
+  await voice.emit(transcript("New words"));
   expect(controller.snapshot().draft.pending).toBeNull();
   expect(controller.snapshot().draft.body).toBe("New words");
   expect(pending?.body).toBe("Saved message");
@@ -176,18 +231,206 @@ it("keeps partial text across send completion and final replacement", async () =
   );
   await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
   const voice = mount();
-  voice.emit(transcript("Partial"));
-  finish(true);
-  await operation;
-  voice.emit(transcript("Final"));
+  await voice.emit(transcript("Partial"));
+  await act(async () => {
+    finish(true);
+    await operation;
+  });
+  await voice.emit(transcript("Final"));
   expect(controller.snapshot().draft.body).toBe("Final");
   expect(controller.snapshot().draft.pending).toBeNull();
 });
 
-it("reconciles voice text after send-result confirmation", async () => {
+it("preserves earlier voice text across recordings during a pending send", async () => {
+  const controller = harness.controller;
+  if (!controller) throw new Error("Draft controller is missing");
+  let finish!: (result: boolean) => void;
+  const sending = controller.send(
+    () => new Promise<boolean>((resolve) => (finish = resolve)),
+  );
+  await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+  const voice = mount();
+  await voice.emit(transcript(" one"));
+  const stop = voice.container.querySelector<HTMLButtonElement>(
+    'button[aria-label="Stop recording"]',
+  );
+  if (!stop) throw new Error("Stop recording button is missing");
+  act(() => stop.click());
+  voice.start();
+  await voice.emit(transcript(" two"));
+  expect(body(voice)).toBe("Saved message one two");
+  await act(async () => {
+    finish(true);
+    await sending;
+  });
+  expect(body(voice)).toBe(" one two");
+  expect(controller.snapshot().draft.pending).toBeNull();
+  voice.close();
+});
+
+it("removes the submitted prefix when sending finishes after Discussion changes", async () => {
+  const controller = harness.controller;
+  if (!controller) throw new Error("Draft controller is missing");
+  const other = new DraftController(2, draft("Other Discussion"));
+  harness.controllers.set(2, other);
+  let finish!: (result: boolean) => void;
+  const sending = controller.send(
+    () => new Promise<boolean>((resolve) => (finish = resolve)),
+  );
+  await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+  const voice = mount();
+  await voice.emit(transcript(" New words"));
+  voice.render(2);
+  expect(harness.cancel).toHaveBeenCalledOnce();
+  await act(async () => {
+    finish(true);
+    await sending;
+  });
+  expect(controller.snapshot().draft.body).toBe(" New words");
+  expect(other.snapshot().draft.body).toBe("Other Discussion");
+  expect(body(voice)).toBe("Other Discussion");
+  voice.close();
+});
+
+it("retains the submitted body when a concurrent send is cancelled", async () => {
+  const controller = harness.controller;
+  if (!controller) throw new Error("Draft controller is missing");
+  let finish!: (result: "cancelled") => void;
+  const operation = controller.send(
+    () => new Promise<"cancelled">((resolve) => (finish = resolve)),
+  );
+  await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+  const voice = mount();
+  const pendingId = controller.snapshot().draft.pending?.id;
+  await voice.emit(transcript(" partial"));
+  expect(body(voice)).toBe("Saved message partial");
+  await act(async () => {
+    finish("cancelled");
+    await operation;
+  });
+  expect(controller.snapshot().draft.pending).toBeNull();
+  expect(controller.snapshot().submissionResult).toEqual({
+    id: pendingId,
+    state: "cancelled",
+  });
+  expect(body(voice)).toBe("Saved message partial");
+  await voice.emit(transcript(" final"));
+  expect(body(voice)).toBe("Saved message final");
+  expect(controller.snapshot().submissionResult).toEqual({
+    id: pendingId,
+    state: "cancelled",
+  });
+  voice.close();
+});
+
+it("preserves a user edit during voice input after the send succeeds", async () => {
+  const controller = harness.controller;
+  if (!controller) throw new Error("Draft controller is missing");
+  let finish!: (result: boolean) => void;
+  const sending = controller.send(
+    () => new Promise<boolean>((resolve) => (finish = resolve)),
+  );
+  await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+  const voice = mount();
+  await voice.emit(transcript(" partial"));
+  const input = voice.container.querySelector<HTMLTextAreaElement>(
+    'textarea[aria-label="Message"]',
+  );
+  if (!input) throw new Error("Composer textarea is missing");
+  await act(async () => {
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      "value",
+    )?.set;
+    setter?.call(input, "Hand edited text");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await vi.waitFor(() => expect(controller.snapshot().saving).toBe(false));
+  });
+  await act(async () => {
+    finish(true);
+    await sending;
+  });
+  expect(body(voice)).toBe("Hand edited text");
+  expect(controller.snapshot().draft.voiceSubmission).toBeNull();
+  voice.close();
+});
+
+it("preserves voice text when upload cancellation interrupts a pending send", async () => {
+  const controller = harness.controller;
+  if (!controller) throw new Error("Draft controller is missing");
+  const file = new File(["content"], "notes.txt", { type: "text/plain" });
+  act(() => controller.addFiles([file]));
+  await vi.waitFor(() => expect(controller.snapshot().saving).toBe(false));
+  vi.spyOn(backend, "createUpload").mockResolvedValue({
+    id: "upload-1",
+    state: "reserved",
+    expires_at: Date.now() / 1000 + 3600,
+  });
+  let uploadStarted!: () => void;
+  vi.spyOn(backend, "uploadFile").mockImplementation(
+    (_id, _file, signal) =>
+      new Promise((_resolve, reject) => {
+        uploadStarted = () => reject(signal.reason);
+      }),
+  );
+  const sending = controller.send(async () => true);
+  await vi.waitFor(() => expect(uploadStarted).toBeTypeOf("function"));
+  const voice = mount();
+  await voice.emit(transcript(" partial"));
+  const cancelUpload = Array.from(
+    voice.container.querySelectorAll<HTMLButtonElement>("button"),
+  ).find((button) => button.textContent === "Cancel upload");
+  if (!cancelUpload) throw new Error("Cancel upload button is missing");
+  act(() => {
+    cancelUpload.click();
+    uploadStarted();
+  });
+  await act(async () => sending);
+  expect(controller.snapshot().draft.pending?.phase).toBe("uploading");
+  expect(body(voice)).toBe("Saved message partial");
+  voice.close();
+});
+
+it("preserves voice text when an upload fails", async () => {
+  const controller = harness.controller;
+  if (!controller) throw new Error("Draft controller is missing");
+  const file = new File(["content"], "notes.txt", { type: "text/plain" });
+  act(() => controller.addFiles([file]));
+  await vi.waitFor(() => expect(controller.snapshot().saving).toBe(false));
+  vi.spyOn(backend, "createUpload").mockResolvedValue({
+    id: "upload-1",
+    state: "reserved",
+    expires_at: Date.now() / 1000 + 3600,
+  });
+  let failUpload!: () => void;
+  vi.spyOn(backend, "uploadFile").mockImplementation(
+    () =>
+      new Promise((_resolve, reject) => {
+        failUpload = () => reject(new Error("Upload failed"));
+      }),
+  );
+  const sending = controller.send(async () => true);
+  await vi.waitFor(() => expect(failUpload).toBeTypeOf("function"));
+  const voice = mount();
+  await voice.emit(transcript(" partial"));
+  await act(async () => {
+    failUpload();
+    await sending;
+  });
+  expect(controller.snapshot().draft.pending?.phase).toBe("uploading");
+  expect(body(voice)).toBe("Saved message partial");
+  expect(voice.container.textContent).toContain("Upload failed");
+  voice.close();
+});
+
+it("reconciles a recording started before unknown-send confirmation", async () => {
   const controller = harness.controller;
   if (!controller) throw new Error("Draft controller is missing");
   await controller.send(async () => false);
+  const pendingId = controller.snapshot().draft.pending?.id;
+  const voice = mount();
+  await voice.emit(transcript("Partial"));
+  expect(body(voice)).toBe("Saved messagePartial");
   let resolveStatus!: (result: { state: "sent"; message: null }) => void;
   vi.spyOn(backend, "sendStatus").mockImplementation(
     () =>
@@ -195,13 +438,124 @@ it("reconciles voice text after send-result confirmation", async () => {
         resolveStatus = resolve;
       }),
   );
-  const checking = controller.checkResult();
+  const check = Array.from(
+    voice.container.querySelectorAll<HTMLButtonElement>("button"),
+  ).find((button) => button.textContent === "Check send result");
+  if (!check) throw new Error("Check send result button is missing");
+  act(() => check.click());
+  await vi.waitFor(() => expect(resolveStatus).toBeTypeOf("function"));
+  await act(async () => {
+    resolveStatus({ state: "sent", message: null });
+    await vi.waitFor(() => {
+      expect(controller.snapshot().draft.pending).toBeNull();
+      expect(controller.snapshot().busy).toBe(false);
+      expect(controller.snapshot().progress).toBe("Message sent");
+    });
+  });
+  expect(body(voice)).toBe("Partial");
+  expect(controller.snapshot().submissionResult).toEqual({
+    id: pendingId,
+    state: "sent",
+  });
+  await voice.emit(transcript("Final"));
+  expect(body(voice)).toBe("Final");
+  voice.close();
+});
+
+it("reconciles a confirmed send after receipt saving fails", async () => {
+  const controller = harness.controller;
+  if (!controller) throw new Error("Draft controller is missing");
+  await controller.send(async () => false);
   const voice = mount();
-  resolveStatus({ state: "sent", message: null });
-  await checking;
-  voice.emit(transcript("Final"));
-  expect(controller.snapshot().draft.pending).toBeNull();
-  expect(controller.snapshot().draft.body).toBe("Final");
+  await voice.emit(transcript("Partial"));
+  const pendingId = controller.snapshot().draft.pending?.id;
+  harness.put.mockRejectedValueOnce(new Error("Disk full"));
+  vi.spyOn(backend, "sendStatus").mockResolvedValue({
+    state: "sent",
+    message: null,
+  });
+  const check = Array.from(
+    voice.container.querySelectorAll<HTMLButtonElement>("button"),
+  ).find((button) => button.textContent === "Check send result");
+  if (!check) throw new Error("Check send result button is missing");
+  await act(async () => {
+    check.click();
+    await vi.waitFor(() => {
+      expect(controller.snapshot().busy).toBe(false);
+      expect(controller.snapshot().draft.pending?.id).toBe(pendingId);
+    });
+  });
+  expect(body(voice)).toBe("Partial");
+  expect(controller.snapshot().submissionResult).toEqual({
+    id: pendingId,
+    state: "sent",
+  });
+  await voice.emit(transcript("Final"));
+  expect(body(voice)).toBe("Final");
+
+  vi.spyOn(backend, "cancelSend").mockResolvedValue({
+    state: "sent",
+    message: null,
+  });
+  const discard = Array.from(
+    voice.container.querySelectorAll<HTMLButtonElement>("button"),
+  ).find((button) => button.textContent === "Discard send attempt");
+  if (!discard) throw new Error("Discard send attempt button is missing");
+  await act(async () => {
+    discard.click();
+    await vi.waitFor(() => {
+      expect(controller.snapshot().busy).toBe(false);
+      expect(controller.snapshot().draft.pending).toBeNull();
+    });
+  });
+  expect(backend.cancelSend).toHaveBeenCalledWith(1, pendingId);
+  expect(body(voice)).toBe("Final");
+  voice.close();
+});
+
+it("retries send-result confirmation after receipt persistence fails", async () => {
+  const controller = harness.controller;
+  if (!controller) throw new Error("Draft controller is missing");
+  await controller.send(async () => false);
+  const voice = mount();
+  await voice.emit(transcript("Partial"));
+  const pendingId = controller.snapshot().draft.pending?.id;
+  harness.put.mockRejectedValueOnce(new Error("Disk full"));
+  vi.spyOn(backend, "sendStatus").mockResolvedValue({
+    state: "sent",
+    message: null,
+  });
+  const check = () => {
+    const button = Array.from(
+      voice.container.querySelectorAll<HTMLButtonElement>("button"),
+    ).find((item) => item.textContent === "Check send result");
+    if (!button) throw new Error("Check send result button is missing");
+    return button;
+  };
+  await act(async () => {
+    check().click();
+    await vi.waitFor(() => {
+      expect(controller.snapshot().busy).toBe(false);
+      expect(controller.snapshot().draft.pending?.id).toBe(pendingId);
+    });
+  });
+  expect(body(voice)).toBe("Partial");
+  expect(controller.snapshot().submissionResult).toEqual({
+    id: pendingId,
+    state: "sent",
+  });
+  await voice.emit(transcript("Final"));
+  expect(body(voice)).toBe("Final");
+  await act(async () => {
+    check().click();
+    await vi.waitFor(() => {
+      expect(controller.snapshot().busy).toBe(false);
+      expect(controller.snapshot().draft.pending).toBeNull();
+      expect(controller.snapshot().progress).toBe("Message sent");
+    });
+  });
+  expect(body(voice)).toBe("Final");
+  voice.close();
 });
 
 it("retains voice text through unknown status, reload and cancellation", async () => {
@@ -212,7 +566,7 @@ it("retains voice text through unknown status, reload and cancellation", async (
   if (!pending) throw new Error("Pending submission is missing");
   const id = pending.id;
   const voice = mount();
-  voice.emit(transcript(" new words"));
+  await voice.emit(transcript(" new words"));
   await vi.waitFor(() => expect(controller.snapshot().saving).toBe(false));
   const lastWrite = harness.put.mock.calls[harness.put.mock.calls.length - 1];
   if (!lastWrite) throw new Error("Draft write is missing");
@@ -225,6 +579,14 @@ it("retains voice text through unknown status, reload and cancellation", async (
   await restored.checkResult();
   expect(restored.snapshot().draft.pending?.id).toBe(id);
   expect(restored.snapshot().draft.body).toBe("Saved message new words");
+  const confirmed = new DraftController(1, saved);
+  vi.spyOn(backend, "sendStatus").mockResolvedValue({
+    state: "sent",
+    message: null,
+  });
+  await confirmed.checkResult();
+  expect(confirmed.snapshot().draft.pending).toBeNull();
+  expect(confirmed.snapshot().draft.body).toBe(" new words");
   vi.spyOn(backend, "cancelSend").mockResolvedValue({
     state: "cancelled",
     message: null,
@@ -235,17 +597,50 @@ it("retains voice text through unknown status, reload and cancellation", async (
   expect(restored.snapshot().draft.body).toBe("Saved message new words");
 });
 
-it("rejects callbacks after leaving a Discussion and after user edits", () => {
+it("rejects old callbacks after edits, Discussion changes and unmount", async () => {
   const controller = harness.controller;
   if (!controller) throw new Error("Draft controller is missing");
   const first = mount();
-  first.emit(transcript(" first"));
+  await first.emit(transcript(" first"));
+  const lateAfterUnmount = harness.callbacks[harness.callbacks.length - 1];
   first.close();
-  first.emit(transcript(" late"));
+  act(() => lateAfterUnmount(transcript(" late")));
   expect(controller.snapshot().draft.body).toBe("Saved message first");
+
   const second = mount();
-  controller.setBody("User edit");
-  second.emit(transcript(" overwrite"));
+  const input = second.container.querySelector<HTMLTextAreaElement>(
+    'textarea[aria-label="Message"]',
+  );
+  if (!input) throw new Error("Composer textarea is missing");
+  await act(async () => {
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      "value",
+    )?.set;
+    setter?.call(input, "User edit");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await vi.waitFor(() => expect(controller.snapshot().saving).toBe(false));
+  });
   expect(controller.snapshot().draft.body).toBe("User edit");
-  expect(harness.cancel).toHaveBeenCalledTimes(2);
+  expect(body(second)).toBe("User edit");
+  const editedCallback = harness.callbacks[harness.callbacks.length - 1];
+  act(() => editedCallback(transcript(" overwrite")));
+  expect(controller.snapshot().draft.body).toBe("User edit");
+
+  const other = new DraftController(2, draft("Second Discussion"));
+  harness.controllers.set(2, other);
+  second.start();
+  const oldDiscussionCallback = harness.callbacks[harness.callbacks.length - 1];
+  second.render(2);
+  expect(harness.cancel).toHaveBeenCalledTimes(3);
+  expect(second.container.textContent).not.toContain("Listening…");
+  act(() => oldDiscussionCallback(transcript(" late")));
+  expect(body(second)).toBe("Second Discussion");
+
+  second.start();
+  const activeCallback = harness.callbacks[harness.callbacks.length - 1];
+  second.close();
+  expect(harness.cancel).toHaveBeenCalledTimes(4);
+  act(() => activeCallback(transcript(" late")));
+  expect(other.snapshot().draft.body).toBe("Second Discussion");
 });
