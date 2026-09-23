@@ -128,12 +128,80 @@ it("persists partial and final while keeping the active submission snapshot", as
   expect(controller.snapshot().draft.pending).toEqual(pending);
   finish(true);
   await operation;
-  expect(controller.snapshot().draft.body).toBe("Saved message final");
+  expect(controller.snapshot().draft.body).toBe(" final");
   expect(controller.snapshot().draft.pending).toBeNull();
   expect(harness.put).toHaveBeenLastCalledWith(
     "drafts",
-    expect.objectContaining({ body: "Saved message final" }),
+    expect.objectContaining({ body: " final" }),
   );
+});
+
+it("keeps only new voice text when sending finishes before the first transcript", async () => {
+  const controller = harness.controller;
+  if (!controller) throw new Error("Draft controller is missing");
+  let finish!: (value: boolean) => void;
+  const operation = controller.send(
+    () =>
+      new Promise<boolean>((resolve) => {
+        finish = resolve;
+      }),
+  );
+  await vi.waitFor(() =>
+    expect(controller.snapshot().draft.pending).not.toBeNull(),
+  );
+  await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+  const pending = structuredClone(controller.snapshot().draft.pending);
+  const voice = mount();
+  finish(true);
+  await operation;
+  expect(controller.snapshot().draft.body).toBe("");
+  voice.emit(transcript("New words"));
+  expect(controller.snapshot().draft.pending).toBeNull();
+  expect(controller.snapshot().draft.body).toBe("New words");
+  expect(pending?.body).toBe("Saved message");
+});
+
+it("keeps partial text across send completion and final replacement", async () => {
+  const controller = harness.controller;
+  if (!controller) throw new Error("Draft controller is missing");
+  let finish!: (value: boolean) => void;
+  const operation = controller.send(
+    () =>
+      new Promise<boolean>((resolve) => {
+        finish = resolve;
+      }),
+  );
+  await vi.waitFor(() =>
+    expect(controller.snapshot().draft.pending).not.toBeNull(),
+  );
+  await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+  const voice = mount();
+  voice.emit(transcript("Partial"));
+  finish(true);
+  await operation;
+  voice.emit(transcript("Final"));
+  expect(controller.snapshot().draft.body).toBe("Final");
+  expect(controller.snapshot().draft.pending).toBeNull();
+});
+
+it("reconciles voice text after send-result confirmation", async () => {
+  const controller = harness.controller;
+  if (!controller) throw new Error("Draft controller is missing");
+  await controller.send(async () => false);
+  let resolveStatus!: (result: { state: "sent"; message: null }) => void;
+  vi.spyOn(backend, "sendStatus").mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolveStatus = resolve;
+      }),
+  );
+  const checking = controller.checkResult();
+  const voice = mount();
+  resolveStatus({ state: "sent", message: null });
+  await checking;
+  voice.emit(transcript("Final"));
+  expect(controller.snapshot().draft.pending).toBeNull();
+  expect(controller.snapshot().draft.body).toBe("Final");
 });
 
 it("retains voice text through unknown status, reload and cancellation", async () => {

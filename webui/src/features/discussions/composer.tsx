@@ -217,8 +217,15 @@ export function Composer({
   const startRecording = () => {
     if (!controller || recording.current) return;
     const target = controller;
-    let revision = target.snapshot().draft.bodyRevision;
-    const prefix = target.snapshot().draft.body;
+    const initial = target.snapshot();
+    let revision = initial.draft.bodyRevision;
+    let prefix =
+      initial.busy &&
+      initial.draft.pending?.bodyRevision === revision &&
+      initial.draft.body.trim() === initial.draft.pending.body
+        ? ""
+        : initial.draft.body;
+    let appliedBody = initial.draft.body;
     setVoiceError("");
     setLevels([0, 0, 0, 0, 0]);
     const active = new VoiceRecording((event) => {
@@ -236,9 +243,12 @@ export function Composer({
           cancelRecording();
           return;
         }
+        const currentBody = target.snapshot().draft.body;
+        if (currentBody !== appliedBody) prefix = currentBody;
         const text = prefix + event.text;
         target.setBody(text);
         revision = target.snapshot().draft.bodyRevision;
+        appliedBody = text;
         setCaret(text.length);
       } else if (event.type === "level") {
         setLevels((previous) => [...previous.slice(1), event.level]);
