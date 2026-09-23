@@ -163,7 +163,7 @@ describe("thread page", () => {
     ]);
     expect(html).toMatch(/<h1\b[^>]*>Release notes<\/h1>/);
     expect(html).toContain('placeholder="Message Release notes"');
-    expect(html).toContain('aria-label="Voice input · Coming soon"');
+    expect(html).toContain('aria-label="Start voice input"');
     expect(html).toMatch(/<textarea[^>]*rows="1"[^>]*aria-label="Message"/);
     expect(html).not.toContain("crumb");
     expect(html).not.toContain("thread-strip");

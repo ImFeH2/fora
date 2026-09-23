@@ -7,7 +7,12 @@ import {
   useState,
 } from "react";
 
-export type SettingsSection = "model" | "execution" | "agent" | "langfuse";
+export type SettingsSection =
+  | "model"
+  | "execution"
+  | "agent"
+  | "langfuse"
+  | "voice";
 
 export type Route =
   | { name: "discussions" }

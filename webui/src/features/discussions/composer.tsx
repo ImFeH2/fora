@@ -3,6 +3,7 @@ import {
   type CSSProperties,
   Fragment,
   useCallback,
+  useEffect,
   useId,
   useLayoutEffect,
   useMemo,
@@ -18,6 +19,7 @@ import {
   mentionQuery,
 } from "@/features/mentions";
 import type { Member } from "@/lib/backend";
+import { VoiceRecording, type VoiceState } from "@/lib/voice";
 
 const MENU_LIMIT = 8;
 const composerTheme = {
@@ -191,6 +193,62 @@ export function Composer({
     observer.observe(element);
     return () => observer.disconnect();
   }, []);
+  const [voiceState, setVoiceState] = useState<VoiceState>("closed");
+  const [voiceError, setVoiceError] = useState("");
+  const [levels, setLevels] = useState([0, 0, 0, 0, 0]);
+  const recording = useRef<VoiceRecording | null>(null);
+  const recordingActive = voiceState !== "closed";
+  const cancelRecording = () => {
+    const active = recording.current;
+    recording.current = null;
+    active?.cancel();
+    setVoiceState("closed");
+  };
+  useEffect(
+    () => () => {
+      const active = recording.current;
+      recording.current = null;
+      active?.cancel();
+    },
+    [controller, discussionId],
+  );
+  const currentDraft = useRef({ controller, discussionId });
+  currentDraft.current = { controller, discussionId };
+  const startRecording = () => {
+    if (!controller || recording.current) return;
+    const target = controller;
+    let revision = target.snapshot().draft.bodyRevision;
+    const prefix = target.snapshot().draft.body;
+    setVoiceError("");
+    setLevels([0, 0, 0, 0, 0]);
+    const active = new VoiceRecording((event) => {
+      if (
+        recording.current !== active ||
+        currentDraft.current.controller !== target ||
+        currentDraft.current.discussionId !== discussionId
+      )
+        return;
+      if (event.type === "state") {
+        setVoiceState(event.state);
+        if (event.state === "closed") recording.current = null;
+      } else if (event.type === "transcript") {
+        if (target.snapshot().draft.bodyRevision !== revision) {
+          cancelRecording();
+          return;
+        }
+        const text = prefix + event.text;
+        target.setBody(text);
+        revision = target.snapshot().draft.bodyRevision;
+        setCaret(text.length);
+      } else if (event.type === "level") {
+        setLevels((previous) => [...previous.slice(1), event.level]);
+      } else {
+        setVoiceError(event.message);
+      }
+    });
+    recording.current = active;
+    void active.start();
+  };
   const [caret, setCaret] = useState(0);
   const [highlighted, setHighlighted] = useState(0);
   const [dismissed, setDismissed] = useState(false);
@@ -233,6 +291,7 @@ export function Composer({
       const expanded =
         files.length > 0 ||
         !!view?.draft.pending ||
+        recordingActive ||
         composerMultiline(
           element.value,
           measureInput.scrollHeight,
@@ -292,7 +351,14 @@ export function Composer({
       mounted = false;
       observer.disconnect();
     };
-  }, [body, files.length, view?.draft.pending, extraHeight, updateFades]);
+  }, [
+    body,
+    files.length,
+    view?.draft.pending,
+    extraHeight,
+    recordingActive,
+    updateFades,
+  ]);
 
   useLayoutEffect(() => {
     const element = card.current;
@@ -333,6 +399,7 @@ export function Composer({
   const accept = (member: Member) => {
     if (!mention) return;
     const next = completeMention(body, mention, caret, member.name);
+    cancelRecording();
     setBody(next.text);
     setCaret(next.caret);
     setHighlighted(0);
@@ -343,7 +410,7 @@ export function Composer({
   };
 
   const submit = async () => {
-    if (!canSend || sending || !controller) return;
+    if (!canSend || sending || !controller || recording.current) return;
     await controller.send(onSend);
     if (!controller.snapshot().draft.body) setCaret(0);
   };
@@ -480,6 +547,14 @@ export function Composer({
             </div>
           ) : null}
         </div>
+        {voiceError ? (
+          <div
+            role="alert"
+            className="absolute bottom-full left-0 right-0 mb-2 rounded-lg bg-surface-raised p-3 text-sm text-fg"
+          >
+            {voiceError}
+          </div>
+        ) : null}
         {suggesting ? (
           <div
             className="absolute bottom-full mb-2 left-0 right-0 z-(--layer-popover) max-h-66 overflow-y-auto rounded-sm bg-surface-raised p-1 shadow-popover origin-bottom animate-pop-in"
@@ -563,6 +638,7 @@ export function Composer({
               suggesting ? `${menuId}-${candidates[active].id}` : undefined
             }
             onChange={(event) => {
+              cancelRecording();
               setBody(event.target.value);
               setCaret(event.target.selectionStart ?? 0);
               setHighlighted(0);
@@ -626,6 +702,44 @@ export function Composer({
               : "opacity-0 blur-sm translate-y-2 pointer-events-none",
           )}
         >
+          {!recordingActive && canSend ? (
+            <button
+              type="button"
+              aria-label="Start voice input"
+              onClick={startRecording}
+            >
+              <MicIcon />
+            </button>
+          ) : null}
+          {recordingActive ? (
+            <div className="flex items-center gap-3 text-xs" role="status">
+              <div
+                className="flex h-5 items-center gap-1"
+                role="img"
+                aria-label="Microphone volume"
+              >
+                {levels.map((level, index) => (
+                  <span
+                    key={index}
+                    className="w-1 rounded-full bg-current"
+                    style={{
+                      height: `${Math.max(2, Math.min(20, level * 100))}px`,
+                    }}
+                  />
+                ))}
+              </div>
+              <span>
+                {voiceState === "starting"
+                  ? "Starting microphone…"
+                  : voiceState === "finishing"
+                    ? "Transcribing…"
+                    : "Listening…"}
+              </span>
+              <button type="button" onClick={cancelRecording}>
+                Cancel
+              </button>
+            </div>
+          ) : null}
           <button
             type="button"
             disabled={!controller}
@@ -652,36 +766,62 @@ export function Composer({
         <button
           type="button"
           className="absolute right-2 bottom-2 z-10 flex size-8 items-center justify-center rounded-full bg-(--composer-primary) text-(--composer-primary-foreground) transition-all duration-300 hover:enabled:opacity-90 outline-none focus-visible:ring-2 focus-visible:ring-(--composer-ring) cursor-default motion-reduce:transition-none"
-          aria-label={canSend ? "Send · Enter" : "Voice input · Coming soon"}
-          title={canSend ? "Send · Enter" : "Voice input · Coming soon"}
-          disabled={sending || !canSend}
-          onClick={() => void submit()}
+          aria-label={
+            recordingActive
+              ? "Stop recording"
+              : canSend
+                ? "Send · Enter"
+                : "Start voice input"
+          }
+          title={
+            recordingActive
+              ? "Stop recording"
+              : canSend
+                ? "Send · Enter"
+                : "Start voice input"
+          }
+          disabled={
+            !controller ||
+            (!recordingActive && sending) ||
+            voiceState === "finishing"
+          }
+          onClick={() => {
+            if (recordingActive) recording.current?.stop();
+            else if (canSend) void submit();
+            else startRecording();
+          }}
         >
-          <span
-            className="relative flex h-full w-full items-center justify-center"
-            aria-hidden="true"
-          >
+          {recordingActive ? (
+            <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+              <rect width="12" height="12" rx="2" fill="currentColor" />
+            </svg>
+          ) : (
             <span
-              className={clsx(
-                "absolute inset-0 flex items-center justify-center transition-all duration-300 ease-[cubic-bezier(0.175,0.885,0.32,1.275)] motion-reduce:transition-none",
-                canSend
-                  ? "opacity-100 scale-100 rotate-0 blur-none"
-                  : "opacity-0 scale-50 rotate-45 blur-[1px] pointer-events-none",
-              )}
+              className="relative flex h-full w-full items-center justify-center"
+              aria-hidden="true"
             >
-              <ArrowUpIcon />
+              <span
+                className={clsx(
+                  "absolute inset-0 flex items-center justify-center transition-all duration-300 ease-[cubic-bezier(0.175,0.885,0.32,1.275)] motion-reduce:transition-none",
+                  canSend
+                    ? "opacity-100 scale-100 rotate-0 blur-none"
+                    : "opacity-0 scale-50 rotate-45 blur-[1px] pointer-events-none",
+                )}
+              >
+                <ArrowUpIcon />
+              </span>
+              <span
+                className={clsx(
+                  "absolute inset-0 flex items-center justify-center transition-all duration-300 ease-[cubic-bezier(0.175,0.885,0.32,1.275)] motion-reduce:transition-none",
+                  canSend
+                    ? "opacity-0 scale-50 -rotate-45 blur-[1px] pointer-events-none"
+                    : "opacity-100 scale-100 rotate-0 blur-none",
+                )}
+              >
+                <MicIcon />
+              </span>
             </span>
-            <span
-              className={clsx(
-                "absolute inset-0 flex items-center justify-center transition-all duration-300 ease-[cubic-bezier(0.175,0.885,0.32,1.275)] motion-reduce:transition-none",
-                canSend
-                  ? "opacity-0 scale-50 -rotate-45 blur-[1px] pointer-events-none"
-                  : "opacity-100 scale-100 rotate-0 blur-none",
-              )}
-            >
-              <MicIcon />
-            </span>
-          </span>
+          )}
         </button>
       </fieldset>
     </div>

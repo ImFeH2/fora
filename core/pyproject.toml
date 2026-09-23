@@ -7,11 +7,14 @@ authors = [{ name = "ImFeH2", email = "i@feh2.im" }]
 dependencies = [
   "aiohttp>=3.12.0",
   "httpx>=0.28.1",
+  "numpy>=2.5.3",
   "opentelemetry-exporter-otlp-proto-http>=1.44.0",
   "opentelemetry-sdk>=1.44.0",
   "pillow>=11.3.0",
   "psutil>=7.2.2",
   "pydantic-ai-slim[anthropic,duckduckgo,google,openai]>=2.28.0",
+  "soxr>=1.1.0",
+  "webrtcvad-wheels>=2.0.14",
   "websockets>=16.1.1",
 ]
 
@@ -29,5 +32,13 @@ dev = [
 ]
 
 [build-system]
-requires = ["uv_build>=0.11.16,<0.12.0"]
-build-backend = "uv_build"
+requires = ["scikit-build-core==1.0.3"]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+cmake.version = ">=3.25"
+wheel.packages = ["src/huddol"]
+wheel.py-api = "py3"
+install.components = ["voice"]
+sdist.include = ["CMakeLists.txt", "native/voice_shim.cpp", "src/huddol/**"]
+build-dir = "../.task-data/native-build/{wheel_tag}"

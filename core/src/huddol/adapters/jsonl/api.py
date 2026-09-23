@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from huddol.adapters.jsonl.protocol import Dispatcher
 from huddol.adapters.model.config import AgentModelConfig, ModelCatalog
+from huddol.adapters.voice.config import VoiceConfig
 from huddol.core.errors import DomainError
 from huddol.core.parameters import agent_parameters, validate_parameters
 from huddol.core.turn import idle_streak
@@ -350,6 +351,8 @@ class Api:
             values = settings.get_settings(section) or {}
             if section == "model":
                 return ModelCatalog.restore(values).redacted()
+            if section == "voice":
+                return VoiceConfig.restore(values).public()
             if section == "agent":
                 return asdict(agent_parameters(values))
             if section == "observability":
@@ -397,6 +400,11 @@ class Api:
             merged = {**(settings.get_settings(section) or {}), **values}
             if section == "agent":
                 validate_parameters(merged)
+            if section == "voice":
+                unknown = values.keys() - {"mode", "address", "model", "api_key"}
+                if unknown:
+                    raise DomainError("voice_config", "Unknown voice setting")
+                merged = asdict(VoiceConfig.restore(merged))
             settings.set_settings(section, merged)
             self._dispatcher.emit("settings.updated", {"section": section})
             return settings_get({"section": section})

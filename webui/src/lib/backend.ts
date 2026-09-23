@@ -450,6 +450,16 @@ export class Backend {
     await this.#open();
   }
 
+  async voiceUrl(): Promise<string> {
+    const socket = await this.#open();
+    if (this.#closed) throw this.#closed;
+    if (socket !== this.#activeSocket || this.#connectionUrl === null)
+      throw new BackendError("connection_changed", "Connection changed.", true);
+    const url = new URL(this.#connectionUrl);
+    url.pathname = "/voice";
+    return url.toString();
+  }
+
   reconnect(automatic = false): Promise<void> {
     if (this.#reconnecting) return this.#reconnecting;
     if (

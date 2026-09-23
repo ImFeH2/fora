@@ -211,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
     from huddol.adapters.model.runner import PydanticModelRunner
     from huddol.adapters.sqlite.agent import SqliteAgentStore
     from huddol.adapters.sqlite.store import SqliteStore
+    from huddol.adapters.voice.endpoint import VoiceEndpoint
     from huddol.adapters.websocket.server import WebServer, webui_directory
     from huddol.runtime.scheduler import Scheduler
     from huddol.services.uploads import Uploads
@@ -314,6 +315,8 @@ def main(argv: list[str] | None = None) -> int:
                 port=options.port,
                 uploads=uploads,
             )
+            voice = VoiceEndpoint(directory, lambda: agent_store.get_settings("voice"))
+            server.add_websocket_route("/voice", voice.handle, max_msg_size=1048576)
             resources.callback(server.stop)
             server.start()
             write_run_file(run_file, server.port, token)

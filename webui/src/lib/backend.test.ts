@@ -251,6 +251,35 @@ describe("Backend", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("uses the authenticated active connection for voice", async () => {
+    let connection = "wss://example.test/ws?token=voice-test";
+    let socket!: FakeSocket;
+    const backend = new Backend(
+      () => ({ url: connection }),
+      (url) => {
+        socket = new FakeSocket(url);
+        return socket;
+      },
+    );
+    const connected = backend.connect();
+    socket.open();
+    await connected;
+    connection = "wss://other.test/ws?token=other-test";
+    await expect(backend.voiceUrl()).resolves.toBe(
+      "wss://example.test/voice?token=voice-test",
+    );
+    socket.fail();
+    await expect(backend.voiceUrl()).rejects.toMatchObject({
+      code: "disconnected",
+    });
+    const recovery = backend.reconnect();
+    socket.open();
+    await recovery;
+    await expect(backend.voiceUrl()).resolves.toBe(
+      "wss://other.test/voice?token=other-test",
+    );
+  });
+
   it("opens a socket at the resolved url", async () => {
     const { connected } = harness();
     const socket = await connected();

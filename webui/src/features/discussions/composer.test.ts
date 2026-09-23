@@ -94,7 +94,7 @@ describe("composer layout", () => {
     expect(composerHeight(true, 204)).toBe(252);
   });
 
-  it("renders a real compact input, an inaccessible measuring probe and disabled send", () => {
+  it("renders a compact input, measuring probe and voice input button", () => {
     const html = renderToStaticMarkup(
       createElement(Composer, {
         discussionId: 1,
@@ -109,7 +109,7 @@ describe("composer layout", () => {
     expect(html).toContain('data-expanded="false"');
     expect(html).toContain('role="combobox"');
     expect(html).toContain('aria-label="Message"');
-    expect(html).toContain('aria-label="Voice input · Coming soon"');
+    expect(html).toContain('aria-label="Start voice input"');
     expect(html).toContain('aria-hidden="true"');
     expect(html).toContain('tabindex="-1"');
     expect(html).toContain("motion-reduce:transition-none");

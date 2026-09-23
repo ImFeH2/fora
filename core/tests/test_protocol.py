@@ -327,6 +327,43 @@ def test_cancel_response_loss_and_cleanup_failure(
     assert store.message_count(room.id) == 0
 
 
+def test_voice_settings_keep_key_private_and_validate_updates(server) -> None:
+    dispatcher, output, deps = server
+    saved = call(
+        dispatcher,
+        output,
+        "settings.update",
+        section="voice",
+        values={
+            "mode": "remote",
+            "model": "gpt-live-transcribe",
+            "api_key": "test-placeholder",
+        },
+    )
+    assert saved["result"]["api_key_set"] is True
+    assert "api_key" not in saved["result"]
+    changed = call(
+        dispatcher,
+        output,
+        "settings.update",
+        section="voice",
+        values={"model": "another-model"},
+    )
+    assert changed["result"]["model"] == "another-model"
+    assert deps.settings.get_settings("voice")["api_key"] == "test-placeholder"
+    failed = call(
+        dispatcher,
+        output,
+        "settings.update",
+        section="voice",
+        values={"address": "http://example.invalid"},
+    )
+    assert failed["error"]["code"] == "voice_config"
+    restored = call(dispatcher, output, "settings.get", section="voice")
+    assert restored["result"]["address"].startswith("wss://")
+    assert "test-placeholder" not in json.dumps(output.frames())
+
+
 def test_bad_json_produces_an_error_event_not_a_crash(server) -> None:
     dispatcher, output, _ = server
     dispatcher.receive("{not json}", output)
