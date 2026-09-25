@@ -352,6 +352,10 @@ class Api:
             if section == "model":
                 return ModelCatalog.restore(values).redacted()
             if section == "voice":
+                if "mode" in values:
+                    values = settings.update_settings(
+                        "voice", lambda stored: asdict(VoiceConfig.restore(stored))
+                    )
                 return VoiceConfig.restore(values).public()
             if section == "agent":
                 return asdict(agent_parameters(values))
@@ -401,9 +405,16 @@ class Api:
             if section == "agent":
                 validate_parameters(merged)
             if section == "voice":
-                unknown = values.keys() - {"mode", "address", "model", "api_key"}
+                unknown = values.keys() - {"address", "model", "api_key"}
                 if unknown:
                     raise DomainError("voice_config", "Unknown voice setting")
+                model = values.get("model")
+                if "model" in values and (
+                    not isinstance(model, str) or not model.strip()
+                ):
+                    raise DomainError(
+                        "voice_config", "A transcription model is required"
+                    )
                 merged = asdict(VoiceConfig.restore(merged))
             settings.set_settings(section, merged)
             self._dispatcher.emit("settings.updated", {"section": section})

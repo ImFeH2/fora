@@ -4,7 +4,6 @@ import { backend } from "@/lib/backend";
 import { VoiceRecording, type VoiceState } from "@/lib/voice";
 
 type Values = {
-  mode: "local" | "remote";
   address: string;
   model: string;
   api_key_set: boolean;
@@ -17,88 +16,30 @@ export function VoicePanel() {
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [present, setPresent] = useState(false);
-  const [download, setDownload] = useState<number | null>(null);
-  const [connected, setConnected] = useState(false);
   const [text, setText] = useState("");
   const [state, setState] = useState<VoiceState>("closed");
   const [level, setLevel] = useState(0);
-  const socket = useRef<WebSocket | null>(null);
   const recording = useRef<VoiceRecording | null>(null);
   const active = state !== "closed";
 
   useEffect(() => {
     let mounted = true;
-    const fail = (failure: unknown) => {
-      if (mounted)
-        setError(failure instanceof Error ? failure.message : String(failure));
-    };
-    void backend.settings("voice").then((value) => {
-      if (mounted) setValues(value as Values);
-    }, fail);
-    void backend.voiceUrl().then((url) => {
-      if (!mounted) return;
-      const connection = new WebSocket(url);
-      socket.current = connection;
-      connection.onopen = () => {
-        if (!mounted) return;
-        setConnected(true);
-        connection.send(JSON.stringify({ type: "model.status" }));
-      };
-      connection.onmessage = (event) => {
-        if (!mounted) return;
-        try {
-          const message = JSON.parse(event.data);
-          switch (message.type) {
-            case "model.status":
-              setPresent(message.present === true);
-              break;
-            case "model.progress":
-              setDownload(message.received / message.total);
-              break;
-            case "model.downloaded":
-              setPresent(true);
-              setDownload(null);
-              break;
-            case "model.cancelled":
-              setDownload(null);
-              break;
-            case "error":
-              setDownload(null);
-              setError(message.message);
-              break;
-            default:
-              throw new Error("Unexpected model download event.");
-          }
-        } catch (failure) {
-          fail(failure);
-          connection.close();
-        }
-      };
-      connection.onerror = () =>
-        fail(new Error("Model download connection failed."));
-      connection.onclose = () => {
-        if (!mounted) return;
-        setConnected(false);
-        setDownload(null);
-        fail(
-          new Error(
-            "Model download connection closed. Reopen Voice settings to reconnect.",
-          ),
-        );
-      };
-    }, fail);
-    const off = backend.onEvent((event) => {
-      if (event.type === "connection.closed") socket.current?.close();
-    });
+    void backend.settings("voice").then(
+      (value) => {
+        if (mounted) setValues(value as Values);
+      },
+      (failure: unknown) => {
+        if (mounted)
+          setError(
+            failure instanceof Error ? failure.message : String(failure),
+          );
+      },
+    );
     return () => {
       mounted = false;
-      off();
       const current = recording.current;
       recording.current = null;
       current?.cancel();
-      socket.current?.close();
-      socket.current = null;
     };
   }, []);
 
@@ -115,7 +56,6 @@ export function VoicePanel() {
     setText("");
     try {
       const update: Record<string, unknown> = {
-        mode: values.mode,
         address: values.address,
         model: values.model,
       };
@@ -128,18 +68,6 @@ export function VoicePanel() {
     } finally {
       setBusy(false);
     }
-  };
-  const command = (type: string) => {
-    const connection = socket.current;
-    if (!connection || connection.readyState !== WebSocket.OPEN) {
-      setError(
-        "Model download connection is unavailable. Reopen Voice settings.",
-      );
-      return;
-    }
-    setError("");
-    if (type === "model.download") setDownload(0);
-    connection.send(JSON.stringify({ type }));
   };
   const test = () => {
     if (active || dirty || busy || !values) return;
@@ -178,108 +106,62 @@ export function VoicePanel() {
           disabled={!values || busy || active}
           className="m-0 flex min-w-0 flex-col gap-4 border-0 p-0"
         >
-          <Field label="Transcription" htmlFor={`${id}-mode`}>
-            <select
-              id={`${id}-mode`}
-              className="rounded border border-line bg-surface p-2"
-              value={values?.mode ?? "local"}
+          <Field label="Service address" htmlFor={`${id}-address`}>
+            <Input
+              id={`${id}-address`}
+              type="url"
+              required
+              value={values?.address ?? ""}
               onChange={(event) => {
                 if (!values) throw new Error("Voice settings are unavailable");
-                change({
-                  ...values,
-                  mode: event.target.value as Values["mode"],
-                });
+                change({ ...values, address: event.target.value });
               }}
-            >
-              <option value="local">Local · Whisper base</option>
-              <option value="remote">Remote · OpenAI Realtime</option>
-            </select>
+            />
           </Field>
-          {values?.mode === "remote" ? (
-            <>
-              <Field label="Service address" htmlFor={`${id}-address`}>
-                <Input
-                  id={`${id}-address`}
-                  type="url"
-                  required
-                  value={values.address}
-                  onChange={(event) =>
-                    change({ ...values, address: event.target.value })
-                  }
-                />
-              </Field>
-              <Field label="Model" htmlFor={`${id}-model`}>
-                <Input
-                  id={`${id}-model`}
-                  required
-                  value={values.model}
-                  onChange={(event) =>
-                    change({ ...values, model: event.target.value })
-                  }
-                />
-              </Field>
-              <Field
-                label="API key"
-                htmlFor={`${id}-key`}
-                hint={
-                  values.api_key_set
-                    ? "Leave blank to keep the stored key."
-                    : undefined
-                }
-              >
-                <Input
-                  id={`${id}-key`}
-                  type="password"
-                  autoComplete="off"
-                  required={!values.api_key_set}
-                  value={key}
-                  onChange={(event) => {
-                    setKey(event.target.value);
-                    change(values);
-                  }}
-                />
-              </Field>
-              <p className="text-sm text-fg-muted">
-                Audio is sent through Huddol to {values.address} for
-                transcription.
-              </p>
-            </>
-          ) : (
-            <p className="text-sm text-fg-muted">
-              Whisper runs on the computer hosting Huddol. Download the
-              multilingual base model (141 MiB) to use local transcription.
-            </p>
-          )}
+          <Field label="Model" htmlFor={`${id}-model`}>
+            <Input
+              id={`${id}-model`}
+              required
+              value={values?.model ?? ""}
+              onChange={(event) => {
+                if (!values) throw new Error("Voice settings are unavailable");
+                change({ ...values, model: event.target.value });
+              }}
+            />
+          </Field>
+          <Field
+            label="API key"
+            htmlFor={`${id}-key`}
+            hint={
+              values?.api_key_set
+                ? "Leave blank to keep the stored key."
+                : undefined
+            }
+          >
+            <Input
+              id={`${id}-key`}
+              type="password"
+              autoComplete="off"
+              required={!values?.api_key_set}
+              value={key}
+              onChange={(event) => {
+                setKey(event.target.value);
+                if (values) change(values);
+              }}
+            />
+          </Field>
+          <p className="text-sm text-fg-muted">
+            Audio is sent through Huddol to{" "}
+            {values?.address ?? "the configured service"} for transcription.
+          </p>
           <Button type="submit" variant="primary" disabled={!dirty}>
             Save
           </Button>
         </fieldset>
       </form>
-      {values?.mode === "local" ? (
-        <div className="flex flex-col gap-2">
-          <p>{present ? "Whisper base downloaded" : "Whisper base required"}</p>
-          {download !== null ? (
-            <>
-              <progress aria-label="Model download" max={1} value={download} />
-              <Button type="button" onClick={() => command("model.cancel")}>
-                Cancel download
-              </Button>
-            </>
-          ) : (
-            <Button
-              type="button"
-              disabled={!connected || active}
-              onClick={() => command("model.download")}
-            >
-              {present ? "Download again" : "Download model"}
-            </Button>
-          )}
-        </div>
-      ) : null}
       <div className="flex flex-col gap-3 border-t border-line pt-4">
         <p className="text-sm">
-          Test saved settings ·{" "}
-          {values?.mode === "remote" ? values.address : "Local Whisper"}
+          Test saved OpenAI Realtime settings · {values?.address ?? ""}
         </p>
         {dirty ? (
           <p className="text-sm text-fg-muted">
@@ -317,11 +199,7 @@ export function VoicePanel() {
             <Button
               type="button"
               disabled={
-                !values ||
-                busy ||
-                dirty ||
-                download !== null ||
-                (values.mode === "local" && !present)
+                !values || busy || dirty || (!values.api_key_set && !key)
               }
               onClick={test}
             >

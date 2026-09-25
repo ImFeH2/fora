@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import io
 import json
 import sqlite3
@@ -7,9 +9,11 @@ import threading
 import uuid
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, Self, cast
 
 import pytest
+from aiohttp import ClientSession, WSMsgType, WSServerHandshakeError
 from websockets.sync.client import connect
 
 from huddol.adapters.execution.manager import ExecutionManager
@@ -20,6 +24,9 @@ from huddol.adapters.jsonl.protocol import Dispatcher, parse, wait_for_shutdown
 from huddol.adapters.model.runner import PydanticModelRunner
 from huddol.adapters.sqlite.agent import SqliteAgentStore
 from huddol.adapters.sqlite.store import SqliteStore
+from huddol.adapters.voice.config import VoiceConfig
+from huddol.adapters.voice.endpoint import VoiceEndpoint
+from huddol.adapters.voice.remote import RemoteRecording
 from huddol.adapters.websocket.server import WebServer
 from huddol.core.errors import DomainError
 from huddol.core.parameters import AgentParameters
@@ -329,18 +336,21 @@ def test_cancel_response_loss_and_cleanup_failure(
 
 def test_voice_settings_keep_key_private_and_validate_updates(server) -> None:
     dispatcher, output, deps = server
+    defaults = call(dispatcher, output, "settings.get", section="voice")
+    assert defaults["result"]["model"] == "gpt-live-transcribe"
+    assert "mode" not in defaults["result"]
     saved = call(
         dispatcher,
         output,
         "settings.update",
         section="voice",
         values={
-            "mode": "remote",
             "model": "gpt-live-transcribe",
             "api_key": "test-placeholder",
         },
     )
     assert saved["result"]["api_key_set"] is True
+    assert "mode" not in saved["result"]
     assert "api_key" not in saved["result"]
     changed = call(
         dispatcher,
@@ -361,7 +371,66 @@ def test_voice_settings_keep_key_private_and_validate_updates(server) -> None:
     assert failed["error"]["code"] == "voice_config"
     restored = call(dispatcher, output, "settings.get", section="voice")
     assert restored["result"]["address"].startswith("wss://")
+    assert restored["result"]["model"] == "another-model"
+    assert "mode" not in restored["result"]
     assert "test-placeholder" not in json.dumps(output.frames())
+    deps.settings.set_settings("voice", {"mode": "local", "model": ""})
+    migrated = call(dispatcher, output, "settings.get", section="voice")
+    assert migrated["result"]["model"] == "gpt-live-transcribe"
+    assert "mode" not in migrated["result"]
+    assert "mode" not in deps.settings.get_settings("voice")
+    rejected_mode = call(
+        dispatcher,
+        output,
+        "settings.update",
+        section="voice",
+        values={"mode": "local"},
+    )
+    assert rejected_mode["error"]["code"] == "voice_config"
+    rejected_model = call(
+        dispatcher,
+        output,
+        "settings.update",
+        section="voice",
+        values={"model": " "},
+    )
+    assert rejected_model["error"]["code"] == "voice_config"
+
+
+def test_voice_recording_requires_a_saved_api_key() -> None:
+    events: list[dict[str, Any]] = []
+
+    class Connection:
+        closed = False
+
+        async def __aiter__(self):
+            yield SimpleNamespace(
+                type=WSMsgType.TEXT,
+                data=json.dumps(
+                    {
+                        "type": "start",
+                        "sample_rate": 48000,
+                        "channels": 1,
+                        "format": "f32le",
+                    }
+                ),
+            )
+
+        async def send_json(self, event: dict[str, Any]) -> None:
+            events.append(event)
+
+    async def scenario() -> None:
+        endpoint = VoiceEndpoint(lambda: {"model": "gpt-live-transcribe"})
+        await endpoint.handle(cast(Any, Connection()))
+
+    asyncio.run(scenario())
+    assert events == [
+        {
+            "type": "error",
+            "code": "voice_config",
+            "message": "Save an API key before testing transcription",
+        }
+    ]
 
 
 def test_bad_json_produces_an_error_event_not_a_crash(server) -> None:
@@ -1276,3 +1345,404 @@ def test_library_directory_operations_and_workspace_read_protocol(server) -> Non
         {"type": "library.updated", "path": "renamed", "hash": None},
         {"type": "library.updated", "path": "renamed", "deleted": True},
     ]
+
+
+class RealtimeSocket:
+    def __init__(self, phase: str = "complete") -> None:
+        self.incoming: asyncio.Queue[SimpleNamespace] = asyncio.Queue()
+        self.sent: list[dict[str, Any]] = []
+        self.closed = False
+        self.audio = bytearray()
+        self.phase = phase
+        self.blocked = threading.Event()
+        self.closed_event = threading.Event()
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        self.closed = True
+        self.closed_event.set()
+
+    async def send_json(self, event: dict[str, Any]) -> None:
+        self.sent.append(event)
+        if event["type"] == "session.update":
+            if self.phase == "handshake":
+                self.blocked.set()
+                await asyncio.Future()
+            event_type = "error" if self.phase == "failure" else "session.updated"
+            await self.incoming.put(
+                SimpleNamespace(
+                    type=WSMsgType.TEXT,
+                    data=json.dumps({"type": event_type}),
+                )
+            )
+        elif event["type"] == "input_audio_buffer.append":
+            self.audio.extend(base64.b64decode(event["audio"]))
+            if self.phase == "transfer":
+                self.blocked.set()
+                await asyncio.Future()
+        elif event["type"] == "input_audio_buffer.commit":
+            if self.phase == "final":
+                self.blocked.set()
+                await asyncio.Future()
+            for result in (
+                {
+                    "type": "conversation.item.input_audio_transcription.delta",
+                    "item_id": "i1",
+                    "delta": "hello",
+                },
+                {
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "item_id": "i1",
+                    "transcript": "hello world",
+                },
+                {"type": "input_audio_buffer.committed", "item_id": "i1"},
+            ):
+                await self.incoming.put(
+                    SimpleNamespace(type=WSMsgType.TEXT, data=json.dumps(result))
+                )
+
+    async def receive(self) -> SimpleNamespace:
+        return await self.incoming.get()
+
+
+class RealtimeClient:
+    def __init__(self, phase: str = "complete", **kwargs: Any) -> None:
+        self.headers: dict[str, str] = {}
+        self.socket = RealtimeSocket(phase)
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        pass
+
+    def ws_connect(
+        self, address: str, *, headers: dict[str, str], **kwargs: Any
+    ) -> RealtimeSocket:
+        self.headers = headers
+        return self.socket
+
+
+def test_remote_recording_streams_pcm_and_waits_for_commit_and_transcript(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from huddol.adapters.voice import remote
+
+    client = RealtimeClient()
+    monkeypatch.setattr(remote.aiohttp, "ClientSession", lambda **kwargs: client)
+    config = VoiceConfig.restore(
+        {
+            "address": "wss://service.invalid/realtime",
+            "model": "gpt-live-transcribe",
+            "api_key": "test-key",
+        }
+    )
+
+    async def scenario() -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        ready = asyncio.Event()
+
+        async def emit(event: dict[str, Any]) -> None:
+            events.append(event)
+            if event["type"] == "ready":
+                ready.set()
+
+        recording = RemoteRecording(config, 48000, emit)
+        worker = recording.start()
+        await asyncio.wait_for(ready.wait(), timeout=2)
+        recording.feed(bytes(19200))
+        recording.stop()
+        await asyncio.wait_for(worker, timeout=2)
+        return events
+
+    events = asyncio.run(scenario())
+    assert client.headers == {"Authorization": "Bearer test-key"}
+    assert client.socket.closed
+    assert [event["type"] for event in events] == [
+        "ready",
+        "transcript",
+        "transcript",
+        "finished",
+    ]
+    assert events[-2]["text"] == "hello world"
+    assert events[-1]["text"] == "hello world"
+    assert len(client.socket.audio) == 4800
+    assert [event["type"] for event in client.socket.sent] == [
+        "session.update",
+        "input_audio_buffer.append",
+        "input_audio_buffer.append",
+        "input_audio_buffer.commit",
+    ]
+
+
+@pytest.mark.parametrize("phase", ["handshake", "transfer", "final"])
+def test_webserver_stop_closes_remote_recording_resources(
+    monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    from huddol.adapters.voice import remote
+
+    clients: list[RealtimeClient] = []
+    client_created = threading.Event()
+
+    def create_client(**kwargs: Any) -> RealtimeClient:
+        client = RealtimeClient(phase)
+        clients.append(client)
+        client_created.set()
+        return client
+
+    monkeypatch.setattr(remote.aiohttp, "ClientSession", create_client)
+    server = WebServer(Dispatcher(), "test-token", None, port=0)
+    endpoint = VoiceEndpoint(
+        lambda: {
+            "address": "wss://service.invalid/realtime",
+            "model": "gpt-live-transcribe",
+            "api_key": "test-key",
+        }
+    )
+    server.add_websocket_route("/voice", endpoint.handle, max_msg_size=1048576)
+    server.start()
+
+    async def scenario() -> None:
+        async with ClientSession() as session:
+            with pytest.raises(WSServerHandshakeError) as unauthorized:
+                await session.ws_connect(
+                    f"http://127.0.0.1:{server.port}/voice?token=wrong"
+                )
+            assert unauthorized.value.status == 401
+            async with session.ws_connect(
+                f"http://127.0.0.1:{server.port}/voice?token=test-token"
+            ) as connection:
+                await connection.send_json(
+                    {
+                        "type": "start",
+                        "sample_rate": 48000,
+                        "channels": 1,
+                        "format": "f32le",
+                    }
+                )
+                assert await asyncio.to_thread(client_created.wait, 3)
+                client = clients[0]
+                if phase == "handshake":
+                    assert await asyncio.to_thread(client.socket.blocked.wait, 3)
+                else:
+                    ready = await asyncio.wait_for(connection.receive_json(), 3)
+                    assert ready == {"type": "ready", "mode": "remote"}
+                    await connection.send_bytes(bytes(19200))
+                    if phase == "transfer":
+                        assert await asyncio.to_thread(client.socket.blocked.wait, 3)
+                    else:
+                        await connection.send_json({"type": "stop"})
+                        assert await asyncio.wait_for(connection.receive_json(), 3) == {
+                            "type": "finishing"
+                        }
+                        assert await asyncio.to_thread(client.socket.blocked.wait, 3)
+                await asyncio.wait_for(asyncio.to_thread(server.stop), timeout=8)
+                assert await asyncio.to_thread(client.socket.closed_event.wait, 3)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        if server._thread.is_alive():
+            server.stop()
+    assert not server._handlers
+
+
+def test_server_stop_closes_every_active_remote_recording(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from huddol.adapters.voice import remote
+
+    clients: list[RealtimeClient] = []
+    client_created = threading.Event()
+
+    def create_client(**kwargs: Any) -> RealtimeClient:
+        client = RealtimeClient("transfer")
+        clients.append(client)
+        client_created.set()
+        return client
+
+    monkeypatch.setattr(remote.aiohttp, "ClientSession", create_client)
+    server = WebServer(Dispatcher(), "test-token", None, port=0)
+    endpoint = VoiceEndpoint(
+        lambda: {
+            "address": "wss://service.invalid/realtime",
+            "model": "gpt-live-transcribe",
+            "api_key": "test-key",
+        }
+    )
+    server.add_websocket_route("/voice", endpoint.handle, max_msg_size=1048576)
+    server.start()
+
+    async def scenario() -> None:
+        async with (
+            ClientSession() as session,
+            session.ws_connect(
+                f"http://127.0.0.1:{server.port}/voice?token=test-token"
+            ) as first,
+            session.ws_connect(
+                f"http://127.0.0.1:{server.port}/voice?token=test-token"
+            ) as second,
+        ):
+            for connection in (first, second):
+                await connection.send_json(
+                    {
+                        "type": "start",
+                        "sample_rate": 48000,
+                        "channels": 1,
+                        "format": "f32le",
+                    }
+                )
+            assert await asyncio.to_thread(client_created.wait, 3)
+            async with asyncio.timeout(3):
+                while len(clients) != 2:
+                    await asyncio.sleep(0.005)
+            assert await asyncio.wait_for(first.receive_json(), 3) == {
+                "type": "ready",
+                "mode": "remote",
+            }
+            assert await asyncio.wait_for(second.receive_json(), 3) == {
+                "type": "ready",
+                "mode": "remote",
+            }
+            await first.send_bytes(bytes(19200))
+            await second.send_bytes(bytes(19200))
+            assert await asyncio.to_thread(clients[0].socket.blocked.wait, 3)
+            assert await asyncio.to_thread(clients[1].socket.blocked.wait, 3)
+            await asyncio.wait_for(asyncio.to_thread(server.stop), timeout=8)
+            assert await asyncio.to_thread(clients[0].socket.closed_event.wait, 3)
+            assert await asyncio.to_thread(clients[1].socket.closed_event.wait, 3)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        if server._thread.is_alive():
+            server.stop()
+    assert not server._handlers
+
+
+def test_remote_failure_allows_a_new_recording_on_the_same_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from huddol.adapters.voice import remote
+
+    clients: list[RealtimeClient] = []
+    client_created = threading.Event()
+
+    def create_client(**kwargs: Any) -> RealtimeClient:
+        client = RealtimeClient("failure" if not clients else "complete")
+        clients.append(client)
+        client_created.set()
+        return client
+
+    monkeypatch.setattr(remote.aiohttp, "ClientSession", create_client)
+    server = WebServer(Dispatcher(), "test-token", None, port=0)
+    endpoint = VoiceEndpoint(
+        lambda: {
+            "address": "wss://service.invalid/realtime",
+            "model": "gpt-live-transcribe",
+            "api_key": "test-key",
+        }
+    )
+    server.add_websocket_route("/voice", endpoint.handle, max_msg_size=1048576)
+    server.start()
+
+    async def scenario() -> None:
+        async with (
+            ClientSession() as session,
+            session.ws_connect(
+                f"http://127.0.0.1:{server.port}/voice?token=test-token"
+            ) as connection,
+        ):
+            start = {
+                "type": "start",
+                "sample_rate": 48000,
+                "channels": 1,
+                "format": "f32le",
+            }
+            await connection.send_json(start)
+            assert await asyncio.to_thread(client_created.wait, 3)
+            failed = await asyncio.wait_for(connection.receive_json(), 3)
+            assert failed["type"] == "error"
+            assert failed["code"] == "voice_remote_error"
+            assert await asyncio.to_thread(clients[0].socket.closed_event.wait, 3)
+            await connection.send_json(start)
+            async with asyncio.timeout(3):
+                while len(clients) != 2:
+                    await asyncio.sleep(0.005)
+            assert await asyncio.wait_for(connection.receive_json(), 3) == {
+                "type": "ready",
+                "mode": "remote",
+            }
+            await connection.send_bytes(bytes(19200))
+            await connection.send_json({"type": "stop"})
+            transcripts = []
+            async with asyncio.timeout(3):
+                while True:
+                    event = await connection.receive_json()
+                    transcripts.append(event)
+                    if event["type"] == "finished":
+                        break
+            assert any(event["type"] == "transcript" for event in transcripts)
+            assert transcripts[-1] == {
+                "type": "finished",
+                "text": "hello world",
+            }
+            assert await asyncio.to_thread(clients[1].socket.closed_event.wait, 3)
+            await connection.send_json(start)
+            async with asyncio.timeout(3):
+                while len(clients) != 3:
+                    await asyncio.sleep(0.005)
+            assert await asyncio.wait_for(connection.receive_json(), 3) == {
+                "type": "ready",
+                "mode": "remote",
+            }
+            await connection.send_json({"type": "cancel"})
+            assert await asyncio.wait_for(connection.receive_json(), 3) == {
+                "type": "cancelled"
+            }
+            assert await asyncio.to_thread(clients[2].socket.closed_event.wait, 3)
+        await asyncio.wait_for(asyncio.to_thread(server.stop), timeout=8)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        if server._thread.is_alive():
+            server.stop()
+    assert not server._handlers
+
+
+def test_remote_recording_cancel_closes_upstream_and_discards_late_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from huddol.adapters.voice import remote
+
+    client = RealtimeClient()
+    monkeypatch.setattr(remote.aiohttp, "ClientSession", lambda **kwargs: client)
+    config = VoiceConfig.restore(
+        {
+            "address": "wss://service.invalid/realtime",
+            "model": "gpt-live-transcribe",
+            "api_key": "test-key",
+        }
+    )
+
+    async def scenario() -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        ready = asyncio.Event()
+
+        async def emit(event: dict[str, Any]) -> None:
+            events.append(event)
+            if event["type"] == "ready":
+                ready.set()
+
+        recording = RemoteRecording(config, 48000, emit)
+        recording.start()
+        await asyncio.wait_for(ready.wait(), timeout=2)
+        await recording.close()
+        return events
+
+    events = asyncio.run(scenario())
+    assert client.socket.closed
+    assert [event["type"] for event in events] == ["ready"]

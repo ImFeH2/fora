@@ -315,7 +315,7 @@ def main(argv: list[str] | None = None) -> int:
                 port=options.port,
                 uploads=uploads,
             )
-            voice = VoiceEndpoint(directory, lambda: agent_store.get_settings("voice"))
+            voice = VoiceEndpoint(lambda: agent_store.get_settings("voice"))
             server.add_websocket_route("/voice", voice.handle, max_msg_size=1048576)
             resources.callback(server.stop)
             server.start()

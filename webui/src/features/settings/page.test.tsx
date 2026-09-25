@@ -388,4 +388,19 @@ describe("Settings page", () => {
       "0 means unlimited. Changes apply to new Turns.",
     ]);
   });
+
+  it("shows only remote voice settings and the microphone test", () => {
+    const html = renderToStaticMarkup(
+      <RouterProvider>
+        <SettingsPage section="voice" />
+      </RouterProvider>,
+    );
+    expect(html).toContain(">Service address</label>");
+    expect(html).toContain(">Model</label>");
+    expect(html).toContain(">API key</label>");
+    expect(html).toContain("Start microphone test");
+    expect(html).not.toContain("Whisper");
+    expect(html).not.toContain("Download model");
+    expect(html).not.toContain("<select");
+  });
 });

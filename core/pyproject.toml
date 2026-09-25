@@ -14,7 +14,6 @@ dependencies = [
   "psutil>=7.2.2",
   "pydantic-ai-slim[anthropic,duckduckgo,google,openai]>=2.28.0",
   "soxr>=1.1.0",
-  "webrtcvad-wheels>=2.0.14",
   "websockets>=16.1.1",
 ]
 
@@ -32,13 +31,5 @@ dev = [
 ]
 
 [build-system]
-requires = ["scikit-build-core==1.0.3"]
-build-backend = "scikit_build_core.build"
-
-[tool.scikit-build]
-cmake.version = ">=3.25"
-wheel.packages = ["src/huddol"]
-wheel.py-api = "py3"
-install.components = ["voice"]
-sdist.include = ["CMakeLists.txt", "native/voice_shim.cpp", "src/huddol/**"]
-build-dir = "../.task-data/native-build/{wheel_tag}"
+requires = ["uv_build>=0.11.16,<0.12.0"]
+build-backend = "uv_build"

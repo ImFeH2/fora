@@ -87,7 +87,7 @@ afterEach(() => {
 async function ready() {
   await recording.start();
   TestSocket.current.onopen?.();
-  TestSocket.current.receive({ type: "ready", mode: "local" });
+  TestSocket.current.receive({ type: "ready", mode: "remote" });
   await vi.advanceTimersByTimeAsync(0);
   expect(recording.state).toBe("recording");
 }

@@ -4,14 +4,16 @@ import asyncio
 import base64
 import contextlib
 import json
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import aiohttp
 
 from huddol.adapters.voice.audio import AudioConverter
 from huddol.adapters.voice.config import VoiceConfig
-from huddol.adapters.voice.local import Emit
 from huddol.core.errors import DomainError
+
+Emit = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 class RemoteRecording:
