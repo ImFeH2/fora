@@ -766,12 +766,17 @@ def test_reset_notices_use_the_exact_window_timestamp() -> None:
     assert reset_notice(WindowState(1, 1, None, None)) is None
     assert reset_notice(WindowState(2, 3, "STAMP", "prepared")) == (
         "Your context window was reset at STAMP after you saved your notes. "
-        "Use the history tool for anything older."
+        "Use the history tool at least once to review your progress and tool results "
+        "from before the previous window ended. Then continue using your saved records "
+        "and the latest discussions. Look up only the history you need; you do not "
+        "need to read it all."
     )
     assert reset_notice(WindowState(2, 3, "STAMP", "overflow")) == (
         "Your context window was reset at STAMP in the middle of a Turn because it "
-        "overflowed, so you could not save notes first. Use the history tool to see "
-        "what you were doing."
+        "overflowed, so you could not save notes first. Use the history tool to "
+        "inspect the most recent interrupted turn, the last completed operation, and "
+        "any tool calls that did not return. Confirm where to continue from. Look up "
+        "only the history you need; you do not need to read it all."
     )
 
 
