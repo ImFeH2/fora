@@ -184,12 +184,22 @@ async function openSettings(section: "model" | "agent") {
   return tab;
 }
 
-afterEach(() => {
+function flushScheduledWork() {
+  return new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+afterEach(async () => {
   cleanup();
+  await act(async () => {
+    await flushScheduledWork();
+  });
   vi.restoreAllMocks();
 });
 
-afterAll(() => {
+afterAll(async () => {
+  await act(async () => {
+    await flushScheduledWork();
+  });
   dom.window.close();
   vi.unstubAllGlobals();
 });
