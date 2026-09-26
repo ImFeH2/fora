@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -52,6 +53,27 @@ def tools_for(deps: Dependencies, member_id: int, **kwargs) -> AgentTools:
     member = deps.store.get_member(member_id)
     assert member is not None
     return AgentTools(deps, Actor(member_id, member.is_agent), **kwargs)
+
+
+def test_history_tool_returns_bounded_pages_and_hides_other_members_runs(world) -> None:
+    payload = '[{"text":"' + "z" * 3_000_000 + '"}]'
+    run = world.history.start_run(MAIN)
+    world.history.finish_run(
+        MAIN, run.sequence, status="completed", messages_json=payload
+    )
+    tools = tools_for(world, MAIN)
+    first = tools.read_history(run.sequence)
+    assert len(first["messages"]) == 2048
+    assert first["offset"] == 0
+    assert first["total_length"] == len(payload)
+    assert first["next_offset"] == 2048
+    second = tools.read_history(run.sequence, first["next_offset"])
+    assert second["offset"] == 2048
+    assert len(second["messages"]) == 2048
+    assert len(json.dumps(first, ensure_ascii=False).encode()) < 32 * 1024
+    with pytest.raises(DomainError) as error:
+        tools_for(world, OTHER).read_history(run.sequence)
+    assert error.value.code == "not_found"
 
 
 @pytest.mark.parametrize("member_id", [MAIN, OTHER])

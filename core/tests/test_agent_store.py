@@ -25,6 +25,53 @@ def agent_store(tmp_path: Path) -> SqliteAgentStore:
     base.close()
 
 
+def test_history_reads_unicode_slices_without_loading_or_changing_the_run(
+    agent_store: SqliteAgentStore,
+) -> None:
+    payload = '[{"text":"漢\\\\n' + "x" * 3_000_000 + '終"}]'
+    run = agent_store.start_run(AGENT)
+    agent_store.finish_run(
+        AGENT, run.sequence, status="completed", messages_json=payload
+    )
+    history = History(agent_store, AGENT)
+    before = agent_store.runs(AGENT)[0].messages_json
+    chunks = []
+    offset = 0
+    while True:
+        part = history.read(run.sequence, offset)
+        assert part is not None
+        assert len(part.messages) <= 2048
+        chunks.append(part.messages)
+        offset += len(part.messages)
+        if offset == part.total_length:
+            break
+    assert "".join(chunks) == payload
+    assert agent_store.runs(AGENT)[0].messages_json == before
+    final = history.read(run.sequence, len(payload))
+    assert final is not None
+    assert final.messages == ""
+    with pytest.raises(DomainError):
+        history.read(run.sequence, len(payload) + 1)
+    with pytest.raises(DomainError):
+        history.read(run.sequence, True)
+    with pytest.raises(DomainError):
+        history.read(run.sequence, 2**63)
+
+
+def test_history_reads_a_run_older_than_the_recent_run_window(
+    agent_store: SqliteAgentStore,
+) -> None:
+    original = agent_store.start_run(AGENT)
+    agent_store.finish_run(
+        AGENT, original.sequence, status="completed", messages_json='[{"text":"old"}]'
+    )
+    for _ in range(1000):
+        agent_store.start_run(AGENT)
+    part = History(agent_store, AGENT).read(original.sequence)
+    assert part is not None
+    assert part.messages == '[{"text":"old"}]'
+
+
 def test_runs_append_and_report_the_latest_history(
     agent_store: SqliteAgentStore,
 ) -> None:

@@ -1764,6 +1764,11 @@ def test_non_tool_faults_are_not_tool_failures(settings, monkeypatch, stage):
         ("run", {"argv": ["true"]}, "run"),
         ("edit", {"path": "/fake", "old_text": "old", "new_text": "new"}, "edit"),
         ("history", {"action": "read", "sequence": 1}, "read_history"),
+        (
+            "history",
+            {"action": "read", "sequence": 1, "offset": 2048},
+            "read_history",
+        ),
     ],
 )
 def test_all_builtin_registrations_share_execution_boundary(

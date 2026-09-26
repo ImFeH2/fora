@@ -11,6 +11,7 @@ from huddol.core.errors import DomainError
 from huddol.ports.agent import (
     AgentLifecycle,
     AgentRun,
+    HistorySlice,
     RunSummary,
     TurnEffect,
     WindowState,
@@ -407,6 +408,38 @@ class SqliteAgentStore:
             )
         )
         return str(row["messages_json"]) if row else "[]"
+
+    def read_run_slice(
+        self, agent_id: int, sequence: int, offset: int, limit: int
+    ) -> HistorySlice | None:
+        row = first(
+            self._db.execute(
+                "SELECT sequence, status, started_at, length(messages_json) AS total_length "
+                "FROM agent_runs WHERE agent_id = ? AND sequence = ?",
+                (agent_id, sequence),
+            )
+        )
+        if row is None:
+            return None
+        total_length = int(row["total_length"])
+        if offset > total_length:
+            raise DomainError("invalid_offset", "History offset exceeds its length")
+        content = first(
+            self._db.execute(
+                "SELECT substr(messages_json, ?, ?) AS messages FROM agent_runs "
+                "WHERE agent_id = ? AND sequence = ?",
+                (offset + 1, limit, agent_id, sequence),
+            )
+        )
+        assert content is not None
+        return HistorySlice(
+            sequence=int(row["sequence"]),
+            status=str(row["status"]),
+            started_at=str(row["started_at"]),
+            messages=str(content["messages"]),
+            offset=offset,
+            total_length=total_length,
+        )
 
     def runs(self, agent_id: int, *, limit: int = 50) -> tuple[AgentRun, ...]:
         rows = self._db.execute(

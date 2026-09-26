@@ -603,6 +603,7 @@ class PydanticModelRunner:
             action: str,
             query: str | None = None,
             sequence: int | None = None,
+            offset: int | None = None,
         ) -> Any:
             tools = ctx.deps
             if action == "search":
@@ -611,7 +612,13 @@ class PydanticModelRunner:
                 )
             if action == "read":
                 return _guard(
-                    lambda: tools.read_history(_required(sequence, "sequence", action))
+                    lambda: (
+                        tools.read_history(_required(sequence, "sequence", action))
+                        if offset is None
+                        else tools.read_history(
+                            _required(sequence, "sequence", action), offset
+                        )
+                    )
                 )
             raise ModelRetry(f"history has no action {action}")
 

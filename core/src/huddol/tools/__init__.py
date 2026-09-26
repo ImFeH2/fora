@@ -795,14 +795,22 @@ class AgentTools:
             for item in self._history().search(query)
         ]
 
-    def read_history(self, sequence: int) -> dict[str, Any]:
+    def read_history(self, sequence: int, offset: int = 0) -> dict[str, Any]:
         self._check("history.read", sequence)
-        run = self._history().read(sequence)
+        run = self._history().read(sequence, offset)
         if run is None:
             raise DomainError("not_found", f"Run {sequence} does not exist")
+        next_offset = (
+            offset + len(run.messages)
+            if offset + len(run.messages) < run.total_length
+            else None
+        )
         return {
             "sequence": run.sequence,
             "status": run.status,
             "started_at": run.started_at,
-            "messages": run.messages_json,
+            "messages": run.messages,
+            "offset": run.offset,
+            "total_length": run.total_length,
+            "next_offset": next_offset,
         }

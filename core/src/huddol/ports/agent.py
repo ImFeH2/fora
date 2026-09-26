@@ -31,6 +31,16 @@ class RunSummary:
 
 
 @dataclass(frozen=True)
+class HistorySlice:
+    sequence: int
+    status: str
+    started_at: str
+    messages: str
+    offset: int
+    total_length: int
+
+
+@dataclass(frozen=True)
 class WindowState:
     number: int
     since_sequence: int
@@ -142,6 +152,10 @@ class HistoryStore(Protocol):
     def search_runs(
         self, agent_id: int, query: str, *, limit: int = 20
     ) -> tuple[AgentRun, ...]: ...
+
+    def read_run_slice(
+        self, agent_id: int, sequence: int, offset: int, limit: int
+    ) -> HistorySlice | None: ...
 
 
 class SettingsStore(Protocol):
