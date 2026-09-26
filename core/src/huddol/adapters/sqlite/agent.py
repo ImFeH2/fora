@@ -410,7 +410,7 @@ class SqliteAgentStore:
         return str(row["messages_json"]) if row else "[]"
 
     def read_run_slice(
-        self, agent_id: int, sequence: int, offset: int, limit: int
+        self, agent_id: int, sequence: int, offset: int | None, limit: int
     ) -> HistorySlice | None:
         row = first(
             self._db.execute(
@@ -422,13 +422,14 @@ class SqliteAgentStore:
         if row is None:
             return None
         total_length = int(row["total_length"])
-        if offset > total_length:
+        start = max(total_length - limit, 0) if offset is None else offset
+        if start > total_length:
             raise DomainError("invalid_offset", "History offset exceeds its length")
         content = first(
             self._db.execute(
                 "SELECT substr(messages_json, ?, ?) AS messages FROM agent_runs "
                 "WHERE agent_id = ? AND sequence = ?",
-                (offset + 1, limit, agent_id, sequence),
+                (start + 1, limit, agent_id, sequence),
             )
         )
         assert content is not None
@@ -437,7 +438,7 @@ class SqliteAgentStore:
             status=str(row["status"]),
             started_at=str(row["started_at"]),
             messages=str(content["messages"]),
-            offset=offset,
+            offset=start,
             total_length=total_length,
         )
 

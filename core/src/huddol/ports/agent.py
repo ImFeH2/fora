@@ -154,7 +154,7 @@ class HistoryStore(Protocol):
     ) -> tuple[AgentRun, ...]: ...
 
     def read_run_slice(
-        self, agent_id: int, sequence: int, offset: int, limit: int
+        self, agent_id: int, sequence: int, offset: int | None, limit: int
     ) -> HistorySlice | None: ...
 
 

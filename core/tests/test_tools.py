@@ -62,10 +62,14 @@ def test_history_tool_returns_bounded_pages_and_hides_other_members_runs(world) 
         MAIN, run.sequence, status="completed", messages_json=payload
     )
     tools = tools_for(world, MAIN)
-    first = tools.read_history(run.sequence)
+    tail = tools.read_history(run.sequence)
+    assert len(tail["messages"]) == 2048
+    assert tail["offset"] == len(payload) - 2048
+    assert tail["total_length"] == len(payload)
+    assert tail["next_offset"] is None
+    first = tools.read_history(run.sequence, 0)
     assert len(first["messages"]) == 2048
     assert first["offset"] == 0
-    assert first["total_length"] == len(payload)
     assert first["next_offset"] == 2048
     second = tools.read_history(run.sequence, first["next_offset"])
     assert second["offset"] == 2048
@@ -74,6 +78,13 @@ def test_history_tool_returns_bounded_pages_and_hides_other_members_runs(world) 
     with pytest.raises(DomainError) as error:
         tools_for(world, OTHER).read_history(run.sequence)
     assert error.value.code == "not_found"
+    empty = world.history.start_run(MAIN)
+    world.history.finish_run(MAIN, empty.sequence, status="completed", messages_json="")
+    empty_result = tools.read_history(empty.sequence)
+    assert empty_result["messages"] == ""
+    assert empty_result["offset"] == 0
+    assert empty_result["total_length"] == 0
+    assert empty_result["next_offset"] is None
 
 
 @pytest.mark.parametrize("member_id", [MAIN, OTHER])

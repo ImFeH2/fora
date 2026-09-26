@@ -28,7 +28,8 @@ def agent_store(tmp_path: Path) -> SqliteAgentStore:
 def test_history_reads_unicode_slices_without_loading_or_changing_the_run(
     agent_store: SqliteAgentStore,
 ) -> None:
-    payload = '[{"text":"漢\\\\n' + "x" * 3_000_000 + '終"}]'
+    prefix = '[{"text":"'
+    payload = prefix + "x" * (2047 - len(prefix)) + "\\n漢" + "x" * 3_000_000 + '終"}]'
     run = agent_store.start_run(AGENT)
     agent_store.finish_run(
         AGENT, run.sequence, status="completed", messages_json=payload
@@ -46,6 +47,8 @@ def test_history_reads_unicode_slices_without_loading_or_changing_the_run(
         if offset == part.total_length:
             break
     assert "".join(chunks) == payload
+    assert chunks[0].endswith("\\")
+    assert chunks[1].startswith("n漢")
     assert agent_store.runs(AGENT)[0].messages_json == before
     final = history.read(run.sequence, len(payload))
     assert final is not None

@@ -18,12 +18,14 @@ class History:
     def search(self, query: str, *, limit: int = 20) -> tuple[AgentRun, ...]:
         return self._store.search_runs(self._agent_id, query, limit=limit)
 
-    def read(self, sequence: int, offset: int = 0) -> HistorySlice | None:
-        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+    def read(self, sequence: int, offset: int | None = None) -> HistorySlice | None:
+        if offset is not None and (
+            isinstance(offset, bool) or not isinstance(offset, int) or offset < 0
+        ):
             raise DomainError(
                 "invalid_offset", "History offset must be a non-negative integer"
             )
-        if offset > MAX_SQLITE_INTEGER:
+        if offset is not None and offset > MAX_SQLITE_INTEGER:
             raise DomainError(
                 "invalid_offset", "History offset exceeds the supported range"
             )
