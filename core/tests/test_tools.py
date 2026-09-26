@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from pydantic_ai import ModelMessagesTypeAdapter
+from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
+from pydantic_ai.models.function import FunctionModel
 
 from huddol.adapters.execution.manager import ExecutionManager
 from huddol.adapters.files.tree import DirectoryTree
+from huddol.adapters.model.runner import PydanticModelRunner
 from huddol.adapters.sqlite.agent import SqliteAgentStore
 from huddol.adapters.sqlite.store import SqliteStore
 from huddol.core.errors import DomainError
 from huddol.ports.execution import EditResult, RunResult
+from huddol.runtime.reminder import Reminder, ReminderItem, TurnRequest
 from huddol.tools import AgentTools, Dependencies, TurnBinding
 from huddol.tools.authorize import Actor, Authorizer
 
@@ -85,6 +91,118 @@ def test_history_tool_returns_bounded_pages_and_hides_other_members_runs(world) 
     assert empty_result["offset"] == 0
     assert empty_result["total_length"] == 0
     assert empty_result["next_offset"] is None
+
+
+def test_new_window_runner_can_read_and_continue_large_history(world) -> None:
+    payload = '[{"text":"' + "q" * 3_000_000 + '"}]'
+    run = world.history.start_run(MAIN)
+    world.history.finish_run(
+        MAIN, run.sequence, status="completed", messages_json=payload
+    )
+    tools = tools_for(world, MAIN)
+    returned = []
+
+    class Settings:
+        def get_settings(self, section):
+            if section == "model":
+                return {
+                    "api_type": "openai-chat",
+                    "base_url": "https://example.invalid/v1",
+                    "api_key": "unused",
+                    "model": "history-test",
+                }
+            return None
+
+    def respond(messages, info):
+        history_returns = [
+            part
+            for message in messages
+            for part in message.parts
+            if isinstance(part, ToolReturnPart) and part.tool_name == "history"
+        ]
+        if history_returns:
+            result = history_returns[-1].content
+            returned.append(result)
+            assert len(result["messages"]) <= 2048
+            assert len(json.dumps(result, ensure_ascii=False).encode()) < 32 * 1024
+        calls = len(returned)
+        if calls == 0:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "history",
+                        {"action": "read", "sequence": run.sequence},
+                        tool_call_id="tail",
+                    )
+                ]
+            )
+        if calls == 1:
+            assert returned[0]["offset"] == len(payload) - 2048
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "history",
+                        {"action": "read", "sequence": run.sequence, "offset": 0},
+                        tool_call_id="first",
+                    )
+                ]
+            )
+        if calls == 2:
+            assert returned[1]["offset"] == 0
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "history",
+                        {"action": "read", "sequence": run.sequence, "offset": 2048},
+                        tool_call_id="next",
+                    )
+                ]
+            )
+        assert returned[2]["offset"] == 2048
+        return ModelResponse(parts=[TextPart("continued")])
+
+    reminder = Reminder(MAIN, "Main", (ReminderItem(1, "test", 1, 1, "You", False),))
+    persisted = []
+    request = TurnRequest(
+        agent_id=MAIN,
+        sequence=run.sequence + 1,
+        agent_name="Main",
+        prompt=reminder.render(),
+        reminder=reminder,
+        history_json="[]",
+        resident="",
+        environment=lambda: "environment",
+        ephemeral=lambda: "",
+        persist=persisted.append,
+    )
+    runner = PydanticModelRunner(
+        Settings(), build_model=lambda config: FunctionModel(respond)
+    )
+    outcome = runner.run(request, tools)
+    assert outcome.error is None
+    assert len(returned) == 3
+    assert len(persisted) >= 1
+    assert (
+        ModelMessagesTypeAdapter.validate_json(outcome.messages_json)[-1]
+        .parts[0]
+        .content
+        == "continued"
+    )
+    continued = runner.run(
+        replace(
+            request,
+            sequence=request.sequence + 1,
+            history_json=outcome.messages_json,
+        ),
+        tools,
+    )
+    assert continued.error is None
+    assert (
+        ModelMessagesTypeAdapter.validate_json(continued.messages_json)[-1]
+        .parts[0]
+        .content
+        == "continued"
+    )
 
 
 @pytest.mark.parametrize("member_id", [MAIN, OTHER])
