@@ -182,6 +182,8 @@ def test_new_window_runner_can_read_and_continue_large_history(world) -> None:
     assert outcome.error is None
     assert len(returned) == 3
     assert len(persisted) >= 1
+    assert len(outcome.messages_json.encode()) < 32 * 1024
+    assert payload not in outcome.messages_json
     assert (
         ModelMessagesTypeAdapter.validate_json(outcome.messages_json)[-1]
         .parts[0]
