@@ -21,6 +21,8 @@ let dom: {
     CustomEvent: typeof CustomEvent;
     MouseEvent: typeof MouseEvent;
     KeyboardEvent: typeof KeyboardEvent;
+    AbortController: typeof AbortController;
+    AbortSignal: typeof AbortSignal;
   };
 };
 let act: typeof import("@testing-library/react").act;
@@ -53,6 +55,8 @@ beforeAll(async () => {
   vi.stubGlobal("CustomEvent", dom.window.CustomEvent);
   vi.stubGlobal("MouseEvent", dom.window.MouseEvent);
   vi.stubGlobal("KeyboardEvent", dom.window.KeyboardEvent);
+  vi.stubGlobal("AbortController", dom.window.AbortController);
+  vi.stubGlobal("AbortSignal", dom.window.AbortSignal);
   vi.stubGlobal("getComputedStyle", dom.window.getComputedStyle);
   dom.window.requestAnimationFrame = vi.fn();
   dom.window.cancelAnimationFrame = vi.fn();
