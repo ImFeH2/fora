@@ -241,16 +241,11 @@ def main(argv: list[str] | None = None) -> int:
         store = SqliteStore(directory / "huddol.sqlite3")
         resources.callback(store.close)
         agent_store = SqliteAgentStore(store._db)
-        agent_store.mark_interrupted()
-        agent_store.mark_session_start()
 
         uploads = Uploads(store, DirectoryUploads(directory / "uploads"))
         uploads.cleanup(restart=True)
         if store.get_member(HUMAN_ID) is None:
             store.create_member("human", "You")
-        for member in store.list_members():
-            if member.is_agent and member.state == "running":
-                store.set_agent_state(member.id, "idle")
 
         def agent_directory_for(member_id: int) -> Path:
             path = directory / "agents" / str(member_id)

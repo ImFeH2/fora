@@ -1339,6 +1339,66 @@ def test_interrupted_turns_are_marked_on_the_next_start(tmp_path: Path) -> None:
     assert status == "interrupted"
 
 
+def test_startup_recovers_running_history_and_lifecycle_state(
+    tmp_path: Path,
+) -> None:
+    from huddol.adapters.sqlite.agent import SqliteAgentStore
+    from huddol.adapters.sqlite.store import SqliteStore
+    from huddol.ports.agent import AgentLifecycle
+
+    data = tmp_path / "data"
+    store = SqliteStore(data / "huddol.sqlite3")
+    try:
+        history = SqliteAgentStore(store._db)
+        store.create_member("human", "You")
+        store.create_member("agent", "PausedRun")
+        store.create_member("agent", "InvalidHistory")
+
+        paused_run = history.start_run(2)
+        partial = (
+            '[{"kind":"response","parts":[{"part_kind":"text","content":"partial"}]}]'
+        )
+        history.save_progress(2, paused_run.sequence, partial)
+        history.set_lifecycle(2, AgentLifecycle(pause_requested=True))
+        store.set_agent_state(2, "running")
+
+        invalid_run = history.start_run(3)
+        history.save_progress(3, invalid_run.sequence, "{")
+        store.set_agent_state(3, "running")
+    finally:
+        store.close()
+
+    with Kernel(data) as kernel:
+        with kernel.connect() as connection:
+            assert Client(connection).call({"id": 1, "method": "ping"})["result"] == {
+                "pong": None
+            }
+        assert kernel.shutdown() == 0, kernel.stderr
+
+    with closing(sqlite3.connect(data / "huddol.sqlite3")) as connection:
+        assert connection.execute(
+            "SELECT status, messages_json FROM agent_runs WHERE agent_id = 2"
+        ).fetchone() == ("interrupted", partial)
+        assert connection.execute(
+            "SELECT status, messages_json FROM agent_runs WHERE agent_id = 3"
+        ).fetchone() == ("running", "{")
+        assert connection.execute(
+            "SELECT state FROM members WHERE id = 2"
+        ).fetchone() == ("paused",)
+        assert connection.execute(
+            "SELECT state FROM members WHERE id = 3"
+        ).fetchone() == ("idle",)
+        assert connection.execute(
+            "SELECT pause_requested FROM agent_lifecycle WHERE agent_id = 2"
+        ).fetchone() == (1,)
+        assert connection.execute(
+            "SELECT pause_reason FROM agent_safety WHERE agent_id = 3"
+        ).fetchone() == ("history_invalid",)
+        assert connection.execute(
+            "SELECT agent_id, start_after FROM agent_sessions ORDER BY agent_id"
+        ).fetchall() == [(2, 1), (3, 1)]
+
+
 def wait_for_persisted_turn(data: Path, agent_id: int, sequence: int) -> None:
     deadline = time.monotonic() + TIMEOUT
     with closing(sqlite3.connect(data / "huddol.sqlite3")) as connection:
