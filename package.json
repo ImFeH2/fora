@@ -4,7 +4,7 @@
   "description": "Run your own organization of agents.",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@12.3.4",
+  "packageManager": "pnpm@12.6.0",
   "scripts": {
     "dev:app": "pnpm --dir app exec tauri dev",
     "dev:web": "pnpm build:webui && uv run --project core python -m huddol --webui-dir webui/dist",
