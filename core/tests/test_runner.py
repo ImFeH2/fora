@@ -1483,6 +1483,8 @@ def test_view_image_returns_native_binary_content_and_preserves_history(settings
                 tool for tool in info.function_tools if tool.name == "view_image"
             )
             assert view.parameters_json_schema["required"] == ["path"]
+            assert "sent to the current model" in view.description
+            assert "current Turn's model history" in view.description
             return ModelResponse(
                 parts=[ToolCallPart("view_image", {"path": path}, "image-call")]
             )
