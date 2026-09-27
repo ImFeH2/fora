@@ -100,6 +100,7 @@ def test_read_file_rejects_fifo_without_waiting(tmp_path: Path) -> None:
         environment.close()
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux execution")
 def test_read_file_rejects_fifo_after_stat_with_a_controlled_replacement(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
