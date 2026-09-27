@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -152,8 +153,14 @@ class ExecutionManager:
             self._error = None
         return self.status()
 
-    def close(self) -> None:
-        with self._lock:
-            self._closed = True
-            if self._environment is not None:
-                self._environment.close()
+    def close(self, *, deadline: float | None = None) -> None:
+        deadline = time.monotonic() + 5 if deadline is None else deadline
+        self._closed = True
+        if not self._lock.acquire(timeout=max(0, deadline - time.monotonic())):
+            raise TimeoutError("Execution manager is busy")
+        try:
+            environment = self._environment
+        finally:
+            self._lock.release()
+        if environment is not None:
+            environment.close(deadline=deadline)

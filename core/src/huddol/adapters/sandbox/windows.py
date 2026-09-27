@@ -319,182 +319,216 @@ class WindowsWriteAccess:
     def __init__(self, roots: Sequence[Path]) -> None:
         values = [secrets.randbits(30) + 1 for _ in range(4)]
         self.sid = "S-1-5-21-" + "-".join(str(value) for value in values)
-        self.logon_sid = _current_logon_sid()
-        self._sid = _sid_pointer(self.sid)
-        self._logon_sid = _sid_pointer(self.logon_sid)
-        self._window_station = _user32.GetProcessWindowStation()
-        self._desktop = _user32.GetThreadDesktop(_kernel.GetCurrentThreadId())
-        self._roots: tuple[Path, ...] = ()
+        self._requested_roots = tuple(roots)
+        self._sid = ctypes.c_void_p()
+        self._logon_sid = ctypes.c_void_p()
+        self._window_station: int | None = None
+        self._desktop: int | None = None
+        self._grants: list[tuple[Path, ctypes.c_void_p]] = []
         self._lock = Lock()
-        granted: list[tuple[wintypes.HANDLE, int]] = []
-        try:
-            for handle, permissions in (
-                (self._window_station, WINDOW_STATION_ACCESS),
-                (self._desktop, DESKTOP_ACCESS),
-            ):
-                _require(handle)
-                _change_user_object_ace(handle, self._sid, SET_ACCESS, permissions)
-                granted.append((handle, permissions))
-            self.configure(roots)
-        except OSError:
-            for handle, permissions in reversed(granted):
-                try:
-                    _change_user_object_ace(
-                        handle,
-                        self._sid,
-                        REVOKE_ACCESS,
-                        permissions,
-                    )
-                except OSError:
-                    pass
-            _kernel.LocalFree(self._logon_sid)
-            _kernel.LocalFree(self._sid)
-            raise
+        self._ready = False
+        self._closed = False
 
-    def configure(self, roots: Sequence[Path]) -> None:
-        updated = tuple(roots)
+    def initialize(self) -> None:
         with self._lock:
-            added = tuple(path for path in updated if path not in self._roots)
-            removed = tuple(path for path in self._roots if path not in updated)
-            granted: list[tuple[Path, ctypes.c_void_p]] = []
-            revoked: list[tuple[Path, ctypes.c_void_p]] = []
-            try:
-                for path in added:
-                    if path.is_dir():
-                        for sid in (self._sid, self._logon_sid):
+            if self._closed:
+                raise RuntimeError("Windows write access is closed")
+            if self._ready:
+                return
+            if not self._sid:
+                self._sid = _sid_pointer(self.sid)
+            if not self._logon_sid:
+                self._logon_sid = _sid_pointer(_current_logon_sid())
+            for attribute, permissions, handle in (
+                (
+                    "_window_station",
+                    WINDOW_STATION_ACCESS,
+                    _user32.GetProcessWindowStation(),
+                ),
+                (
+                    "_desktop",
+                    DESKTOP_ACCESS,
+                    _user32.GetThreadDesktop(_kernel.GetCurrentThreadId()),
+                ),
+            ):
+                if getattr(self, attribute) is None:
+                    _require(handle)
+                    _change_user_object_ace(handle, self._sid, SET_ACCESS, permissions)
+                    setattr(self, attribute, handle)
+            for path in self._requested_roots:
+                if path.is_dir():
+                    for sid in (self._sid, self._logon_sid):
+                        if (path, sid) not in self._grants:
                             _change_ace(path, sid, SET_ACCESS)
-                            granted.append((path, sid))
-                for path in removed:
-                    if path.exists():
-                        for sid in (self._sid, self._logon_sid):
-                            _change_ace(path, sid, REVOKE_ACCESS)
-                            revoked.append((path, sid))
-            except OSError:
-                for path, sid in reversed(revoked):
-                    try:
-                        _change_ace(path, sid, SET_ACCESS)
-                    except OSError:
-                        pass
-                for path, sid in reversed(granted):
-                    try:
-                        _change_ace(path, sid, REVOKE_ACCESS)
-                    except OSError:
-                        pass
-                raise
-            self._roots = updated
+                            self._grants.append((path, sid))
+            self._ready = True
 
     def close(self) -> None:
         with self._lock:
-            roots = self._roots
-            self._roots = ()
-            sid = self._sid
-            logon_sid = self._logon_sid
-            self._sid = ctypes.c_void_p()
-            self._logon_sid = ctypes.c_void_p()
-        for path in roots:
-            if path.exists():
-                for value in (sid, logon_sid):
+            self._closed = True
+            errors: list[OSError] = []
+            remaining: list[tuple[Path, ctypes.c_void_p]] = []
+            for path, sid in self._grants:
+                if path.exists():
                     try:
-                        _change_ace(path, value, REVOKE_ACCESS)
-                    except OSError:
-                        pass
-        for handle, permissions in (
-            (self._desktop, DESKTOP_ACCESS),
-            (self._window_station, WINDOW_STATION_ACCESS),
-        ):
-            try:
-                _change_user_object_ace(
-                    handle,
-                    sid,
-                    REVOKE_ACCESS,
-                    permissions,
-                )
-            except OSError:
-                pass
-        if logon_sid:
-            _kernel.LocalFree(logon_sid)
-        if sid:
-            _kernel.LocalFree(sid)
+                        _change_ace(path, sid, REVOKE_ACCESS)
+                    except OSError as error:
+                        remaining.append((path, sid))
+                        errors.append(error)
+            self._grants = remaining
+            for attribute, permissions in (
+                ("_desktop", DESKTOP_ACCESS),
+                ("_window_station", WINDOW_STATION_ACCESS),
+            ):
+                handle = getattr(self, attribute)
+                if handle:
+                    try:
+                        _change_user_object_ace(
+                            handle, self._sid, REVOKE_ACCESS, permissions
+                        )
+                        setattr(self, attribute, None)
+                    except OSError as error:
+                        errors.append(error)
+            if errors:
+                raise ExceptionGroup("Windows write access cleanup failed", errors)
+            if self._logon_sid:
+                if _kernel.LocalFree(self._logon_sid):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                self._logon_sid = ctypes.c_void_p()
+            if self._sid:
+                if _kernel.LocalFree(self._sid):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                self._sid = ctypes.c_void_p()
 
 
-def run_restricted_command(sid_text: str, argv: list[str], cwd: str) -> int:
+class StartupInfoEx(ctypes.Structure):
+    _fields_ = [("StartupInfo", StartupInfo), ("lpAttributeList", ctypes.c_void_p)]
+
+
+_kernel.InitializeProcThreadAttributeList.argtypes = [
+    ctypes.c_void_p,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    ctypes.POINTER(ctypes.c_size_t),
+]
+_kernel.InitializeProcThreadAttributeList.restype = wintypes.BOOL
+_kernel.UpdateProcThreadAttribute.argtypes = [
+    ctypes.c_void_p,
+    wintypes.DWORD,
+    ctypes.c_size_t,
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+]
+_kernel.UpdateProcThreadAttribute.restype = wintypes.BOOL
+_kernel.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
+_kernel.DeleteProcThreadAttributeList.restype = None
+_kernel.CreateProcessW.argtypes = _advapi.CreateProcessAsUserW.argtypes[1:]
+_kernel.CreateProcessW.restype = wintypes.BOOL
+
+
+def _create_command(
+    token: wintypes.HANDLE, argv: list[str], cwd: str, process: ProcessInformation
+) -> None:
+    startup = StartupInfoEx()
+    startup.StartupInfo.cb = ctypes.sizeof(startup)
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES
+    startup.StartupInfo.lpDesktop = "Winsta0\\Default"
+    startup.StartupInfo.hStdInput = _kernel.GetStdHandle(-10 & 0xFFFFFFFF)
+    startup.StartupInfo.hStdOutput = _kernel.GetStdHandle(-11 & 0xFFFFFFFF)
+    startup.StartupInfo.hStdError = _kernel.GetStdHandle(-12 & 0xFFFFFFFF)
+    handles = tuple(
+        dict.fromkeys(
+            (
+                startup.StartupInfo.hStdInput,
+                startup.StartupInfo.hStdOutput,
+                startup.StartupInfo.hStdError,
+            )
+        )
+    )
+    for handle in handles:
+        _require(handle)
+        _require(
+            _kernel.SetHandleInformation(
+                handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT
+            )
+        )
+    inherited = (wintypes.HANDLE * len(handles))(*handles)
+    size = ctypes.c_size_t()
+    result = _kernel.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
+    if result or ctypes.get_last_error() != 122:
+        raise ctypes.WinError(ctypes.get_last_error())
+    attributes = ctypes.create_string_buffer(size.value)
+    _require(
+        _kernel.InitializeProcThreadAttributeList(attributes, 1, 0, ctypes.byref(size))
+    )
+    try:
+        startup.lpAttributeList = ctypes.cast(attributes, ctypes.c_void_p)
+        _require(
+            _kernel.UpdateProcThreadAttribute(
+                attributes, 0, 0x20002, inherited, ctypes.sizeof(inherited), None, None
+            )
+        )
+        command = ctypes.create_unicode_buffer(subprocess.list2cmdline(argv))
+        arguments = (
+            None,
+            command,
+            None,
+            None,
+            True,
+            CREATE_UNICODE_ENVIRONMENT | 0x80000,
+            None,
+            cwd,
+            ctypes.byref(startup.StartupInfo),
+            ctypes.byref(process),
+        )
+        if token:
+            _require(_advapi.CreateProcessAsUserW(token, *arguments))
+        else:
+            _require(_kernel.CreateProcessW(*arguments))
+    finally:
+        _kernel.DeleteProcThreadAttributeList(attributes)
+
+
+def run_restricted_command(sid_text: str | None, argv: list[str], cwd: str) -> int:
     if not argv:
         raise ValueError("Sandbox command is required")
-    sid = _sid_pointer(sid_text)
-    everyone_sid = _sid_pointer("S-1-1-0")
+    sid = ctypes.c_void_p()
+    everyone_sid = ctypes.c_void_p()
     base_token = wintypes.HANDLE()
     restricted_token = wintypes.HANDLE()
     process = ProcessInformation()
     try:
-        _require(
-            _advapi.OpenProcessToken(
-                _kernel.GetCurrentProcess(),
-                TOKEN_ACCESS,
-                ctypes.byref(base_token),
-            )
-        )
-        restricting = (SidAndAttributes * 2)(
-            SidAndAttributes(sid, 0),
-            SidAndAttributes(everyone_sid, 0),
-        )
-        _require(
-            _advapi.CreateRestrictedToken(
-                base_token,
-                TOKEN_FLAGS,
-                0,
-                None,
-                0,
-                None,
-                2,
-                restricting,
-                ctypes.byref(restricted_token),
-            )
-        )
-        startup = StartupInfo()
-        startup.cb = ctypes.sizeof(startup)
-        startup.dwFlags = STARTF_USESTDHANDLES
-        startup.lpDesktop = "Winsta0\\Default"
-        startup.hStdInput = _kernel.GetStdHandle(-10 & 0xFFFFFFFF)
-        startup.hStdOutput = _kernel.GetStdHandle(-11 & 0xFFFFFFFF)
-        startup.hStdError = _kernel.GetStdHandle(-12 & 0xFFFFFFFF)
-        for handle in (
-            startup.hStdInput,
-            startup.hStdOutput,
-            startup.hStdError,
-        ):
-            if handle:
-                _require(
-                    _kernel.SetHandleInformation(
-                        handle,
-                        HANDLE_FLAG_INHERIT,
-                        HANDLE_FLAG_INHERIT,
-                    )
+        if sid_text is not None:
+            sid = _sid_pointer(sid_text)
+            everyone_sid = _sid_pointer("S-1-1-0")
+            _require(
+                _advapi.OpenProcessToken(
+                    _kernel.GetCurrentProcess(), TOKEN_ACCESS, ctypes.byref(base_token)
                 )
-        command = ctypes.create_unicode_buffer(subprocess.list2cmdline(argv))
-        _require(
-            _advapi.CreateProcessAsUserW(
-                restricted_token,
-                None,
-                command,
-                None,
-                None,
-                True,
-                CREATE_UNICODE_ENVIRONMENT,
-                None,
-                cwd,
-                ctypes.byref(startup),
-                ctypes.byref(process),
             )
-        )
+            restricting = (SidAndAttributes * 2)(
+                SidAndAttributes(sid, 0), SidAndAttributes(everyone_sid, 0)
+            )
+            _require(
+                _advapi.CreateRestrictedToken(
+                    base_token,
+                    TOKEN_FLAGS,
+                    0,
+                    None,
+                    0,
+                    None,
+                    2,
+                    restricting,
+                    ctypes.byref(restricted_token),
+                )
+            )
+        _create_command(restricted_token, argv, cwd, process)
         if _kernel.WaitForSingleObject(process.hProcess, INFINITE) != 0:
             raise ctypes.WinError(ctypes.get_last_error())
         exit_code = wintypes.DWORD()
-        _require(
-            _kernel.GetExitCodeProcess(
-                process.hProcess,
-                ctypes.byref(exit_code),
-            )
-        )
+        _require(_kernel.GetExitCodeProcess(process.hProcess, ctypes.byref(exit_code)))
         return exit_code.value
     finally:
         for handle in (
@@ -504,7 +538,7 @@ def run_restricted_command(sid_text: str, argv: list[str], cwd: str) -> int:
             base_token,
         ):
             if handle:
-                _kernel.CloseHandle(handle)
+                _require(_kernel.CloseHandle(handle))
         if everyone_sid:
             _kernel.LocalFree(everyone_sid)
         if sid:

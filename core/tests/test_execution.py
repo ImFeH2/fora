@@ -339,3 +339,60 @@ def test_bound_execution_resolves_path_syntax(tmp_path, value) -> None:
         assert bound.resolve_path(value, base=str(tmp_path)) == expected
     finally:
         manager.close()
+
+
+def test_normal_completion_release_failure_can_retry(tmp_path, monkeypatch):
+    from concurrent.futures import Future
+    from unittest.mock import Mock
+
+    from huddol.adapters.execution.platforms import (
+        ExecutionCleanupError,
+        ExecutionRecord,
+    )
+
+    environment = LocalExecution(enforce=False)
+    backend = WindowsBackend(False)
+    environment._backend = backend
+    monkeypatch.setattr(backend, "_close_process", Mock())
+    record = ExecutionRecord(())
+    process = Mock(stdin=None, stdout=None, stderr=None, returncode=0)
+    job = Mock()
+    job.active_processes.return_value = 0
+    job.close.side_effect = [OSError("release denied"), None]
+    reader = Future()
+    reader.set_result((b"output", b""))
+    record.created.set()
+    record.process = process
+    record.job = job
+    record.reader = reader
+    backend._records.add(record)
+    backend._jobs[process] = record
+    backend._results[process] = record
+    monkeypatch.setattr(backend, "spawn", Mock(return_value=process))
+    try:
+        with pytest.raises(ExecutionCleanupError) as failure:
+            environment.run(["command"], cwd=str(tmp_path))
+        assert failure.value.execution_stopped
+        assert record.run_completed and record.execution_stopped
+        assert not record.released
+        assert str(record.release_error) == "release denied"
+        environment.close()
+        assert record.released and record.release_error is None
+        assert record.attempt.error is None
+        assert job.close.call_count == 2
+        job.request_termination.assert_not_called()
+        assert not backend._records and not backend._results
+    finally:
+        environment.close()
+
+
+def test_cleanup_error_subgroups_preserve_completion_evidence():
+    from huddol.adapters.execution.platforms import ExecutionCleanupError
+
+    error = ExecutionCleanupError(
+        "cleanup", [OSError("denied"), ValueError("bad")], True
+    )
+    selected, remaining = error.split(OSError)
+    assert isinstance(selected, ExecutionCleanupError)
+    assert isinstance(remaining, ExecutionCleanupError)
+    assert selected.execution_stopped and remaining.execution_stopped

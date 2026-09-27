@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import threading
+import time
 from collections.abc import Sequence
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -49,13 +50,25 @@ class LocalExecution:
             return value
         return str(Path(base) / value)
 
-    def close(self) -> None:
+    def close(self, *, deadline: float | None = None) -> None:
+        deadline = time.monotonic() + 5 if deadline is None else deadline
+        self._closed = True
+        if self._backend.manages_cleanup:
+            self._backend.close(deadline=deadline)
+            return
         with self._lock:
-            self._closed = True
+            errors: list[Exception] = []
             for process in self._processes:
-                if process.poll() is None:
+                try:
                     self._backend.terminate(process)
-            self._backend.close()
+                except (OSError, subprocess.TimeoutExpired, ExceptionGroup) as error:
+                    errors.append(error)
+            try:
+                self._backend.close(deadline=deadline)
+            except (OSError, subprocess.TimeoutExpired, ExceptionGroup) as error:
+                errors.append(error)
+            if errors:
+                raise ExceptionGroup("Execution cleanup failed", errors)
 
     def describe_environment(self, labeled: Sequence[tuple[str, str]] = ()) -> str:
         entries = [f"- {path} ({label})" for path, label in labeled]
@@ -101,25 +114,52 @@ class LocalExecution:
                     else normalize_directories(write_directories)
                 )
                 process = self._backend.spawn(
-                    argv, directory, roots, piped_input=data is not None
+                    argv,
+                    directory,
+                    roots,
+                    piped_input=data is not None,
+                    input_data=data,
                 )
                 self._processes.add(process)
         except FileNotFoundError as error:
             raise DomainError("command_not_found", str(error)) from error
+        failure: BaseException | None = None
         try:
-            stdout, stderr = process.communicate(
-                input=data, timeout=timeout or DEFAULT_TIMEOUT
+            stdout, stderr = self._backend.communicate(
+                process, data, timeout or DEFAULT_TIMEOUT
             )
             return process.returncode, stdout, stderr
-        except subprocess.TimeoutExpired as error:
-            self._backend.terminate(process)
-            process.communicate()
-            raise DomainError(
-                "timeout", f"Command exceeded {timeout or DEFAULT_TIMEOUT} seconds"
-            ) from error
+        except BaseException as error:
+            failure = error
+            try:
+                self._backend.cleanup(process, deadline=time.monotonic() + 5)
+            except (
+                OSError,
+                RuntimeError,
+                subprocess.TimeoutExpired,
+                ExceptionGroup,
+            ) as cleanup_error:
+                failure = BaseExceptionGroup(
+                    "Command failed and cleanup failed", [error, cleanup_error]
+                )
+                raise failure from None
+            if isinstance(error, subprocess.TimeoutExpired):
+                raise DomainError(
+                    "timeout", f"Command exceeded {timeout or DEFAULT_TIMEOUT} seconds"
+                ) from error
+            raise
         finally:
             with self._lock:
                 self._processes.discard(process)
+            try:
+                self._backend.finish(process)
+            except Exception as finish_error:
+                if failure is not None:
+                    raise BaseExceptionGroup(
+                        "Command failed and finalization failed",
+                        [failure, finish_error],
+                    ) from None
+                raise
 
     def run(
         self,
