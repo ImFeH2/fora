@@ -256,6 +256,7 @@ def test_control_owner_cancellation(mode: str, monkeypatch) -> None:
     from huddol.adapters.websocket import server as module
 
     started = threading.Event()
+    sending = threading.Event()
     release = threading.Event()
     finished = threading.Event()
     propagated = threading.Event()
@@ -265,6 +266,7 @@ def test_control_owner_cancellation(mode: str, monkeypatch) -> None:
     state = {}
     original_control = WebServer._control
     original_frame = module.OutgoingFrame
+    original_send_str = module.web.WebSocketResponse.send_str
 
     def outbox():
         value = ControlOutbox()
@@ -287,8 +289,19 @@ def test_control_owner_cancellation(mode: str, monkeypatch) -> None:
             propagated.set()
             raise
 
+    async def send_str(connection, text):
+        if (
+            sys.platform == "win32"
+            and mode == "sending"
+            and len(text) > 32 * 1024 * 1024
+        ):
+            sending.set()
+            await asyncio.Event().wait()
+        return await original_send_str(connection, text)
+
     monkeypatch.setattr(module, "ControlOutbox", outbox)
     monkeypatch.setattr(module, "OutgoingFrame", frame)
+    monkeypatch.setattr(module.web.WebSocketResponse, "send_str", send_str)
     monkeypatch.setattr(WebServer, "_control", control)
     dispatcher = Dispatcher()
 
@@ -325,7 +338,7 @@ def test_control_owner_cancellation(mode: str, monkeypatch) -> None:
                 assert await asyncio.to_thread(started.wait, 5)
                 if mode == "sending":
                     if sys.platform == "win32":
-                        await asyncio.sleep(0.1)
+                        assert await asyncio.to_thread(sending.wait, 5)
                     else:
                         async with asyncio.timeout(5):
                             while not state["transport"].get_write_buffer_size():
