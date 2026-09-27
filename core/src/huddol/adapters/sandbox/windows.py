@@ -8,6 +8,14 @@ from ctypes import wintypes
 from pathlib import Path
 from threading import Lock
 
+from huddol.adapters.windows import (
+    _advapi,
+    _kernel,
+    _raise_if_error,
+    _require,
+    _sid_pointer,
+)
+
 TOKEN_ACCESS = 0x0001 | 0x0002 | 0x0008 | 0x0080 | 0x0100
 TOKEN_FLAGS = 0x1 | 0x4 | 0x8
 DACL_SECURITY_INFORMATION = 0x4
@@ -84,10 +92,7 @@ class ProcessInformation(ctypes.Structure):
     ]
 
 
-_advapi = ctypes.WinDLL("advapi32", use_last_error=True)
-_kernel = ctypes.WinDLL("kernel32", use_last_error=True)
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
-_kernel.GetCurrentProcess.restype = wintypes.HANDLE
 _kernel.GetCurrentThreadId.restype = wintypes.DWORD
 _kernel.GetStdHandle.argtypes = [wintypes.DWORD]
 _kernel.GetStdHandle.restype = wintypes.HANDLE
@@ -101,15 +106,6 @@ _kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 _kernel.WaitForSingleObject.restype = wintypes.DWORD
 _kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
 _kernel.GetExitCodeProcess.restype = wintypes.BOOL
-_kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-_kernel.CloseHandle.restype = wintypes.BOOL
-_kernel.LocalFree.argtypes = [ctypes.c_void_p]
-_kernel.LocalFree.restype = ctypes.c_void_p
-_advapi.ConvertStringSidToSidW.argtypes = [
-    wintypes.LPCWSTR,
-    ctypes.POINTER(ctypes.c_void_p),
-]
-_advapi.ConvertStringSidToSidW.restype = wintypes.BOOL
 _advapi.GetNamedSecurityInfoW.argtypes = [
     wintypes.LPWSTR,
     ctypes.c_int,
@@ -159,12 +155,6 @@ _advapi.SetSecurityInfo.argtypes = [
     ctypes.c_void_p,
 ]
 _advapi.SetSecurityInfo.restype = wintypes.DWORD
-_advapi.OpenProcessToken.argtypes = [
-    wintypes.HANDLE,
-    wintypes.DWORD,
-    ctypes.POINTER(wintypes.HANDLE),
-]
-_advapi.OpenProcessToken.restype = wintypes.BOOL
 _advapi.CreateRestrictedToken.argtypes = [
     wintypes.HANDLE,
     wintypes.DWORD,
@@ -194,22 +184,6 @@ _advapi.CreateProcessAsUserW.restype = wintypes.BOOL
 _user32.GetProcessWindowStation.restype = wintypes.HANDLE
 _user32.GetThreadDesktop.argtypes = [wintypes.DWORD]
 _user32.GetThreadDesktop.restype = wintypes.HANDLE
-
-
-def _raise_if_error(code: int) -> None:
-    if code:
-        raise ctypes.WinError(code)
-
-
-def _require(value: int) -> None:
-    if not value:
-        raise ctypes.WinError(ctypes.get_last_error())
-
-
-def _sid_pointer(value: str) -> ctypes.c_void_p:
-    sid = ctypes.c_void_p()
-    _require(_advapi.ConvertStringSidToSidW(value, ctypes.byref(sid)))
-    return sid
 
 
 def _updated_acl(
