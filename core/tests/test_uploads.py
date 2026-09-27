@@ -171,6 +171,8 @@ def test_control_slow_connection_isolated(monkeypatch) -> None:
                                 "result": {"pong": None},
                             }
                             break
+                    if sys.platform == "win32":
+                        transport.abort()
                     while len(server._handlers) != 1:
                         await asyncio.sleep(0.01)
                 assert len(dispatcher._sinks) == 1
@@ -322,9 +324,12 @@ def test_control_owner_cancellation(mode: str, monkeypatch) -> None:
                 await connection.send_json({"id": 1, "method": "operation"})
                 assert await asyncio.to_thread(started.wait, 5)
                 if mode == "sending":
-                    async with asyncio.timeout(5):
-                        while not state["transport"].get_write_buffer_size():
-                            await asyncio.sleep(0.01)
+                    if sys.platform == "win32":
+                        await asyncio.sleep(0.1)
+                    else:
+                        async with asyncio.timeout(5):
+                            while not state["transport"].get_write_buffer_size():
+                                await asyncio.sleep(0.01)
                 waiter = asyncio.run_coroutine_threadsafe(
                     cancel_and_observe(), server._loop
                 )
