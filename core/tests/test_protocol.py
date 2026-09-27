@@ -19,7 +19,7 @@ from websockets.sync.client import connect
 
 from huddol.adapters.execution.manager import ExecutionManager
 from huddol.adapters.files.tree import DirectoryTree
-from huddol.adapters.files.uploads import DirectoryUploads
+from huddol.adapters.files.uploads import DirectoryUploads, decode_image
 from huddol.adapters.jsonl.api import HUMAN_ID, Api
 from huddol.adapters.jsonl.protocol import Dispatcher, parse, wait_for_shutdown
 from huddol.adapters.model.runner import PydanticModelRunner
@@ -80,6 +80,7 @@ def server(tmp_path: Path):
         history=agent_store,
         settings=agent_store,
         agent_directory_for=agent_directory_for,
+        decode_image=decode_image,
         execution=ExecutionManager(
             settings={"directories": {"native": [str(tmp_path)]}},
             enforce=False,

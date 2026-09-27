@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -50,6 +53,170 @@ def test_timeout_does_not_leave_a_linux_descendant_writing_later(
         assert error.value.code == "timeout"
         time.sleep(1.3)
         assert not marker.exists()
+    finally:
+        environment.close()
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+def test_read_file_returns_binary_data_and_enforces_initial_size_limit(
+    tmp_path: Path, enforce: bool
+) -> None:
+    target = tmp_path / "image.bin"
+    data = b"\x00\xffimage-bytes"
+    target.write_bytes(data)
+    environment = LocalExecution(enforce=enforce)
+    try:
+        assert environment.read_file(str(target), len(data)) == data
+        with pytest.raises(DomainError) as failure:
+            environment.read_file(str(target), len(data) - 1)
+        assert failure.value.code == "file_too_large"
+    finally:
+        environment.close()
+
+
+def test_read_file_reports_missing_and_non_regular_paths(tmp_path: Path) -> None:
+    environment = LocalExecution(enforce=False)
+    try:
+        with pytest.raises(DomainError) as missing:
+            environment.read_file(str(tmp_path / "missing"), 1024)
+        assert missing.value.code == "not_found"
+        with pytest.raises(DomainError) as directory:
+            environment.read_file(str(tmp_path), 1024)
+        assert directory.value.code == "not_regular_file"
+    finally:
+        environment.close()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux execution")
+def test_read_file_rejects_fifo_without_waiting(tmp_path: Path) -> None:
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    environment = LocalExecution(enforce=False)
+    try:
+        with pytest.raises(DomainError) as failure:
+            environment.read_file(str(fifo), 1024, timeout=1)
+        assert failure.value.code == "not_regular_file"
+    finally:
+        environment.close()
+
+
+def test_read_file_rejects_fifo_after_stat_with_a_controlled_replacement(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    from huddol.adapters.execution import reading
+
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"source")
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    target = tmp_path / "target"
+    target.symlink_to(source)
+    observed = threading.Event()
+    replaced = threading.Event()
+    original_stat = reading.os.stat
+
+    def replace_target() -> None:
+        observed.wait(5)
+        target.unlink()
+        target.symlink_to(fifo)
+        replaced.set()
+
+    def stat(path, *args, **kwargs):
+        result = original_stat(path, *args, **kwargs)
+        if path == str(target):
+            observed.set()
+            assert replaced.wait(5)
+        return result
+
+    thread = threading.Thread(target=replace_target)
+    monkeypatch.setattr(reading.os, "stat", stat)
+    thread.start()
+    try:
+        assert reading.read_file(str(target), 1024) == 3
+    finally:
+        thread.join(timeout=5)
+    assert replaced.is_set()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "code": "not_regular_file",
+        "message": "The path is not a regular file",
+    }
+
+
+def test_read_file_returns_at_most_max_plus_one_when_content_grows(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    from huddol.adapters.execution import reading
+
+    target = tmp_path / "growing.bin"
+    target.write_bytes(b"a")
+    observed = threading.Event()
+    grown = threading.Event()
+    original_fstat = reading.os.fstat
+
+    def grow_target() -> None:
+        observed.wait(5)
+        with target.open("ab") as output:
+            output.write(b"bcdefgh")
+        grown.set()
+
+    def fstat(descriptor):
+        result = original_fstat(descriptor)
+        observed.set()
+        assert grown.wait(5)
+        return result
+
+    thread = threading.Thread(target=grow_target)
+    monkeypatch.setattr(reading.os, "fstat", fstat)
+    thread.start()
+    try:
+        assert reading.read_file(str(target), 4) == 0
+    finally:
+        thread.join(timeout=5)
+    assert grown.is_set()
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.encode() == b"abcde"
+
+
+def test_read_file_validates_parent_protocol(tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "image.bin"
+    target.write_bytes(b"data")
+    environment = LocalExecution(enforce=False)
+    try:
+        monkeypatch.setattr(
+            environment,
+            "_execute",
+            lambda *args, **kwargs: (
+                3,
+                b"",
+                json.dumps({"code": "read_failed", "message": "failed"}).encode(),
+            ),
+        )
+        with pytest.raises(DomainError) as failure:
+            environment.read_file(str(target), 1024)
+        assert failure.value.code == "read_failed"
+
+        monkeypatch.setattr(
+            environment, "_execute", lambda *args, **kwargs: (0, b"x" * 1026, b"")
+        )
+        with pytest.raises(DomainError) as protocol:
+            environment.read_file(str(target), 1024)
+        assert protocol.value.code == "execution_protocol"
+
+        monkeypatch.setattr(
+            environment,
+            "_execute",
+            lambda *args, **kwargs: (
+                3,
+                b"",
+                json.dumps({"code": "unexpected", "message": "failed"}).encode(),
+            ),
+        )
+        with pytest.raises(DomainError) as fields:
+            environment.read_file(str(target), 1024)
+        assert fields.value.code == "execution_protocol"
     finally:
         environment.close()
 

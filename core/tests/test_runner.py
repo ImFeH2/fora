@@ -10,7 +10,13 @@ from itertools import pairwise
 from typing import Any
 
 import pytest
-from pydantic_ai import ModelMessagesTypeAdapter, ModelRetry, Tool, models
+from pydantic_ai import (
+    BinaryContent,
+    ModelMessagesTypeAdapter,
+    ModelRetry,
+    Tool,
+    models,
+)
 from pydantic_ai.capabilities import Hooks
 from pydantic_ai.exceptions import (
     ApprovalRequired,
@@ -46,6 +52,7 @@ from huddol.adapters.model.runner import (
     PydanticModelRunner,
     is_context_exceeded,
 )
+from huddol.core.attachment import ImageData, ViewedImage
 from huddol.core.errors import DomainError
 from huddol.runtime.reminder import (
     HistoryPersistenceError,
@@ -1450,6 +1457,70 @@ def test_model_file_tools_forward_arguments_without_tree_tools(
     ).run(request(), Tools())
     assert outcome.error is None
     assert calls == [expected]
+
+
+def test_view_image_returns_native_binary_content_and_preserves_history(settings):
+    from io import BytesIO
+
+    from PIL import Image
+
+    source = BytesIO()
+    Image.new("RGB", (2, 3), (80, 90, 100)).save(source, format="PNG")
+    data = source.getvalue()
+    path = "/native/picture.png"
+    persisted = []
+    received = []
+
+    class Tools:
+        def view_image(self, value):
+            assert value == path
+            return ViewedImage(path, ImageData(data, "image/png", 2, 3))
+
+    def respond(messages, info):
+        received.append(messages)
+        if len(received) == 1:
+            view = next(
+                tool for tool in info.function_tools if tool.name == "view_image"
+            )
+            assert view.parameters_json_schema["required"] == ["path"]
+            return ModelResponse(
+                parts=[ToolCallPart("view_image", {"path": path}, "image-call")]
+            )
+        result = next(
+            part
+            for message in messages
+            for part in message.parts
+            if isinstance(part, ToolReturnPart) and part.tool_name == "view_image"
+        )
+        description, image = result.content
+        assert description == {
+            "path": path,
+            "size": len(data),
+            "media_type": "image/png",
+            "width": 2,
+            "height": 3,
+        }
+        assert isinstance(image, BinaryContent)
+        assert image.data == data
+        return ModelResponse(parts=[TextPart("Done")])
+
+    outcome = PydanticModelRunner(
+        settings,
+        build_model=lambda config: FunctionModel(respond),
+    ).run(replace(request(), persist=persisted.append), Tools())
+    assert outcome.error is None
+    assert len(received) == 2
+    saved = ModelMessagesTypeAdapter.validate_json(outcome.messages_json)
+    returned = next(
+        part
+        for message in saved
+        for part in message.parts
+        if isinstance(part, ToolReturnPart) and part.tool_name == "view_image"
+    )
+    assert returned.content[0]["path"] == path
+    assert isinstance(returned.content[1], BinaryContent)
+    assert returned.content[1].data == data
+    assert persisted
 
 
 @pytest.mark.parametrize("kind", ["sync", "async", "awaitable"])

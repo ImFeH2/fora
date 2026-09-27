@@ -43,6 +43,12 @@ class ViewedAttachment:
 
 
 @dataclass(frozen=True)
+class ViewedImage:
+    path: str
+    image: ImageData
+
+
+@dataclass(frozen=True)
 class Upload:
     id: str
     discussion_id: int

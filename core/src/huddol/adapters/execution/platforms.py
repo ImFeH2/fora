@@ -32,6 +32,10 @@ def entrypoint() -> list[str]:
 
 
 def dispatch_helper(argv: list[str]) -> int | None:
+    if argv and argv[0] == "--read-file":
+        from huddol.adapters.execution.reading import dispatch_read_file
+
+        return dispatch_read_file(argv[1:])
     if argv and argv[0] == "--windows-execution" and os.name == "nt":
         from huddol.adapters.sandbox.windows import run_restricted_command
         from huddol.adapters.windows import join_job

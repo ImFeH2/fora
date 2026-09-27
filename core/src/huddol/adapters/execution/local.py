@@ -1,19 +1,57 @@
 from __future__ import annotations
 
+import json
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from huddol.adapters.execution.editing import edit_file
-from huddol.adapters.execution.platforms import create_backend
+from huddol.adapters.execution.platforms import create_backend, entrypoint
 from huddol.adapters.sandbox.paths import normalize_directories, normalize_tolerantly
 from huddol.core.errors import DomainError
 from huddol.ports.execution import EditResult, RunResult
 
 MAX_OUTPUT = 200_000
 DEFAULT_TIMEOUT = 120
+_READ_FILE_CODES = frozenset(
+    {
+        "not_found",
+        "permission_denied",
+        "not_regular_file",
+        "file_too_large",
+        "read_failed",
+    }
+)
+
+
+def _read_file_protocol_error(
+    exit_code: int, stdout: bytes, stderr: bytes
+) -> DomainError:
+    if stdout:
+        return DomainError("execution_protocol", "read_file returned unexpected stdout")
+    if exit_code != 3 or not stderr or len(stderr) > 8192:
+        return DomainError("execution_protocol", "read_file returned an invalid error")
+    try:
+        payload = json.loads(stderr.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return DomainError("execution_protocol", "read_file returned invalid JSON")
+    if not isinstance(payload, dict) or set(payload) != {"code", "message"}:
+        return DomainError("execution_protocol", "read_file returned invalid fields")
+    code = payload["code"]
+    message = payload["message"]
+    if (
+        not isinstance(code, str)
+        or code not in _READ_FILE_CODES
+        or not isinstance(message, str)
+        or len(message) > 512
+    ):
+        return DomainError(
+            "execution_protocol", "read_file returned invalid diagnostics"
+        )
+    return DomainError(code, message)
 
 
 class LocalExecution:
@@ -49,6 +87,28 @@ class LocalExecution:
         if PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute():
             return value
         return str(Path(base) / value)
+
+    def read_file(
+        self, path: str, max_bytes: int, *, timeout: int | None = None
+    ) -> bytes:
+        if not isinstance(path, str) or "\0" in path or not Path(path).is_absolute():
+            raise DomainError(
+                "invalid_path", "path must be an absolute path without NUL characters"
+            )
+        if type(max_bytes) is not int or max_bytes <= 0:
+            raise DomainError("invalid_limit", "max_bytes must be a positive integer")
+        code, stdout, stderr = self._execute(
+            [*entrypoint(), "--read-file", path, str(max_bytes)],
+            cwd=str(Path(sys.executable).resolve().parent),
+            timeout=timeout,
+        )
+        if code == 0:
+            if stderr or len(stdout) > max_bytes + 1:
+                raise DomainError(
+                    "execution_protocol", "read_file returned invalid output"
+                )
+            return stdout
+        raise _read_file_protocol_error(code, stdout, stderr)
 
     def close(self, *, deadline: float | None = None) -> None:
         deadline = time.monotonic() + 5 if deadline is None else deadline

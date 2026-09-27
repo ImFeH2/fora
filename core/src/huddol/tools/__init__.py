@@ -6,7 +6,13 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from huddol.core.attachment import ViewedAttachment, identifier
+from huddol.core.attachment import (
+    MAX_IMAGE_BYTES,
+    ImageData,
+    ViewedAttachment,
+    ViewedImage,
+    identifier,
+)
 from huddol.core.context import advance_watermark, context_window
 from huddol.core.discussion import Discussion, Message, validate_body, validate_topic
 from huddol.core.errors import DomainError
@@ -31,6 +37,7 @@ class Dependencies:
     library_tree: FileTree
     workspace_tree_for: Callable[[int], FileTree]
     agent_directory_for: Callable[[int], Path]
+    decode_image: Callable[[bytes], ImageData]
     uploads: Uploads | None = None
 
 
@@ -466,6 +473,13 @@ class AgentTools:
             f"Discussion {discussion_id}: message {message_id}, attachment {attachment_id}",
         )
         return result
+
+    def view_image(self, path: str) -> ViewedImage:
+        self._check("view_image", path)
+        execution = self._deps.execution.snapshot()
+        image = self._deps.decode_image(execution.read_file(path, MAX_IMAGE_BYTES))
+        self._record("view_image", f"Image path: {path}")
+        return ViewedImage(path, image)
 
     def organization_uuid(self) -> str:
         self._check("organization.get")

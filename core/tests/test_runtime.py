@@ -9,6 +9,7 @@ import pytest
 
 from huddol.adapters.execution.manager import ExecutionManager
 from huddol.adapters.files.tree import DirectoryTree
+from huddol.adapters.files.uploads import decode_image
 from huddol.adapters.sqlite.agent import SqliteAgentStore
 from huddol.adapters.sqlite.store import SqliteStore
 from huddol.core.errors import DomainError
@@ -65,6 +66,7 @@ def world(tmp_path: Path):
         history=agent_store,
         settings=agent_store,
         agent_directory_for=agent_directory_for,
+        decode_image=decode_image,
         execution=ExecutionManager(
             settings={"write_directories": [str(tmp_path)]},
             enforce=False,

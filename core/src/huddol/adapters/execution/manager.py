@@ -38,6 +38,11 @@ class BoundExecution:
     def resolve_path(self, value: str, *, base: str) -> str:
         return self._lookup().resolve_path(value, base=base)
 
+    def read_file(
+        self, path: str, max_bytes: int, *, timeout: int | None = None
+    ) -> bytes:
+        return self._lookup().read_file(path, max_bytes, timeout=timeout)
+
     def run(
         self,
         argv: Sequence[str],

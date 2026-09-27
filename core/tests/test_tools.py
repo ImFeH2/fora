@@ -12,6 +12,7 @@ from pydantic_ai.models.function import FunctionModel
 
 from huddol.adapters.execution.manager import ExecutionManager
 from huddol.adapters.files.tree import DirectoryTree
+from huddol.adapters.files.uploads import decode_image
 from huddol.adapters.model.runner import PydanticModelRunner
 from huddol.adapters.sqlite.agent import SqliteAgentStore
 from huddol.adapters.sqlite.store import SqliteStore
@@ -45,6 +46,7 @@ def world(tmp_path: Path):
         settings=agent_store,
         execution=ExecutionManager(enforce=False),
         agent_directory_for=agent_directory_for,
+        decode_image=decode_image,
         library_tree=DirectoryTree(tmp_path / "library"),
         workspace_tree_for=lambda member_id: DirectoryTree(
             tmp_path / "agents" / str(member_id) / "workspace"
@@ -219,6 +221,35 @@ def test_run_defaults_to_the_agents_directory_on_first_use(
         assert result["exit_code"] == 0
         assert result["stdout"].strip() == str(directory)
     assert directory.is_dir()
+
+
+def test_view_image_reads_an_absolute_path_with_the_shared_image_decoder(
+    world, tmp_path
+):
+    from PIL import Image
+
+    target = tmp_path / "picture.png"
+    Image.new("RGB", (3, 2), (12, 34, 56)).save(target)
+    result = tools_for(world, MAIN).view_image(str(target))
+    assert result.path == str(target)
+    assert result.image.media_type == "image/png"
+    assert (result.image.width, result.image.height) == (3, 2)
+    assert result.image.data == target.read_bytes()
+    denied = tools_for(
+        world,
+        MAIN,
+        authorizer=Authorizer(
+            lambda actor, capability, value: (
+                "deny" if capability == "view_image" else "allow"
+            )
+        ),
+    )
+    with pytest.raises(DomainError) as denied_error:
+        denied.view_image(str(target))
+    assert denied_error.value.code == "not_permitted"
+    with pytest.raises(DomainError) as failure:
+        tools_for(world, MAIN).view_image("picture.png")
+    assert failure.value.code == "invalid_path"
 
 
 def test_run_resolves_relative_cwd_under_the_agents_directory(world) -> None:

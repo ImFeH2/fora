@@ -31,6 +31,10 @@ class ExecutionEnvironment(Protocol):
 
     def resolve_path(self, value: str, *, base: str) -> str: ...
 
+    def read_file(
+        self, path: str, max_bytes: int, *, timeout: int | None = None
+    ) -> bytes: ...
+
     def run(
         self,
         argv: Sequence[str],

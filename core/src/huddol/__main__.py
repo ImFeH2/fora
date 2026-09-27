@@ -208,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from huddol.adapters.execution.manager import ExecutionManager
     from huddol.adapters.files.tree import DirectoryTree
-    from huddol.adapters.files.uploads import DirectoryUploads
+    from huddol.adapters.files.uploads import DirectoryUploads, decode_image
     from huddol.adapters.jsonl.api import HUMAN_ID, Api
     from huddol.adapters.jsonl.protocol import Dispatcher
     from huddol.adapters.model.runner import PydanticModelRunner
@@ -276,6 +276,7 @@ def main(argv: list[str] | None = None) -> int:
             settings=agent_store,
             execution=execution,
             agent_directory_for=agent_directory_for,
+            decode_image=decode_image,
             uploads=uploads,
             library_tree=DirectoryTree(directory / "library"),
             workspace_tree_for=lambda member_id: DirectoryTree(
