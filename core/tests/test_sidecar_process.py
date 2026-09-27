@@ -763,7 +763,14 @@ def test_missing_model_blocks_turns_with_guidance_and_keeps_kernel_running(
 
 def test_the_process_announces_itself_once_on_stdout(tmp_path: Path) -> None:
     with Kernel(tmp_path / "data") as kernel:
-        assert set(kernel.ready) == {"type", "port", "token", "url"}
+        assert set(kernel.ready) == {
+            "type",
+            "port",
+            "token",
+            "url",
+            "version",
+            "started_at",
+        }
         assert kernel.ready["type"] == "ready"
         assert kernel.ready["url"] == (
             f"http://127.0.0.1:{kernel.port}/?token={kernel.token}"
@@ -771,9 +778,37 @@ def test_the_process_announces_itself_once_on_stdout(tmp_path: Path) -> None:
         with kernel.connect() as connection:
             client = Client(connection)
             organization = client.call({"id": 1, "method": "organization.get"})
+            info = client.call({"id": 2, "method": "info.get"})
+        with kernel.connect() as connection:
+            reconnected = Client(connection)
+            info_after_reconnect = reconnected.call({"id": 3, "method": "info.get"})
         assert organization["result"]["human_id"] == 1
+        assert info["result"] == {
+            key: kernel.ready[key] for key in ("version", "started_at")
+        }
+        assert info_after_reconnect["result"] == info["result"]
         assert kernel.shutdown() == 0, kernel.stderr
         assert kernel.stdout == b""
+
+
+def test_runtime_info_changes_after_restart(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    with Kernel(data) as first:
+        first_info = {key: first.ready[key] for key in ("version", "started_at")}
+        with first.connect() as connection:
+            info = Client(connection).call({"id": 1, "method": "info.get"})
+        assert info["result"] == first_info
+        assert first.shutdown() == 0, first.stderr
+
+    with Kernel(data) as second:
+        assert second.ready["version"] == first_info["version"]
+        assert second.ready["started_at"] != first_info["started_at"]
+        with second.connect() as connection:
+            info = Client(connection).call({"id": 1, "method": "info.get"})
+        assert info["result"] == {
+            key: second.ready[key] for key in ("version", "started_at")
+        }
+        assert second.shutdown() == 0, second.stderr
 
 
 def test_port_and_token_can_be_pinned_by_the_environment(tmp_path: Path) -> None:

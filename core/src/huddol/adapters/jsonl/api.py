@@ -13,6 +13,7 @@ from huddol.core.errors import DomainError
 from huddol.core.parameters import agent_parameters, validate_parameters
 from huddol.core.turn import idle_streak
 from huddol.runtime.scheduler import Scheduler
+from huddol.runtime_info import RuntimeInfo
 from huddol.tools import AgentTools
 from huddol.tools.authorize import Actor
 
@@ -41,11 +42,13 @@ class Api:
         *,
         list_models: ModelProbe = _list_models,
         test_model: ModelProbe = _test_model,
+        runtime_info: RuntimeInfo | None = None,
     ) -> None:
         self._scheduler = scheduler
         self._dispatcher = dispatcher
         self._list_models = list_models
         self._test_model = test_model
+        self._runtime_info = runtime_info or RuntimeInfo.capture()
         self._register()
 
     def _human(self) -> AgentTools:
@@ -58,6 +61,10 @@ class Api:
     def _register(self) -> None:
         register = self._dispatcher.register
         settings = self._scheduler.settings
+
+        def info_get(params: dict[str, Any]) -> Any:
+            del params
+            return self._runtime_info.as_dict()
 
         def organization_get(params: dict[str, Any]) -> Any:
             del params
@@ -426,6 +433,7 @@ class Api:
         def settings_test_model(params: dict[str, Any]) -> Any:
             return self._test_model(dict(params), settings.get_settings("model"))
 
+        register("info.get", info_get)
         register("organization.get", organization_get)
         register("organization.create_agent", create_agent)
         register("organization.rename_member", rename_member)

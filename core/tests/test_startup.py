@@ -396,11 +396,25 @@ def test_core_without_a_frontend_serves_only_the_websocket_endpoint(
 
 def test_stdio_serves_responses_and_events_on_stdout(tmp_path: Path) -> None:
     with Kernel(tmp_path / "data", arguments=["--transport", "stdio"]) as kernel:
-        assert kernel.ready == {"type": "ready", "transport": "stdio"}
+        assert set(kernel.ready) == {
+            "type",
+            "transport",
+            "version",
+            "started_at",
+        }
+        assert kernel.ready["type"] == "ready"
+        assert kernel.ready["transport"] == "stdio"
+        kernel.send_stdin(json.dumps({"id": 1, "method": "info.get"}) + "\n")
+        info = kernel.read_frame()
+        assert info == {
+            "type": "response",
+            "id": 1,
+            "result": {key: kernel.ready[key] for key in ("version", "started_at")},
+        }
         kernel.send_stdin(
             json.dumps(
                 {
-                    "id": 1,
+                    "id": 2,
                     "method": "organization.rename_member",
                     "params": {"member_id": 1, "name": "Renamed"},
                 }
@@ -411,7 +425,7 @@ def test_stdio_serves_responses_and_events_on_stdout(tmp_path: Path) -> None:
         assert {"type": "member.updated", "id": 1, "name": "Renamed"} in frames
         assert {
             "type": "response",
-            "id": 1,
+            "id": 2,
             "result": {"id": 1, "name": "Renamed"},
         } in frames
         assert kernel.shutdown() == 0, kernel.stderr

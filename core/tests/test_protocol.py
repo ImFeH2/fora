@@ -8,6 +8,7 @@ import sqlite3
 import threading
 import uuid
 from dataclasses import asdict
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Self, cast
@@ -431,6 +432,17 @@ def test_voice_recording_requires_a_saved_api_key() -> None:
             "message": "Save an API key before testing transcription",
         }
     ]
+
+
+def test_info_get_returns_fixed_runtime_information(server) -> None:
+    dispatcher, output, _ = server
+    first = call(dispatcher, output, "info.get")["result"]
+    second = call(dispatcher, output, "info.get")["result"]
+
+    assert first == second
+    assert set(first) == {"version", "started_at"}
+    assert first["version"]
+    assert datetime.fromisoformat(first["started_at"]).tzinfo == UTC
 
 
 def test_bad_json_produces_an_error_event_not_a_crash(server) -> None:

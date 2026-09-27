@@ -19,6 +19,7 @@ from huddol.adapters.host import (
     stdin_is_piped,
     write_private,
 )
+from huddol.runtime_info import RuntimeInfo
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -202,6 +203,7 @@ def main(argv: list[str] | None = None) -> int:
     stdio = options.transport == STDIO
 
     configure_stdio()
+    runtime_info = RuntimeInfo.capture()
 
     from huddol.adapters.execution.manager import ExecutionManager
     from huddol.adapters.files.tree import DirectoryTree
@@ -287,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
             on_event=lambda name, payload: dispatcher.emit(name, payload),
         )
         scheduler.recover()
-        Api(scheduler, dispatcher)
+        Api(scheduler, dispatcher, runtime_info=runtime_info)
 
         stop = Stop()
         install_signal_handlers(stop.stop)
@@ -299,7 +301,7 @@ def main(argv: list[str] | None = None) -> int:
             write_run_file(run_file, None, None)
             announced = True
             log.info("Reading stdio requests with data directory %s", directory)
-            announce({"type": "ready", "transport": STDIO})
+            announce({"type": "ready", "transport": STDIO, **runtime_info.as_dict()})
             threading.Thread(
                 target=read_requests,
                 args=(dispatcher, sink, stop, dispatch_lock),
@@ -332,6 +334,7 @@ def main(argv: list[str] | None = None) -> int:
                     "port": server.port,
                     "token": token,
                     "url": f"http://127.0.0.1:{server.port}/?token={quote(token, safe='')}",
+                    **runtime_info.as_dict(),
                 }
             )
             if stdin_is_piped():

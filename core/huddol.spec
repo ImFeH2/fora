@@ -3,6 +3,7 @@ from pathlib import Path
 from PyInstaller.utils.hooks import copy_metadata
 
 datas = copy_metadata("pydantic-ai-slim", recursive=True)
+datas.extend(copy_metadata("huddol"))
 webui = Path(SPECPATH, "..", "webui", "dist")
 if webui.is_dir():
     datas.append((str(webui), "webui"))
