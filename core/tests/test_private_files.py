@@ -15,9 +15,18 @@ WINDOWS = pytest.mark.skipif(sys.platform != "win32", reason="Windows ACL")
 
 
 def powershell(source: str) -> str:
+    environment = os.environ.copy()
+    powershell_exe = (
+        Path(environment["SystemRoot"])
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    environment["PSModulePath"] = str(powershell_exe.parent / "Modules")
     result = subprocess.run(
         [
-            "powershell.exe",
+            str(powershell_exe),
             "-NoProfile",
             "-NonInteractive",
             "-Command",
@@ -27,6 +36,7 @@ def powershell(source: str) -> str:
         capture_output=True,
         text=True,
         timeout=15,
+        env=environment,
     )
     assert result.returncode == 0, result.stderr
     return result.stdout.strip()
