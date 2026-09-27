@@ -16,6 +16,7 @@ from urllib.parse import quote
 from huddol.adapters.host import (
     configure_stdio,
     install_signal_handlers,
+    read_private,
     stdin_is_piped,
     write_private,
 )
@@ -83,7 +84,7 @@ def load_token(directory: Path, override: str | None) -> str:
         return override
     path = directory / "token"
     if path.is_file():
-        stored = path.read_text(encoding="utf-8").strip()
+        stored = read_private(path).strip()
         if stored:
             return stored
     token = secrets.token_urlsafe(24)

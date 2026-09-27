@@ -10,7 +10,20 @@ from pathlib import Path
 from typing import cast
 
 
+def read_private(path: Path) -> str:
+    if os.name == "nt":
+        from huddol.adapters.windows_files import read_private as windows_read_private
+
+        return windows_read_private(path)
+    return path.read_text(encoding="utf-8")
+
+
 def write_private(path: Path, payload: str) -> None:
+    if os.name == "nt":
+        from huddol.adapters.windows_files import write_private as windows_write_private
+
+        windows_write_private(path, payload)
+        return
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write(payload)
