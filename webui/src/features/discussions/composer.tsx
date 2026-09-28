@@ -233,13 +233,13 @@ export function Composer({
     },
     [controller, discussionId],
   );
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
       mounted.current = false;
       voiceConfigRead.current = null;
-    },
-    [],
-  );
+    };
+  }, []);
   const showVoiceSettingsToast = () => {
     toast({
       id: "voice-settings",

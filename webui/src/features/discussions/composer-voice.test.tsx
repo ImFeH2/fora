@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, useSyncExternalStore } from "react";
+import { act, StrictMode, useSyncExternalStore } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { clearToasts, readToasts } from "@/components/ui/toast";
@@ -71,6 +71,7 @@ function mount(
   discussionId = 1,
   autoStart = true,
   onOpenVoiceSettings: () => void = () => {},
+  strictMode = false,
 ) {
   const container = document.createElement("div");
   document.body.append(container);
@@ -78,19 +79,20 @@ function mount(
   let currentDiscussion = discussionId;
   const render = (id: number) => {
     currentDiscussion = id;
+    const composer = (
+      <Composer
+        discussionId={id}
+        members={[]}
+        memberIds={new Set()}
+        busy={false}
+        placeholder="Message"
+        onSend={async () => true}
+        onHeightChange={() => {}}
+        onOpenVoiceSettings={onOpenVoiceSettings}
+      />
+    );
     act(() =>
-      root.render(
-        <Composer
-          discussionId={id}
-          members={[]}
-          memberIds={new Set()}
-          busy={false}
-          placeholder="Message"
-          onSend={async () => true}
-          onHeightChange={() => {}}
-          onOpenVoiceSettings={onOpenVoiceSettings}
-        />,
-      ),
+      root.render(strictMode ? <StrictMode>{composer}</StrictMode> : composer),
     );
   };
   render(discussionId);
@@ -218,6 +220,65 @@ it("checks saved voice settings before opening voice input", async () => {
   notification?.action?.onClick();
   expect(openVoiceSettings).toHaveBeenCalledOnce();
   voice.close();
+});
+
+it("starts configured voice input after a StrictMode remount", async () => {
+  const voice = mount(1, false, () => {}, true);
+  await voice.start();
+  expect(harness.callbacks).toHaveLength(1);
+  voice.close();
+});
+
+it("shows the voice settings notification after a StrictMode remount", async () => {
+  const openVoiceSettings = vi.fn();
+  vi.mocked(backend.settings).mockResolvedValueOnce({
+    address: "wss://example.test/transcription",
+    model: "test-model",
+    api_key_set: false,
+  });
+  const voice = mount(1, false, openVoiceSettings, true);
+  const button = voice.container.querySelector<HTMLButtonElement>(
+    'button[aria-label="Start voice input"]',
+  );
+  if (!button) throw new Error("Voice input start button is missing");
+  await act(async () => {
+    button.click();
+    await vi.waitFor(() =>
+      expect(
+        readToasts().find((item) => item.id === "voice-settings"),
+      ).toMatchObject({
+        title: "Set up voice transcription",
+        action: { label: "Open Voice settings" },
+      }),
+    );
+  });
+  expect(harness.callbacks).toHaveLength(0);
+  voice.close();
+});
+
+it("ignores a voice settings response after StrictMode unmount", async () => {
+  const settingsRead = deferred<Record<string, unknown>>();
+  vi.mocked(backend.settings).mockImplementationOnce(
+    () => settingsRead.promise,
+  );
+  const voice = mount(1, false, () => {}, true);
+  const button = voice.container.querySelector<HTMLButtonElement>(
+    'button[aria-label="Start voice input"]',
+  );
+  if (!button) throw new Error("Voice input start button is missing");
+  act(() => button.click());
+  await vi.waitFor(() => expect(backend.settings).toHaveBeenCalledTimes(1));
+  voice.close();
+  await act(async () => {
+    settingsRead.resolve({
+      address: "wss://example.test/transcription",
+      model: "test-model",
+      api_key_set: true,
+    });
+    await settingsRead.promise;
+  });
+  expect(harness.callbacks).toHaveLength(0);
+  expect(readToasts()).toEqual([]);
 });
 
 it("shows the saved voice settings read error without changing the draft", async () => {
