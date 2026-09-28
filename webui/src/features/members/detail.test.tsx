@@ -28,6 +28,8 @@ import {
   type AgentHistoryRequestSummary,
   type AgentRun,
   backend,
+  type HistoryBinary,
+  type HistoryImage,
   type HistoryText,
   type LibraryEntry,
 } from "@/lib/backend";
@@ -35,7 +37,8 @@ import {
 vi.mock("@/components/ui/dialog", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/components/ui/dialog")>()),
   ConfirmDialog: vi.fn(() => null),
-  Modal: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
+  Modal: ({ children, open }: { children?: ReactNode; open: boolean }) =>
+    open ? <div>{children}</div> : null,
 }));
 
 afterEach(() => {
@@ -397,6 +400,212 @@ describe("Agent history request fields", () => {
       2,
       4,
       expect.objectContaining({
+        request_ordinal: 2,
+        offset: expect.any(Number),
+      }),
+    );
+  });
+
+  it("resets long responses and images when changing requests", async () => {
+    const summary = (ordinal: number): AgentHistoryRequestSummary => ({
+      ordinal,
+      request_id: `request-${ordinal}`,
+      run_id: "run-4",
+      window_number: 2,
+      status: "completed",
+      started_at: "2026-01-01T00:00:00Z",
+      completed_at: "2026-01-01T00:01:00Z",
+      streaming: false,
+      input_length: 0,
+      parameters_length: 10,
+      settings_length: 10,
+      model_length: 10,
+      response_length: 20,
+      input_count: 0,
+      response_count: 2,
+      related_count: 0,
+      error: null,
+    });
+    const field = (
+      source: HistoryText["source"],
+      ordinal: number,
+      value: string,
+      hasMore: boolean,
+    ): HistoryText => ({
+      kind: "text",
+      source,
+      request_ordinal: ordinal,
+      message_index: 0,
+      path: ["value"],
+      offset: 0,
+      next_offset: value.length,
+      total_bytes: value.length + (hasMore ? 5 : 0),
+      value,
+      has_more: hasMore,
+    });
+    const image = (ordinal: number): HistoryBinary => ({
+      kind: "binary",
+      source: "response",
+      request_ordinal: ordinal,
+      message_index: 1,
+      path: ["image"],
+      media_type: "image/png",
+      size: 3,
+      identifier: `image-${ordinal}`,
+    });
+    const emptyMessages = {
+      messages: [],
+      offset: 0,
+      total: 0,
+      has_more: false,
+    };
+    const read = (ordinal: number): AgentHistoryRead => ({
+      agent_id: 2,
+      run: {
+        sequence: 4,
+        run_id: "run-4",
+        status: "failed",
+        started_at: "2026-01-01T00:00:00Z",
+        completed_at: "2026-01-01T00:01:00Z",
+        last_saved_at: "2026-01-01T00:00:30Z",
+        window_number: 2,
+        window_reset_at: null,
+        window_reason: null,
+        request_count: 2,
+        usage: null,
+        error: null,
+        legacy: false,
+      },
+      windows: [],
+      windows_has_more: false,
+      windows_next_after: null,
+      requests: [summary(1), summary(2)],
+      requests_has_more: false,
+      requests_next_after: null,
+      messages: emptyMessages,
+      missing: [],
+      request: {
+        summary: summary(ordinal),
+        input: emptyMessages,
+        parameters: field(
+          "parameters",
+          ordinal,
+          `request-${ordinal}-parameters`,
+          false,
+        ),
+        settings: field(
+          "settings",
+          ordinal,
+          `request-${ordinal}-settings`,
+          false,
+        ),
+        model: field("model", ordinal, `request-${ordinal}-model`, false),
+        response: {
+          messages: [
+            field("response", ordinal, `request-${ordinal}-response`, true),
+            image(ordinal),
+          ],
+          offset: 0,
+          total: 2,
+          has_more: false,
+        },
+        related: emptyMessages,
+      },
+    });
+    vi.spyOn(backend, "agentHistoryRead").mockImplementation(
+      async (_agentId, _sequence, ordinal) => read(ordinal ?? 1),
+    );
+    const textRead = vi
+      .spyOn(backend, "agentHistoryText")
+      .mockImplementation(async (_agentId, _sequence, reference) => ({
+        offset: reference.offset,
+        next_offset: reference.offset + 5,
+        total_bytes: reference.offset + 5,
+        value: `request-${reference.request_ordinal}-response-tail`,
+        has_more: false,
+      }));
+    let resolveSecondImage!: (value: HistoryImage) => void;
+    const secondImage = new Promise<HistoryImage>((resolve) => {
+      resolveSecondImage = resolve;
+    });
+    vi.spyOn(backend, "agentHistoryImage").mockImplementation(
+      async (_agentId, _sequence, reference) => {
+        if (reference.request_ordinal === 2) return secondImage;
+        return {
+          media_type: "image/png",
+          size: 3,
+          identifier: "image-1",
+          data: "image-one",
+        };
+      },
+    );
+
+    render(
+      <TooltipProvider>
+        <HistorySection
+          agentId={2}
+          initialRuns={[
+            {
+              sequence: 4,
+              run_id: "run-4",
+              status: "failed",
+              started_at: "2026-01-01T00:00:00Z",
+              completed_at: "2026-01-01T00:01:00Z",
+              last_saved_at: "2026-01-01T00:00:30Z",
+              window_number: 2,
+              request_count: 2,
+              usage: null,
+              error: null,
+              effects: [],
+            },
+          ]}
+        />
+      </TooltipProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "View full context" }));
+    expect(await screen.findByText("request-1-response")).toBeTruthy();
+    expect(await screen.findByAltText("Saved model content")).toBeTruthy();
+
+    const responsePanel = () => {
+      const heading = screen.getByRole("heading", { name: "Model response" });
+      const section = heading.closest("section");
+      if (!(section instanceof HTMLElement))
+        throw new Error("Model response section is missing");
+      return within(section);
+    };
+
+    fireEvent.click(
+      responsePanel().getByRole("button", { name: "Load more text" }),
+    );
+    expect(await screen.findByText(/request-1-response-tail/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("tab", { name: /Request 2/ }));
+    expect(await screen.findByText("request-2-response")).toBeTruthy();
+    expect(screen.queryByText(/request-1-response-tail/)).toBeNull();
+    expect(screen.queryByAltText("Saved model content")).toBeNull();
+    expect(screen.getByText(/Loading image/)).toBeTruthy();
+
+    resolveSecondImage({
+      media_type: "image/png",
+      size: 3,
+      identifier: "image-2",
+      data: "image-two",
+    });
+    const nextImage = await screen.findByAltText("Saved model content");
+    expect(nextImage.getAttribute("src")).toBe(
+      "data:image/png;base64,image-two",
+    );
+
+    fireEvent.click(
+      responsePanel().getByRole("button", { name: "Load more text" }),
+    );
+    expect(await screen.findByText(/request-2-response-tail/)).toBeTruthy();
+    expect(screen.queryByText(/request-1-response-tail/)).toBeNull();
+    expect(textRead).toHaveBeenLastCalledWith(
+      2,
+      4,
+      expect.objectContaining({
+        source: "response",
         request_ordinal: 2,
         offset: expect.any(Number),
       }),

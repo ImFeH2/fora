@@ -883,6 +883,7 @@ function HistoryReadPanel({
       ) : null}
       {read.request ? (
         <RequestHistoryContent
+          key={`${read.run.sequence}-${read.request.summary.ordinal}`}
           agentId={read.agent_id}
           sequence={read.run.sequence}
           request={read.request}
