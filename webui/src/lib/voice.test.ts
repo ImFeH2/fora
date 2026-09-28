@@ -180,6 +180,7 @@ describe("VoiceRecording", () => {
     ]);
     expect(events).toContainEqual({
       type: "error",
+      code: "voice_capacity",
       message: "Audio capacity reached",
     });
     expect(track.stop).toHaveBeenCalledTimes(1);

@@ -6,7 +6,7 @@ export type VoiceEvent =
   | { type: "state"; state: VoiceState }
   | { type: "level"; level: number }
   | { type: "transcript"; text: string }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string; code?: string };
 
 export class VoiceRecording {
   #state: VoiceState = "starting";
@@ -43,6 +43,7 @@ export class VoiceRecording {
     this.emit({
       type: "error",
       message: error instanceof Error ? error.message : String(error),
+      ...(error instanceof BackendError ? { code: error.code } : {}),
     });
     this.cancel();
   }

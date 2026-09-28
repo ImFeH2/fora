@@ -224,6 +224,7 @@ export function Composer({
       recording.current = null;
       releaseSubmission();
       active?.cancel();
+      voiceConfigRead.current = null;
       if (
         currentDraft.current.controller !== controller ||
         currentDraft.current.discussionId !== discussionId
@@ -239,6 +240,19 @@ export function Composer({
     },
     [],
   );
+  const showVoiceSettingsToast = () => {
+    toast({
+      id: "voice-settings",
+      tone: "info",
+      title: "Set up voice transcription",
+      description: "Add an API key in Voice settings to start voice input.",
+      duration: null,
+      action: {
+        label: "Open Voice settings",
+        onClick: onOpenVoiceSettings,
+      },
+    });
+  };
   const startRecording = async () => {
     if (!controller || recording.current || voiceConfigRead.current !== null)
       return;
@@ -247,43 +261,38 @@ export function Composer({
     voiceConfigVersion.current = version;
     voiceConfigRead.current = version;
     setVoiceError("");
+    const isCurrentVoiceConfigRead = () =>
+      mounted.current &&
+      voiceConfigVersion.current === version &&
+      voiceConfigRead.current === version &&
+      currentDraft.current.controller === target &&
+      currentDraft.current.discussionId === discussionId;
+    const releaseVoiceConfigRead = () => {
+      if (voiceConfigRead.current === version) voiceConfigRead.current = null;
+    };
     let values: Record<string, unknown>;
     try {
       values = await backend.settings("voice");
     } catch (failure) {
-      if (mounted.current) {
-        voiceConfigRead.current = null;
+      const current = isCurrentVoiceConfigRead();
+      releaseVoiceConfigRead();
+      if (current)
         setVoiceError(
           failure instanceof Error ? failure.message : String(failure),
         );
-      }
       return;
     }
-    if (
-      !mounted.current ||
-      voiceConfigVersion.current !== version ||
-      voiceConfigRead.current !== version ||
-      currentDraft.current.controller !== target ||
-      currentDraft.current.discussionId !== discussionId
-    )
+    if (!isCurrentVoiceConfigRead()) {
+      releaseVoiceConfigRead();
       return;
-    voiceConfigRead.current = null;
+    }
+    releaseVoiceConfigRead();
     if (typeof values.api_key_set !== "boolean") {
       setVoiceError("Voice settings did not include API key status.");
       return;
     }
     if (!values.api_key_set) {
-      toast({
-        id: "voice-settings",
-        tone: "info",
-        title: "Set up voice transcription",
-        description: "Add an API key in Voice settings to start voice input.",
-        duration: null,
-        action: {
-          label: "Open Voice settings",
-          onClick: onOpenVoiceSettings,
-        },
-      });
+      showVoiceSettingsToast();
       return;
     }
     releaseSubmission();
@@ -370,6 +379,8 @@ export function Composer({
         setCaret(text.length);
       } else if (event.type === "level") {
         setLevels((previous) => [...previous.slice(1), event.level]);
+      } else if (event.code === "voice_config") {
+        showVoiceSettingsToast();
       } else {
         setVoiceError(event.message);
       }

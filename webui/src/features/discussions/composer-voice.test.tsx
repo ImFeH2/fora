@@ -58,6 +58,15 @@ function draft(body = "Saved message"): Draft {
     pending: null,
   };
 }
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 function mount(
   discussionId = 1,
   autoStart = true,
@@ -234,6 +243,122 @@ it("shows the saved voice settings read error without changing the draft", async
   );
   expect(harness.callbacks).toHaveLength(0);
   expect(controller.snapshot().draft.body).toBe("Saved message");
+  voice.close();
+});
+
+it("routes backend voice configuration errors to voice settings", async () => {
+  const openVoiceSettings = vi.fn();
+  const voice = mount(1, false, openVoiceSettings);
+  await voice.start();
+  await voice.emit({
+    type: "error",
+    code: "voice_config",
+    message: "Invalid transcription settings",
+  });
+  const notification = readToasts().find(
+    (item) => item.id === "voice-settings",
+  );
+  expect(notification).toMatchObject({
+    title: "Set up voice transcription",
+    action: { label: "Open Voice settings" },
+  });
+  expect(voice.container.textContent).not.toContain(
+    "Invalid transcription settings",
+  );
+  notification?.action?.onClick();
+  expect(openVoiceSettings).toHaveBeenCalledOnce();
+  voice.close();
+});
+
+it("keeps ordinary voice errors in composer feedback", async () => {
+  const voice = mount(1, false);
+  await voice.start();
+  await voice.emit({
+    type: "error",
+    code: "voice_capacity",
+    message: "Audio capacity reached",
+  });
+  await vi.waitFor(() =>
+    expect(voice.container.textContent).toContain("Audio capacity reached"),
+  );
+  expect(
+    readToasts().find((item) => item.id === "voice-settings"),
+  ).toBeUndefined();
+  voice.close();
+});
+
+it("releases a stale voice settings read after switching discussions", async () => {
+  const firstRead = deferred<Record<string, unknown>>();
+  const secondRead = deferred<Record<string, unknown>>();
+  const settings = {
+    address: "wss://example.test/transcription",
+    model: "test-model",
+    api_key_set: true,
+  };
+  vi.mocked(backend.settings)
+    .mockImplementationOnce(() => firstRead.promise)
+    .mockImplementationOnce(() => secondRead.promise);
+  const other = new DraftController(2, draft("Other Discussion"));
+  harness.controllers.set(2, other);
+  const voice = mount(1, false);
+  const firstButton = voice.container.querySelector<HTMLButtonElement>(
+    'button[aria-label="Start voice input"]',
+  );
+  if (!firstButton) throw new Error("Voice input start button is missing");
+  act(() => firstButton.click());
+  await vi.waitFor(() => expect(backend.settings).toHaveBeenCalledTimes(1));
+  voice.render(2);
+  const secondStart = voice.start();
+  await vi.waitFor(() => expect(backend.settings).toHaveBeenCalledTimes(2));
+  await act(async () => {
+    firstRead.resolve(settings);
+    await firstRead.promise;
+  });
+  expect(harness.callbacks).toHaveLength(0);
+  await act(async () => {
+    secondRead.resolve(settings);
+    await secondStart;
+  });
+  expect(harness.callbacks).toHaveLength(1);
+  voice.close();
+});
+
+it("suppresses a stale voice settings read error after switching discussions", async () => {
+  const firstRead = deferred<Record<string, unknown>>();
+  const secondRead = deferred<Record<string, unknown>>();
+  const settings = {
+    address: "wss://example.test/transcription",
+    model: "test-model",
+    api_key_set: true,
+  };
+  vi.mocked(backend.settings)
+    .mockImplementationOnce(() => firstRead.promise)
+    .mockImplementationOnce(() => secondRead.promise);
+  const other = new DraftController(2, draft("Other Discussion"));
+  harness.controllers.set(2, other);
+  const voice = mount(1, false);
+  const firstButton = voice.container.querySelector<HTMLButtonElement>(
+    'button[aria-label="Start voice input"]',
+  );
+  if (!firstButton) throw new Error("Voice input start button is missing");
+  act(() => firstButton.click());
+  await vi.waitFor(() => expect(backend.settings).toHaveBeenCalledTimes(1));
+  voice.render(2);
+  const secondStart = voice.start();
+  await vi.waitFor(() => expect(backend.settings).toHaveBeenCalledTimes(2));
+  const failure = new Error("Old discussion settings failed");
+  await act(async () => {
+    firstRead.reject(failure);
+    await expect(firstRead.promise).rejects.toBe(failure);
+  });
+  expect(voice.container.textContent).not.toContain(
+    "Old discussion settings failed",
+  );
+  await act(async () => {
+    secondRead.resolve(settings);
+    await secondStart;
+  });
+  expect(harness.callbacks).toHaveLength(1);
   voice.close();
 });
 
