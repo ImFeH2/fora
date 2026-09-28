@@ -939,18 +939,21 @@ function RequestHistoryContent({
         onLoadMore={request.input.has_more ? onLoadMoreInput : undefined}
       />
       <HistoryValuePanel
+        key={`${sequence}-${request.summary.ordinal}-parameters`}
         agentId={agentId}
         sequence={sequence}
         title="Model request parameters"
         value={request.parameters}
       />
       <HistoryValuePanel
+        key={`${sequence}-${request.summary.ordinal}-settings`}
         agentId={agentId}
         sequence={sequence}
         title="Model settings"
         value={request.settings}
       />
       <HistoryValuePanel
+        key={`${sequence}-${request.summary.ordinal}-model`}
         agentId={agentId}
         sequence={sequence}
         title="Model"
