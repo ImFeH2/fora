@@ -104,6 +104,7 @@ describe("composer layout", () => {
         placeholder: "Message",
         onSend: async () => true,
         onHeightChange: () => {},
+        onOpenVoiceSettings: () => {},
       }),
     );
     expect(html).toContain('data-expanded="false"');

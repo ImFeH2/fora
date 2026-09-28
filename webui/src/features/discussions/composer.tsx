@@ -10,7 +10,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { Avatar, autoGrowHeight, Textarea } from "@/components/ui/index";
+import { Avatar, autoGrowHeight, Textarea, toast } from "@/components/ui/index";
 import { DraftAttachments } from "@/features/discussions/attachments";
 import { type SendDraft, useDraft } from "@/features/discussions/draft";
 import {
@@ -18,7 +18,7 @@ import {
   completeMention,
   mentionQuery,
 } from "@/features/mentions";
-import type { Member } from "@/lib/backend";
+import { backend, type Member } from "@/lib/backend";
 import { VoiceRecording, type VoiceState } from "@/lib/voice";
 
 const MENU_LIMIT = 8;
@@ -165,6 +165,7 @@ export function Composer({
   placeholder,
   onSend,
   onHeightChange,
+  onOpenVoiceSettings,
 }: {
   discussionId: number;
   members: Member[];
@@ -173,6 +174,7 @@ export function Composer({
   placeholder: string;
   onSend: SendDraft;
   onHeightChange: (height: number) => void;
+  onOpenVoiceSettings: () => void;
 }) {
   const { controller, view, error: draftError } = useDraft(discussionId);
   const body = view?.draft.body ?? "";
@@ -197,6 +199,10 @@ export function Composer({
   const [voiceError, setVoiceError] = useState("");
   const [levels, setLevels] = useState([0, 0, 0, 0, 0]);
   const recording = useRef<VoiceRecording | null>(null);
+  const voiceConfigRead = useRef<number | null>(null);
+  const voiceConfigVersion = useRef(0);
+  const mounted = useRef(true);
+  const nextVoiceConfigVersion = useRef(0);
   const submissionUnsubscribe = useRef<(() => void) | null>(null);
   const recordingActive = voiceState !== "closed";
   const releaseSubmission = () => {
@@ -226,10 +232,61 @@ export function Composer({
     },
     [controller, discussionId],
   );
-  const startRecording = () => {
-    if (!controller || recording.current) return;
-    releaseSubmission();
+  useEffect(
+    () => () => {
+      mounted.current = false;
+      voiceConfigRead.current = null;
+    },
+    [],
+  );
+  const startRecording = async () => {
+    if (!controller || recording.current || voiceConfigRead.current !== null)
+      return;
     const target = controller;
+    const version = ++nextVoiceConfigVersion.current;
+    voiceConfigVersion.current = version;
+    voiceConfigRead.current = version;
+    setVoiceError("");
+    let values: Record<string, unknown>;
+    try {
+      values = await backend.settings("voice");
+    } catch (failure) {
+      if (mounted.current) {
+        voiceConfigRead.current = null;
+        setVoiceError(
+          failure instanceof Error ? failure.message : String(failure),
+        );
+      }
+      return;
+    }
+    if (
+      !mounted.current ||
+      voiceConfigVersion.current !== version ||
+      voiceConfigRead.current !== version ||
+      currentDraft.current.controller !== target ||
+      currentDraft.current.discussionId !== discussionId
+    )
+      return;
+    voiceConfigRead.current = null;
+    if (typeof values.api_key_set !== "boolean") {
+      setVoiceError("Voice settings did not include API key status.");
+      return;
+    }
+    if (!values.api_key_set) {
+      toast({
+        id: "voice-settings",
+        tone: "info",
+        title: "Set up voice transcription",
+        description: "Add an API key in Voice settings to start voice input.",
+        duration: null,
+        action: {
+          label: "Open Voice settings",
+          onClick: onOpenVoiceSettings,
+        },
+      });
+      return;
+    }
+    releaseSubmission();
     const initial = target.snapshot();
     const revision = initial.draft.bodyRevision;
     const pending = initial.draft.pending;
@@ -485,6 +542,13 @@ export function Composer({
     await controller.send(onSend);
     if (!controller.snapshot().draft.body) setCaret(0);
   };
+  const draftStatus =
+    view?.progress ??
+    (view?.saving
+      ? "Saving draft…"
+      : view?.storageError
+        ? "Draft not saved"
+        : null);
 
   return (
     <div
@@ -607,14 +671,9 @@ export function Composer({
               )}
             </div>
           ) : null}
-          {body || files.length || view?.progress ? (
+          {draftStatus ? (
             <div role="status" className="px-4 pt-2 text-xs opacity-70">
-              {view?.progress ??
-                (view?.saving
-                  ? "Saving draft…"
-                  : view?.storageError
-                    ? "Draft not saved"
-                    : "Draft saved")}
+              {draftStatus}
             </div>
           ) : null}
         </div>
@@ -777,7 +836,7 @@ export function Composer({
             <button
               type="button"
               aria-label="Start voice input"
-              onClick={startRecording}
+              onClick={() => void startRecording()}
             >
               <MicIcon />
             </button>
@@ -859,7 +918,7 @@ export function Composer({
           onClick={() => {
             if (recordingActive) recording.current?.stop();
             else if (canSend) void submit();
-            else startRecording();
+            else void startRecording();
           }}
         >
           {recordingActive ? (

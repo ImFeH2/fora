@@ -2,6 +2,7 @@
 import { act, useSyncExternalStore } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { clearToasts, readToasts } from "@/components/ui/toast";
 import { Composer } from "@/features/discussions/composer";
 import { type Draft, DraftController } from "@/features/discussions/draft";
 import { backend } from "@/lib/backend";
@@ -57,7 +58,11 @@ function draft(body = "Saved message"): Draft {
     pending: null,
   };
 }
-function mount(discussionId = 1) {
+function mount(
+  discussionId = 1,
+  autoStart = true,
+  onOpenVoiceSettings: () => void = () => {},
+) {
   const container = document.createElement("div");
   document.body.append(container);
   const root: Root = createRoot(container);
@@ -74,28 +79,36 @@ function mount(discussionId = 1) {
           placeholder="Message"
           onSend={async () => true}
           onHeightChange={() => {}}
+          onOpenVoiceSettings={onOpenVoiceSettings}
         />,
       ),
     );
   };
   render(discussionId);
   let callback: ((event: VoiceEvent) => void) | undefined;
+  let ready = Promise.resolve();
   const start = () => {
     const button = container.querySelector<HTMLButtonElement>(
       'button[aria-label="Start voice input"]',
     );
     if (!button) throw new Error("Voice input start button is missing");
+    const callbackIndex = harness.callbacks.length;
     act(() => button.click());
-    callback = harness.callbacks[harness.callbacks.length - 1];
-    if (!callback) throw new Error("Voice recording callback is missing");
+    ready = vi.waitFor(() => {
+      callback = harness.callbacks[callbackIndex];
+      if (!callback) throw new Error("Voice recording callback is missing");
+    });
+    return ready;
   };
-  start();
+  if (autoStart) void start();
   return {
     container,
     render,
     start,
+    ready: () => ready,
     emit: (event: VoiceEvent) =>
       act(async () => {
+        await ready;
         callback?.(event);
         const controller =
           (currentDiscussion === 1 ? harness.controller : null) ??
@@ -129,6 +142,12 @@ beforeEach(() => {
   harness.cancel.mockReset();
   harness.put.mockReset().mockResolvedValue(undefined);
   harness.controller = new DraftController(1, draft());
+  vi.spyOn(backend, "settings").mockResolvedValue({
+    address: "wss://example.test/transcription",
+    model: "test-model",
+    api_key_set: true,
+  });
+  clearToasts();
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal(
     "ResizeObserver",
@@ -151,8 +170,91 @@ beforeEach(() => {
   });
 });
 afterEach(() => {
+  clearToasts();
   vi.unstubAllGlobals();
   document.body.replaceChildren();
+});
+
+it("checks saved voice settings before opening voice input", async () => {
+  const controller = harness.controller;
+  if (!controller) throw new Error("Draft controller is missing");
+  const openVoiceSettings = vi.fn();
+  vi.mocked(backend.settings).mockResolvedValueOnce({
+    address: "wss://example.test/transcription",
+    model: "test-model",
+    api_key_set: false,
+  });
+  const voice = mount(1, false, openVoiceSettings);
+  const button = voice.container.querySelector<HTMLButtonElement>(
+    'button[aria-label="Start voice input"]',
+  );
+  if (!button) throw new Error("Voice input start button is missing");
+  await act(async () => {
+    button.click();
+    await vi.waitFor(() =>
+      expect(
+        readToasts().find((item) => item.id === "voice-settings"),
+      ).toMatchObject({
+        title: "Set up voice transcription",
+        action: { label: "Open Voice settings" },
+      }),
+    );
+  });
+  expect(backend.settings).toHaveBeenCalledWith("voice");
+  expect(harness.callbacks).toHaveLength(0);
+  expect(controller.snapshot().draft.body).toBe("Saved message");
+  const notification = readToasts().find(
+    (item) => item.id === "voice-settings",
+  );
+  notification?.action?.onClick();
+  expect(openVoiceSettings).toHaveBeenCalledOnce();
+  voice.close();
+});
+
+it("shows the saved voice settings read error without changing the draft", async () => {
+  const controller = harness.controller;
+  if (!controller) throw new Error("Draft controller is missing");
+  vi.mocked(backend.settings).mockRejectedValueOnce(
+    new Error("Voice settings unavailable"),
+  );
+  const voice = mount(1, false);
+  const button = voice.container.querySelector<HTMLButtonElement>(
+    'button[aria-label="Start voice input"]',
+  );
+  if (!button) throw new Error("Voice input start button is missing");
+  await act(async () => {
+    button.click();
+    await vi.waitFor(() =>
+      expect(backend.settings).toHaveBeenCalledWith("voice"),
+    );
+    expect(backend.settings).toHaveBeenCalledTimes(1);
+  });
+  await vi.waitFor(() =>
+    expect(voice.container.textContent).toContain("Voice settings unavailable"),
+  );
+  expect(harness.callbacks).toHaveLength(0);
+  expect(controller.snapshot().draft.body).toBe("Saved message");
+  voice.close();
+});
+
+it("keeps saving feedback while draft persistence is pending", async () => {
+  const controller = harness.controller;
+  if (!controller) throw new Error("Draft controller is missing");
+  let finish!: () => void;
+  harness.put.mockImplementationOnce(
+    () =>
+      new Promise<void>((resolve) => {
+        finish = resolve;
+      }),
+  );
+  controller.setBody("Changed draft");
+  await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+  const voice = mount(1, false);
+  expect(voice.container.textContent).toContain("Saving draft…");
+  finish();
+  await vi.waitFor(() => expect(controller.snapshot().saving).toBe(false));
+  expect(voice.container.textContent).not.toContain("Draft saved");
+  voice.close();
 });
 
 it("persists partial and final while keeping the active submission snapshot", async () => {
@@ -169,11 +271,13 @@ it("persists partial and final while keeping the active submission snapshot", as
   await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
   const pending = structuredClone(controller.snapshot().draft.pending);
   const voice = mount();
+  await voice.ready();
   expect(voice.container.textContent).toContain("Listening…");
   expect(voice.container.textContent).toContain("Cancel");
   expect(voice.container.textContent).toContain(
     "Saved send attempt: Saved message",
   );
+  expect(voice.container.textContent).not.toContain("Draft saved");
   await voice.emit(transcript(" partial"));
   await voice.emit(transcript(" final"));
   expect(controller.snapshot().draft.pending).toEqual(pending);
@@ -608,6 +712,7 @@ it("rejects old callbacks after edits, Discussion changes and unmount", async ()
   expect(controller.snapshot().draft.body).toBe("Saved message first");
 
   const second = mount();
+  await second.ready();
   const input = second.container.querySelector<HTMLTextAreaElement>(
     'textarea[aria-label="Message"]',
   );
@@ -629,7 +734,7 @@ it("rejects old callbacks after edits, Discussion changes and unmount", async ()
 
   const other = new DraftController(2, draft("Second Discussion"));
   harness.controllers.set(2, other);
-  second.start();
+  await second.start();
   const oldDiscussionCallback = harness.callbacks[harness.callbacks.length - 1];
   second.render(2);
   expect(harness.cancel).toHaveBeenCalledTimes(3);
@@ -637,7 +742,7 @@ it("rejects old callbacks after edits, Discussion changes and unmount", async ()
   act(() => oldDiscussionCallback(transcript(" late")));
   expect(body(second)).toBe("Second Discussion");
 
-  second.start();
+  await second.start();
   const activeCallback = harness.callbacks[harness.callbacks.length - 1];
   second.close();
   expect(harness.cancel).toHaveBeenCalledTimes(4);

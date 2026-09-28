@@ -524,6 +524,9 @@ function ThreadSession({ id }: { id: number }) {
             placeholder={topic ? `Message ${topic}` : "Message"}
             onSend={send}
             onHeightChange={resizeComposer}
+            onOpenVoiceSettings={() =>
+              navigate({ name: "settings", section: "voice" })
+            }
           />
         </div>
       </PageBody>
