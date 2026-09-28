@@ -64,7 +64,7 @@ def test_read_file_returns_binary_data_and_enforces_initial_size_limit(
     target = tmp_path / "image.bin"
     data = b"\x00\xffimage-bytes"
     target.write_bytes(data)
-    environment = LocalExecution(enforce=enforce)
+    environment = LocalExecution([str(tmp_path)], enforce=enforce)
     try:
         assert environment.read_file(str(target), len(data)) == data
         with pytest.raises(DomainError) as failure:
