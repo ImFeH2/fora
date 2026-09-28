@@ -128,6 +128,8 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     status TEXT NOT NULL,
     started_at TEXT NOT NULL,
     completed_at TEXT,
+    window_number INTEGER,
+    last_saved_at TEXT,
     messages_json TEXT NOT NULL DEFAULT '[]',
     reminded_json TEXT NOT NULL DEFAULT '[]',
     usage_json TEXT,
@@ -394,6 +396,16 @@ class SqliteStore:
             }:
                 self._db.execute(
                     "ALTER TABLE agent_runs ADD COLUMN reminded_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            if "last_saved_at" not in {
+                row["name"] for row in self._db.execute("PRAGMA table_info(agent_runs)")
+            }:
+                self._db.execute("ALTER TABLE agent_runs ADD COLUMN last_saved_at TEXT")
+            if "window_number" not in {
+                row["name"] for row in self._db.execute("PRAGMA table_info(agent_runs)")
+            }:
+                self._db.execute(
+                    "ALTER TABLE agent_runs ADD COLUMN window_number INTEGER"
                 )
             self._db.execute(
                 "INSERT OR IGNORE INTO organization_identity(id, uuid) VALUES (1, ?)",

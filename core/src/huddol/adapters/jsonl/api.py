@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import base64
+import json
 from collections.abc import Callable
 from dataclasses import asdict
 from typing import Any
 
 from huddol.adapters.jsonl.protocol import Dispatcher
 from huddol.adapters.model.config import ModelCatalog
+from huddol.adapters.model.history import (
+    binary_from_history,
+    render_history,
+    text_from_history,
+)
 from huddol.adapters.voice.config import VoiceConfig
 from huddol.core.errors import DomainError
 from huddol.core.parameters import agent_parameters, validate_parameters
@@ -18,6 +25,105 @@ from huddol.tools.authorize import Actor
 HUMAN_ID = 1
 
 ModelProbe = Callable[[dict[str, Any], dict[str, Any] | None], dict[str, Any]]
+
+
+def _integer_param(
+    params: dict[str, Any],
+    name: str,
+    *,
+    default: int | None = None,
+    maximum: int | None = None,
+) -> int | None:
+    value = params.get(name, default)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise DomainError("invalid_params", f"{name} must be a non-negative integer")
+    if maximum is not None and value > maximum:
+        raise DomainError("invalid_params", f"{name} exceeds its maximum")
+    return value
+
+
+def _required_integer(params: dict[str, Any], name: str) -> int:
+    value = _integer_param(params, name)
+    if value is None:
+        raise DomainError("invalid_params", f"{name} is required")
+    return value
+
+
+def _json_value(raw: str) -> Any:
+    return json.loads(raw)
+
+
+def _history_run_payload(run: Any) -> dict[str, Any]:
+    return {
+        "sequence": run.sequence,
+        "run_id": run.run_id,
+        "status": run.status,
+        "started_at": run.started_at,
+        "completed_at": run.completed_at,
+        "usage": run.usage_json,
+        "error": run.error,
+        "window_number": run.window_number,
+        "window_reset_at": run.window_reset_at,
+        "window_reason": run.window_reason,
+        "request_count": run.request_count,
+        "last_saved_at": run.last_saved_at,
+        "legacy": run.request_count == 0,
+    }
+
+
+def _window_event_payload(event: Any) -> dict[str, Any]:
+    return {
+        "number": event.number,
+        "since_sequence": event.since_sequence,
+        "reset_at": event.reset_at,
+        "reason": event.reason,
+    }
+
+
+def _request_summary_payload(summary: Any) -> dict[str, Any]:
+    return {
+        "ordinal": summary.ordinal,
+        "request_id": summary.request_id,
+        "run_id": summary.run_id,
+        "window_number": summary.window_number,
+        "status": summary.status,
+        "started_at": summary.started_at,
+        "completed_at": summary.completed_at,
+        "streaming": summary.streaming,
+        "input_length": summary.input_length,
+        "parameters_length": summary.parameters_length,
+        "settings_length": summary.settings_length,
+        "model_length": summary.model_length,
+        "response_length": summary.response_length,
+        "input_count": summary.input_count,
+        "response_count": summary.response_count,
+        "related_count": summary.related_count,
+        "error": summary.error,
+    }
+
+
+def _render_message_page(
+    page: Any, source: str, request_ordinal: int
+) -> dict[str, Any]:
+    messages = [
+        render_history(
+            raw,
+            source=source,
+            request_ordinal=request_ordinal,
+            limit=1,
+            message_index_base=page.offset + index,
+        )["messages"][0]
+        for index, raw in enumerate(page.messages)
+    ]
+    return {
+        "messages": messages,
+        "offset": page.offset,
+        "total": page.total,
+        "total_bytes": page.total_bytes,
+        "has_more": page.has_more,
+    }
 
 
 def _list_models(values: dict[str, Any], stored: dict[str, Any] | None) -> Any:
@@ -285,9 +391,241 @@ class Api:
                 str(params["path"]), str(params["destination"])
             )
 
+        def agent_history(params: dict[str, Any]) -> Any:
+            agent_id = _required_integer(params, "agent_id")
+            self._human().authorize_agent_history(agent_id)
+            limit = _integer_param(params, "limit", default=30, maximum=50)
+            assert limit is not None
+            if limit == 0:
+                raise DomainError("invalid_params", "limit must be positive")
+            before = _integer_param(params, "before", maximum=2**63 - 1)
+            runs = self._scheduler.history.history_runs(
+                agent_id, before=before, limit=limit
+            )
+            return {
+                "agent_id": agent_id,
+                "runs": [_history_run_payload(run) for run in runs],
+                "windows": [
+                    _window_event_payload(event)
+                    for event in self._scheduler.history.window_events(agent_id)
+                ],
+                "has_before": len(runs) == limit,
+                "next_before": runs[-1].sequence if len(runs) == limit else None,
+            }
+
+        def agent_history_read(params: dict[str, Any]) -> Any:
+            agent_id = _required_integer(params, "agent_id")
+            self._human().authorize_agent_history(agent_id)
+            sequence = _required_integer(params, "sequence")
+            message_offset = _integer_param(
+                params, "message_offset", default=0, maximum=2**63 - 1
+            )
+            message_limit = _integer_param(
+                params, "message_limit", default=100, maximum=100
+            )
+            input_offset = _integer_param(
+                params, "input_offset", default=0, maximum=2**63 - 1
+            )
+            input_limit = _integer_param(
+                params, "input_limit", default=100, maximum=100
+            )
+            response_offset = _integer_param(
+                params, "response_offset", default=0, maximum=2**63 - 1
+            )
+            response_limit = _integer_param(
+                params, "response_limit", default=100, maximum=100
+            )
+            related_offset = _integer_param(
+                params, "related_offset", default=0, maximum=2**63 - 1
+            )
+            related_limit = _integer_param(
+                params, "related_limit", default=100, maximum=100
+            )
+            assert message_offset is not None
+            assert message_limit is not None
+            assert input_offset is not None
+            assert input_limit is not None
+            assert response_offset is not None
+            assert response_limit is not None
+            assert related_offset is not None
+            assert related_limit is not None
+            if 0 in (message_limit, input_limit, response_limit, related_limit):
+                raise DomainError("invalid_params", "message limits must be positive")
+            run = self._scheduler.history.history_run(agent_id, sequence)
+            if run is None:
+                raise DomainError("not_found", f"Turn {sequence} does not exist")
+            requests = self._scheduler.history.model_request_summaries(
+                agent_id, sequence
+            )
+            if requests:
+                messages: dict[str, Any] = {
+                    "messages": [],
+                    "offset": 0,
+                    "total": 0,
+                    "next_offset": 0,
+                    "has_more": False,
+                }
+            else:
+                legacy = self._scheduler.history.read_run_slice(
+                    agent_id, sequence, message_offset, 65536
+                )
+                if legacy is None:
+                    raise DomainError("not_found", f"Turn {sequence} does not exist")
+                next_offset = legacy.offset + len(legacy.messages)
+                messages = {
+                    "messages": [{"kind": "legacy", "content": legacy.messages}],
+                    "offset": legacy.offset,
+                    "total": legacy.total_length,
+                    "next_offset": next_offset,
+                    "has_more": next_offset < legacy.total_length,
+                }
+            result: dict[str, Any] = {
+                "agent_id": agent_id,
+                "run": _history_run_payload(run),
+                "windows": [
+                    _window_event_payload(event)
+                    for event in self._scheduler.history.window_events(agent_id)
+                ],
+                "requests": [_request_summary_payload(item) for item in requests],
+                "messages": messages,
+                "missing": (
+                    [
+                        "provider_system_instructions",
+                        "model_input",
+                        "model_request_parameters",
+                        "model_settings",
+                        "model_identity",
+                        "request_window",
+                    ]
+                    if not requests
+                    else []
+                ),
+            }
+            ordinal = _integer_param(params, "ordinal", maximum=2**63 - 1)
+            if ordinal is None and requests:
+                ordinal = requests[0].ordinal
+            if ordinal is None:
+                return result
+            record = self._scheduler.history.model_request(agent_id, sequence, ordinal)
+            if record is None:
+                raise DomainError(
+                    "not_found", f"Model request {ordinal} does not exist"
+                )
+            input_page = self._scheduler.history.model_request_messages(
+                agent_id, sequence, ordinal, "input", input_offset, input_limit
+            )
+            response_page = self._scheduler.history.model_request_messages(
+                agent_id, sequence, ordinal, "response", response_offset, response_limit
+            )
+            related_page = self._scheduler.history.model_request_messages(
+                agent_id, sequence, ordinal, "related", related_offset, related_limit
+            )
+            result["request"] = {
+                "summary": _request_summary_payload(record.summary),
+                "input": _render_message_page(input_page, "input", ordinal),
+                "parameters": _json_value(record.parameters_json),
+                "settings": _json_value(record.settings_json),
+                "model": _json_value(record.model_json),
+                "response": (
+                    _render_message_page(response_page, "response", ordinal)
+                    if record.summary.response_count
+                    else None
+                ),
+                "related": _render_message_page(related_page, "related", ordinal),
+            }
+            if record.summary.status == "pending":
+                result["missing"].append("model_response")
+            return result
+
+        def agent_history_text(params: dict[str, Any]) -> Any:
+            agent_id = _required_integer(params, "agent_id")
+            self._human().authorize_agent_history(agent_id)
+            sequence = _required_integer(params, "sequence")
+            source = params.get("source")
+            if source not in ("run", "input", "response", "related"):
+                raise DomainError("invalid_params", "source is invalid")
+            message_index = _required_integer(params, "message_index")
+            offset = _integer_param(params, "offset", default=0, maximum=2**63 - 1)
+            limit = _integer_param(
+                params, "limit", default=16 * 1024, maximum=16 * 1024
+            )
+            assert offset is not None
+            assert limit is not None
+            if limit == 0:
+                raise DomainError("invalid_params", "limit must be positive")
+            path = params.get("path")
+            if not isinstance(path, list) or any(
+                isinstance(item, bool) or not isinstance(item, (str, int))
+                for item in path
+            ):
+                raise DomainError("invalid_params", "path must be a list")
+            raw = (
+                self._scheduler.history.run_messages(agent_id, sequence)
+                if source == "run"
+                else None
+            )
+            index = message_index
+            if source in ("input", "response", "related"):
+                ordinal = _integer_param(params, "ordinal")
+                if ordinal is None:
+                    raise DomainError("invalid_params", "ordinal is required")
+                raw = self._scheduler.history.model_request_message(
+                    agent_id, sequence, ordinal, source, message_index
+                )
+                index = 0
+            if raw is None:
+                raise DomainError("not_found", "History content does not exist")
+            return text_from_history(raw, index, path, offset, limit)
+
+        def agent_history_image(params: dict[str, Any]) -> Any:
+            agent_id = _required_integer(params, "agent_id")
+            self._human().authorize_agent_history(agent_id)
+            sequence = _required_integer(params, "sequence")
+            source = params.get("source")
+            if source not in ("run", "input", "response", "related"):
+                raise DomainError("invalid_params", "source is invalid")
+            message_index = _required_integer(params, "message_index")
+            path = params.get("path")
+            if not isinstance(path, list) or any(
+                isinstance(item, bool) or not isinstance(item, (str, int))
+                for item in path
+            ):
+                raise DomainError("invalid_params", "path must be a list")
+            ordinal = _integer_param(params, "ordinal")
+            raw = (
+                self._scheduler.history.run_messages(agent_id, sequence)
+                if source == "run"
+                else None
+            )
+            if source in ("input", "response", "related"):
+                if ordinal is None:
+                    raise DomainError("invalid_params", "ordinal is required")
+                raw = self._scheduler.history.model_request_message(
+                    agent_id, sequence, ordinal, source, message_index
+                )
+                if raw is None:
+                    raise DomainError("not_found", "History content does not exist")
+            if raw is None:
+                raise DomainError("not_found", "History content does not exist")
+            image = binary_from_history(
+                raw,
+                0 if source in ("input", "response", "related") else message_index,
+                path,
+            )
+            return {
+                "media_type": image.media_type,
+                "size": len(image.data),
+                "identifier": image.identifier,
+                "data": base64.b64encode(image.data).decode("ascii"),
+            }
+
         def agent_detail(params: dict[str, Any]) -> Any:
             agent_id = int(params["agent_id"])
             runs = self._scheduler.history.run_summaries(agent_id, limit=30)
+            history_runs = {
+                run.sequence: run
+                for run in self._scheduler.history.history_runs(agent_id, limit=30)
+            }
             effects = self._scheduler.history.effects(
                 agent_id, sequences=[run.sequence for run in runs]
             )
@@ -322,9 +660,27 @@ class Api:
                 "runs": [
                     {
                         "sequence": run.sequence,
+                        "run_id": history_runs[run.sequence].run_id
+                        if run.sequence in history_runs
+                        else None,
                         "status": run.status,
                         "started_at": run.started_at,
                         "completed_at": run.completed_at,
+                        "last_saved_at": history_runs[run.sequence].last_saved_at
+                        if run.sequence in history_runs
+                        else None,
+                        "window_number": history_runs[run.sequence].window_number
+                        if run.sequence in history_runs
+                        else None,
+                        "window_reset_at": history_runs[run.sequence].window_reset_at
+                        if run.sequence in history_runs
+                        else None,
+                        "window_reason": history_runs[run.sequence].window_reason
+                        if run.sequence in history_runs
+                        else None,
+                        "request_count": history_runs[run.sequence].request_count
+                        if run.sequence in history_runs
+                        else 0,
                         "usage": run.usage_json,
                         "error": run.error,
                         "effects": produced.get(run.sequence, []),
@@ -445,6 +801,10 @@ class Api:
         register("library.delete", library_delete)
         register("library.move", library_move)
         register("agent.detail", agent_detail)
+        register("agent.history", agent_history)
+        register("agent.history.read", agent_history_read)
+        register("agent.history.text", agent_history_text)
+        register("agent.history.image", agent_history_image)
         register("settings.get", settings_get)
         register("settings.update", settings_update)
         register("settings.list_models", settings_list_models)

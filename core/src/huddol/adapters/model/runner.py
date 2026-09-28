@@ -16,6 +16,7 @@ from traceback import walk_tb
 from typing import Any, Literal, NotRequired, TypedDict, cast, get_type_hints
 
 import pydantic_ai
+from pydantic import TypeAdapter
 from pydantic_ai import (
     Agent,
     BinaryContent,
@@ -84,7 +85,7 @@ from huddol.adapters.model.prompt import SYSTEM_PROMPT
 from huddol.core.attachment import ViewedAttachment, ViewedImage
 from huddol.core.errors import DomainError
 from huddol.core.parameters import agent_parameters
-from huddol.ports.agent import SettingsStore
+from huddol.ports.agent import ModelRequestHandle, ModelRequestRecorder, SettingsStore
 from huddol.runtime.reminder import (
     HistoryPersistenceError,
     HistoryValidationError,
@@ -333,11 +334,17 @@ class LiveModel(WrapperModel):
         ephemeral: Callable[[], str],
         cache_key: str,
         agents_instructions: str | None = None,
+        request_recorder: ModelRequestRecorder | None = None,
+        model_snapshot: dict[str, Any] | None = None,
     ) -> None:
         self._resolve = resolve
         self._ephemeral = ephemeral
         self._cache_key = cache_key
         self._agents_instructions = agents_instructions
+        self._request_recorder = request_recorder
+        self._model_snapshot = model_snapshot or {}
+        self._last_request_handle: ModelRequestHandle | None = None
+        self._last_response: ModelResponse | None = None
         super().__init__(resolve())
 
     @property
@@ -400,6 +407,112 @@ class LiveModel(WrapperModel):
             return model_settings
         return cast(ModelSettings, {**(model_settings or {}), **caching})
 
+    def _link_related(self, messages: list[ModelMessage]) -> None:
+        if (
+            self._request_recorder is None
+            or self._last_request_handle is None
+            or self._last_response is None
+        ):
+            return
+        response_index = next(
+            (
+                index
+                for index in range(len(messages) - 1, -1, -1)
+                if messages[index] is self._last_response
+                or messages[index] == self._last_response
+            ),
+            None,
+        )
+        handle = self._last_request_handle
+        self._last_request_handle, self._last_response = None, None
+        if response_index is None:
+            return
+        related = [
+            message
+            for message in messages[response_index + 1 :]
+            if isinstance(message, ModelRequest)
+            and any(
+                isinstance(part, ToolReturnPart | RetryPromptPart)
+                for part in message.parts
+            )
+        ]
+        if not related:
+            return
+        assert handle is not None
+        try:
+            self._request_recorder.related(
+                handle,
+                _encode_messages(related),
+            )
+        except HistoryPersistenceError:
+            raise
+        except Exception as error:
+            raise HistoryPersistenceError(
+                "Could not save the related tool results"
+            ) from error
+
+    def _start_request(
+        self,
+        wrapped: Model,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        parameters: ModelRequestParameters,
+        streaming: bool,
+    ) -> ModelRequestHandle | None:
+        if self._request_recorder is None:
+            return None
+        self._link_related(messages)
+        model_snapshot = {
+            **self._model_snapshot,
+            "model_id": wrapped.model_id,
+            "model_name": wrapped.model_name,
+            "provider": wrapped.system,
+        }
+        try:
+            return self._request_recorder.start(
+                _encode_messages(messages),
+                _encode_request_parameters(parameters),
+                _encode_json(model_settings or {}),
+                _encode_json(model_snapshot),
+                streaming,
+            )
+        except HistoryPersistenceError:
+            raise
+        except Exception as error:
+            raise HistoryPersistenceError(
+                "Could not save the model request snapshot"
+            ) from error
+
+    def _record_response(
+        self, handle: ModelRequestHandle | None, response: ModelResponse
+    ) -> None:
+        if handle is None or self._request_recorder is None:
+            return
+        try:
+            self._request_recorder.response(handle, _encode_messages([response]))
+        except HistoryPersistenceError:
+            raise
+        except Exception as error:
+            raise HistoryPersistenceError(
+                "Could not save the model response snapshot"
+            ) from error
+        self._last_request_handle = handle
+        self._last_response = response
+
+    def _record_error(
+        self, handle: ModelRequestHandle | None, error: BaseException
+    ) -> None:
+        if handle is None or self._request_recorder is None:
+            return
+        try:
+            self._request_recorder.error(handle, f"{type(error).__name__}: {error}")
+        except HistoryPersistenceError:
+            raise
+        except Exception as failure:
+            raise HistoryPersistenceError(
+                "Could not save the model request failure"
+            ) from failure
+
     async def request(
         self,
         messages: list[ModelMessage],
@@ -410,11 +523,15 @@ class LiveModel(WrapperModel):
         outgoing, parameters = self._request_content(
             wrapped, messages, model_request_parameters
         )
-        return await wrapped.request(
-            outgoing,
-            self._caching(wrapped, model_settings),
-            parameters,
-        )
+        settings = self._caching(wrapped, model_settings)
+        handle = self._start_request(wrapped, outgoing, settings, parameters, False)
+        try:
+            response = await wrapped.request(outgoing, settings, parameters)
+        except BaseException as error:
+            self._record_error(handle, error)
+            raise
+        self._record_response(handle, response)
+        return response
 
     @asynccontextmanager
     async def request_stream(
@@ -428,13 +545,23 @@ class LiveModel(WrapperModel):
         outgoing, parameters = self._request_content(
             wrapped, messages, model_request_parameters
         )
-        async with wrapped.request_stream(
-            outgoing,
-            self._caching(wrapped, model_settings),
-            parameters,
-            run_context,
-        ) as response:
-            yield response
+        settings = self._caching(wrapped, model_settings)
+        handle = self._start_request(wrapped, outgoing, settings, parameters, True)
+        try:
+            async with wrapped.request_stream(
+                outgoing,
+                settings,
+                parameters,
+                run_context,
+            ) as response:
+                yield response
+                completed = response.get() if handle is not None else None
+        except BaseException as error:
+            self._record_error(handle, error)
+            raise
+        if handle is not None:
+            assert completed is not None
+            self._record_response(handle, completed)
 
 
 class PydanticModelRunner:
@@ -897,7 +1024,17 @@ class PydanticModelRunner:
                     deps=tools,
                     message_history=history,
                     model=LiveModel(
-                        lambda: model, request.ephemeral, cache_key, agents_instructions
+                        lambda: model,
+                        request.ephemeral,
+                        cache_key,
+                        agents_instructions,
+                        request.request_recorder,
+                        {
+                            "api_type": config.api_type,
+                            "model": config.model,
+                            "thinking": config.thinking,
+                            "thinking_budget_tokens": config.thinking_budget_tokens,
+                        },
                     ),
                     capabilities=[
                         hooks,
@@ -1012,9 +1149,21 @@ def _decode_history(raw: str) -> list[ModelMessage]:
         raise HistoryValidationError("Stored model history is invalid") from error
 
 
-def _encode_history(messages: list[ModelMessage]) -> str:
+def _encode_json(value: Any) -> str:
+    return TypeAdapter(Any).dump_json(value).decode("utf-8")
+
+
+def _encode_request_parameters(parameters: ModelRequestParameters) -> str:
+    return TypeAdapter(ModelRequestParameters).dump_json(parameters).decode("utf-8")
+
+
+def _encode_messages(messages: Sequence[ModelMessage]) -> tuple[str, ...]:
+    return tuple(_encode_history([message]) for message in messages)
+
+
+def _encode_history(messages: Sequence[ModelMessage]) -> str:
     try:
-        return ModelMessagesTypeAdapter.dump_json(messages).decode("utf-8")
+        return ModelMessagesTypeAdapter.dump_json(list(messages)).decode("utf-8")
     except Exception as error:
         raise HistoryPersistenceError("Could not serialize model history") from error
 

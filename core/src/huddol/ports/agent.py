@@ -17,6 +17,7 @@ class AgentRun:
     messages_json: str
     usage_json: str | None
     error: str | None
+    window_number: int | None = None
     pending_revision: int = -1
 
 
@@ -31,6 +32,75 @@ class RunSummary:
 
 
 @dataclass(frozen=True)
+class ModelRequestHandle:
+    ordinal: int
+    request_id: str
+
+
+@dataclass(frozen=True)
+class WindowEvent:
+    number: int
+    since_sequence: int
+    reset_at: str | None
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class AgentHistoryRun:
+    sequence: int
+    run_id: str
+    status: str
+    started_at: str
+    completed_at: str | None
+    usage_json: str | None
+    error: str | None
+    window_number: int | None
+    window_reset_at: str | None
+    window_reason: str | None
+    request_count: int
+    last_saved_at: str | None
+
+
+@dataclass(frozen=True)
+class AgentModelRequestSummary:
+    ordinal: int
+    request_id: str
+    run_id: str
+    window_number: int | None
+    status: str
+    started_at: str
+    completed_at: str | None
+    streaming: bool
+    input_length: int
+    parameters_length: int
+    settings_length: int
+    model_length: int
+    response_length: int
+    input_count: int
+    response_count: int
+    related_count: int
+    error: str | None
+
+
+@dataclass(frozen=True)
+class AgentModelRequest:
+    summary: AgentModelRequestSummary
+    parameters_json: str
+    settings_json: str
+    model_json: str
+
+
+@dataclass(frozen=True)
+class AgentMessagePage:
+    channel: str
+    offset: int
+    total: int
+    total_bytes: int
+    messages: tuple[str, ...]
+    has_more: bool
+
+
+@dataclass(frozen=True)
 class HistorySlice:
     sequence: int
     status: str
@@ -38,6 +108,7 @@ class HistorySlice:
     messages: str
     offset: int
     total_length: int
+    last_saved_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +133,27 @@ class AgentLifecycle:
     pause_requested: bool = False
     error: str | None = None
     prepared_sequence: int | None = None
+
+
+class ModelRequestRecorder(Protocol):
+    def start(
+        self,
+        messages_json: Sequence[str],
+        parameters_json: str,
+        settings_json: str,
+        model_json: str,
+        streaming: bool,
+    ) -> ModelRequestHandle: ...
+
+    def response(
+        self, handle: ModelRequestHandle, response_json: Sequence[str]
+    ) -> None: ...
+
+    def related(
+        self, handle: ModelRequestHandle, messages_json: Sequence[str]
+    ) -> None: ...
+
+    def error(self, handle: ModelRequestHandle, error: str) -> None: ...
 
 
 class HistoryStore(Protocol):
@@ -90,6 +182,8 @@ class HistoryStore(Protocol):
     def window(self, agent_id: int) -> WindowState: ...
 
     def reset_window(self, agent_id: int, reason: str) -> WindowState: ...
+
+    def window_events(self, agent_id: int) -> tuple[WindowEvent, ...]: ...
 
     def start_run(
         self,
@@ -127,7 +221,83 @@ class HistoryStore(Protocol):
         error: str | None = None,
     ) -> None: ...
 
+    def start_model_request(
+        self,
+        agent_id: int,
+        sequence: int,
+        run_id: str,
+        window_number: int,
+        messages_json: Sequence[str],
+        parameters_json: str,
+        settings_json: str,
+        model_json: str,
+        streaming: bool,
+    ) -> ModelRequestHandle: ...
+
+    def finish_model_request(
+        self,
+        agent_id: int,
+        sequence: int,
+        handle: ModelRequestHandle,
+        response_json: Sequence[str],
+    ) -> None: ...
+
+    def link_model_request(
+        self,
+        agent_id: int,
+        sequence: int,
+        handle: ModelRequestHandle,
+        messages_json: Sequence[str],
+    ) -> None: ...
+
+    def fail_model_request(
+        self,
+        agent_id: int,
+        sequence: int,
+        handle: ModelRequestHandle,
+        error: str,
+    ) -> None: ...
+
     def latest_messages(self, agent_id: int) -> str: ...
+
+    def run_messages(self, agent_id: int, sequence: int) -> str | None: ...
+
+    def history_run(self, agent_id: int, sequence: int) -> AgentHistoryRun | None: ...
+
+    def history_runs(
+        self,
+        agent_id: int,
+        *,
+        before: int | None = None,
+        limit: int = 30,
+    ) -> tuple[AgentHistoryRun, ...]: ...
+
+    def model_request_summaries(
+        self, agent_id: int, sequence: int
+    ) -> tuple[AgentModelRequestSummary, ...]: ...
+
+    def model_request(
+        self, agent_id: int, sequence: int, ordinal: int
+    ) -> AgentModelRequest | None: ...
+
+    def model_request_messages(
+        self,
+        agent_id: int,
+        sequence: int,
+        ordinal: int,
+        channel: str,
+        offset: int,
+        limit: int,
+    ) -> AgentMessagePage: ...
+
+    def model_request_message(
+        self,
+        agent_id: int,
+        sequence: int,
+        ordinal: int,
+        channel: str,
+        position: int,
+    ) -> str | None: ...
 
     def runs(self, agent_id: int, *, limit: int = 50) -> tuple[AgentRun, ...]: ...
 

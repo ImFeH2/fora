@@ -34,6 +34,7 @@ export function Modal({
   description,
   children,
   footer,
+  wide = false,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -41,6 +42,7 @@ export function Modal({
   description?: ReactNode;
   children?: ReactNode;
   footer: ReactNode;
+  wide?: boolean;
 }) {
   const opener = useRef<HTMLElement | null>(null);
   const content = useRef<HTMLDivElement>(null);
@@ -51,7 +53,7 @@ export function Modal({
         <Dialog.Overlay className="fixed inset-0 z-(--layer-overlay) bg-gray-1100/60 animate-fade-in [animation-duration:var(--duration-fast)] [animation-timing-function:var(--ease-out)]" />
         <Dialog.Content
           ref={content}
-          className="fixed top-1/2 left-1/2 z-(--layer-dialog) flex flex-col gap-4 w-[min(440px,calc(100vw-48px))] p-6 border border-line rounded-lg bg-surface-raised shadow-dialog [translate:-50%_-50%] origin-center animate-pop-in"
+          className={`fixed top-1/2 left-1/2 z-(--layer-dialog) flex max-h-[calc(100vh-32px)] flex-col gap-4 p-6 border border-line rounded-lg bg-surface-raised shadow-dialog [translate:-50%_-50%] origin-center animate-pop-in ${wide ? "w-[min(960px,calc(100vw-32px))]" : "w-[min(440px,calc(100vw-48px))]"}`}
           onOpenAutoFocus={(event) => {
             opener.current =
               document.activeElement instanceof HTMLElement

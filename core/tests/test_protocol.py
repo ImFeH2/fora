@@ -15,6 +15,15 @@ from typing import Any, Self, cast
 
 import pytest
 from aiohttp import ClientSession, WSMsgType, WSServerHandshakeError
+from pydantic_ai import BinaryContent, ModelMessagesTypeAdapter
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 from websockets.sync.client import connect
 
 from huddol.adapters.execution.manager import ExecutionManager
@@ -35,6 +44,7 @@ from huddol.core.parameters import AgentParameters
 from huddol.runtime.scheduler import Scheduler
 from huddol.services.uploads import Uploads
 from huddol.tools import Dependencies
+from huddol.tools.authorize import Authorizer
 
 
 class Capture:
@@ -105,6 +115,7 @@ def server(tmp_path: Path):
         test_model=probe.test_model,
     )
     deps.__dict__["probe"] = probe
+    deps.__dict__["scheduler"] = scheduler
     yield dispatcher, output, deps
     store.close()
 
@@ -1212,6 +1223,270 @@ def test_agent_detail_reports_runs(server) -> None:
         "reason": "overflow",
     }
     assert detail["runs"][0]["sequence"] == run.sequence
+
+
+def test_agent_history_protocol_reads_turn_requests_and_legacy_data(server) -> None:
+    dispatcher, output, deps = server
+    agent = call(dispatcher, output, "organization.create_agent", name="Main")["result"]
+    agent_id = agent["id"]
+    run = deps.history.start_run(agent_id)
+    handle = deps.history.start_model_request(
+        agent_id,
+        run.sequence,
+        run.run_id,
+        2,
+        "[]",
+        '{"function_tools":[{"name":"tool"}]}',
+        '{"temperature":0.2}',
+        '{"model":"test-model"}',
+        False,
+    )
+    deps.history.finish_model_request(agent_id, run.sequence, handle, "[]")
+    deps.history.finish_run(
+        agent_id, run.sequence, status="completed", messages_json="[]"
+    )
+    page = call(dispatcher, output, "agent.history", agent_id=agent_id, limit=1)[
+        "result"
+    ]
+    assert page["runs"][0]["request_count"] == 1
+    assert page["runs"][0]["run_id"] == run.run_id
+    read = call(
+        dispatcher,
+        output,
+        "agent.history.read",
+        agent_id=agent_id,
+        sequence=run.sequence,
+    )["result"]
+    assert read["requests"][0]["request_id"] == handle.request_id
+    assert read["request"]["parameters"] == {"function_tools": [{"name": "tool"}]}
+    assert read["request"]["model"] == {"model": "test-model"}
+    assert read["request"]["response"] is None
+
+    legacy = deps.history.start_run(agent_id)
+    deps.history.finish_run(
+        agent_id,
+        legacy.sequence,
+        status="failed",
+        messages_json="[]",
+        error="provider failure",
+    )
+    legacy_read = call(
+        dispatcher,
+        output,
+        "agent.history.read",
+        agent_id=agent_id,
+        sequence=legacy.sequence,
+    )["result"]
+    assert legacy_read["missing"] == [
+        "provider_system_instructions",
+        "model_input",
+        "model_request_parameters",
+        "model_settings",
+        "model_identity",
+        "request_window",
+    ]
+    assert legacy_read["run"]["legacy"] is True
+    assert legacy_read["run"]["error"] == "provider failure"
+
+
+def test_agent_history_requires_human_history_permission_before_body_reads(
+    server,
+) -> None:
+    dispatcher, output, deps = server
+    agent_id = call(dispatcher, output, "organization.create_agent", name="Main")[
+        "result"
+    ]["id"]
+    run = deps.history.start_run(agent_id)
+    deps.history.finish_run(
+        agent_id,
+        run.sequence,
+        status="completed",
+        messages_json="[]",
+    )
+    deps.scheduler._authorizer = Authorizer(
+        lambda actor, capability, target: (
+            "deny" if capability == "agent.history" else "allow"
+        )
+    )
+    connection = deps.store._db._connection
+    reads = []
+
+    def authorize(action, table, column, database, source):
+        if action == sqlite3.SQLITE_READ:
+            reads.append((table, column))
+            if table in {
+                "agent_runs",
+                "agent_model_requests",
+                "agent_history_message_blobs",
+            }:
+                return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    connection.set_authorizer(authorize)
+    try:
+        response = call(
+            dispatcher,
+            output,
+            "agent.history.read",
+            agent_id=agent_id,
+            sequence=run.sequence,
+        )
+    finally:
+        connection.set_authorizer(None)
+    assert response["error"]["code"] == "not_permitted"
+    assert not any(
+        table in {"agent_runs", "agent_model_requests"} for table, _ in reads
+    )
+
+
+def test_agent_history_groups_tool_results_after_their_model_response(server) -> None:
+    dispatcher, output, deps = server
+    agent_id = call(dispatcher, output, "organization.create_agent", name="Main")[
+        "result"
+    ]["id"]
+    messages = [
+        ModelRequest(parts=[UserPromptPart("input")]),
+        ModelResponse(
+            parts=[ToolCallPart("tool", {"value": 1}, tool_call_id="call-1")]
+        ),
+        ModelRequest(parts=[ToolReturnPart("tool", "result", tool_call_id="call-1")]),
+        ModelResponse(parts=[TextPart("done")]),
+    ]
+    raw = ModelMessagesTypeAdapter.dump_json(messages).decode()
+    response_raw = ModelMessagesTypeAdapter.dump_json([messages[1]]).decode()
+    run = deps.history.start_run(agent_id)
+    handle = deps.history.start_model_request(
+        agent_id,
+        run.sequence,
+        run.run_id,
+        1,
+        "[]",
+        "{}",
+        "{}",
+        "{}",
+        False,
+    )
+    deps.history.finish_model_request(agent_id, run.sequence, handle, response_raw)
+    deps.history.link_model_request(
+        agent_id,
+        run.sequence,
+        handle,
+        (ModelMessagesTypeAdapter.dump_json([messages[2]]).decode(),),
+    )
+    deps.history.finish_run(
+        agent_id, run.sequence, status="completed", messages_json=raw
+    )
+    read = call(
+        dispatcher,
+        output,
+        "agent.history.read",
+        agent_id=agent_id,
+        sequence=run.sequence,
+        ordinal=handle.ordinal,
+    )["result"]
+    related = read["request"]["related"]["messages"]
+    assert len(related) == 1
+    assert related[0]["parts"][0]["part_kind"] == "tool-return"
+
+
+def test_agent_history_image_is_read_as_a_separate_binary_response(server) -> None:
+    dispatcher, output, deps = server
+    agent_id = call(dispatcher, output, "organization.create_agent", name="Main")[
+        "result"
+    ]["id"]
+    raw = ModelMessagesTypeAdapter.dump_json(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        [BinaryContent(data=b"image-bytes", media_type="image/png")]
+                    )
+                ]
+            )
+        ]
+    ).decode()
+    run = deps.history.start_run(agent_id)
+    handle = deps.history.start_model_request(
+        agent_id,
+        run.sequence,
+        run.run_id,
+        1,
+        raw,
+        "{}",
+        "{}",
+        "{}",
+        False,
+    )
+    deps.history.finish_model_request(agent_id, run.sequence, handle, "[]")
+    deps.history.finish_run(
+        agent_id, run.sequence, status="completed", messages_json=raw
+    )
+    image = call(
+        dispatcher,
+        output,
+        "agent.history.image",
+        agent_id=agent_id,
+        sequence=run.sequence,
+        ordinal=handle.ordinal,
+        source="input",
+        message_index=0,
+        path=["parts", 0, "content", 0],
+    )["result"]
+    assert image["media_type"] == "image/png"
+    assert image["size"] == len(b"image-bytes")
+    assert base64.b64decode(image["data"]) == b"image-bytes"
+
+
+def test_agent_history_text_is_bounded_and_continuable(server) -> None:
+    dispatcher, output, deps = server
+    agent_id = call(dispatcher, output, "organization.create_agent", name="Main")[
+        "result"
+    ]["id"]
+    content = "汉" * 12_000
+    raw = ModelMessagesTypeAdapter.dump_json(
+        [ModelRequest(parts=[UserPromptPart(content)])]
+    ).decode()
+    run = deps.history.start_run(agent_id)
+    handle = deps.history.start_model_request(
+        agent_id,
+        run.sequence,
+        run.run_id,
+        1,
+        (raw,),
+        "{}",
+        "{}",
+        "{}",
+        False,
+    )
+    deps.history.finish_run(
+        agent_id, run.sequence, status="completed", messages_json=raw
+    )
+    read = call(
+        dispatcher,
+        output,
+        "agent.history.read",
+        agent_id=agent_id,
+        sequence=run.sequence,
+        ordinal=handle.ordinal,
+    )["result"]
+    value = read["request"]["input"]["messages"][0]["parts"][0]["content"]
+    assert value["kind"] == "text"
+    assert len(value["value"].encode()) <= 16 * 1024
+    assert value["has_more"] is True
+    following = call(
+        dispatcher,
+        output,
+        "agent.history.text",
+        agent_id=agent_id,
+        sequence=run.sequence,
+        source="input",
+        ordinal=handle.ordinal,
+        message_index=0,
+        path=["parts", 0, "content"],
+        offset=value["next_offset"],
+    )["result"]
+    assert following["value"]
+    assert following["offset"] == value["next_offset"]
 
 
 def test_agent_detail_reports_each_turn_output_and_the_idle_streak(server) -> None:

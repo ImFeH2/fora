@@ -6,7 +6,7 @@ from typing import Protocol
 
 from huddol.core.errors import DomainError
 from huddol.core.mention import Mention
-from huddol.ports.agent import HistoryStore, WindowState
+from huddol.ports.agent import HistoryStore, ModelRequestRecorder, WindowState
 from huddol.ports.files import FileTree
 from huddol.ports.store import OrganizationStore
 from huddol.tools import AgentTools
@@ -201,6 +201,7 @@ class TurnRequest:
     ephemeral: Callable[[], str]
     persist: Callable[[str], None]
     agents_instructions: str | None = None
+    request_recorder: ModelRequestRecorder | None = None
 
 
 @dataclass(frozen=True)

@@ -97,6 +97,14 @@ class AgentTools:
                 "not_a_member", f"You do not belong to Discussion {discussion_id}"
             )
 
+    def authorize_agent_history(self, agent_id: int) -> None:
+        self._check("agent.history", agent_id)
+        if self._actor.is_agent:
+            raise DomainError("not_permitted", "Agent history is restricted to Humans")
+        member = self._deps.store.get_member(agent_id)
+        if member is None or not member.is_agent or member.deleted:
+            raise DomainError("not_found", f"Agent {agent_id} does not exist")
+
     def list_members(self, include_deleted: bool = False) -> list[dict[str, Any]]:
         self._check("organization.list_members")
         return [

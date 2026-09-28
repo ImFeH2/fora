@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -15,11 +16,17 @@ from huddol.adapters.model.config import (
 from huddol.adapters.sqlite.store import LockedConnection, first
 from huddol.core.errors import DomainError
 from huddol.ports.agent import (
+    AgentHistoryRun,
     AgentLifecycle,
+    AgentMessagePage,
+    AgentModelRequest,
+    AgentModelRequestSummary,
     AgentRun,
     HistorySlice,
+    ModelRequestHandle,
     RunSummary,
     TurnEffect,
+    WindowEvent,
     WindowState,
 )
 
@@ -49,6 +56,14 @@ CREATE TABLE IF NOT EXISTS agent_windows (
     reset_at TEXT,
     reason TEXT
 );
+CREATE TABLE IF NOT EXISTS agent_window_events (
+    agent_id INTEGER NOT NULL,
+    number INTEGER NOT NULL,
+    since_sequence INTEGER NOT NULL,
+    reset_at TEXT,
+    reason TEXT,
+    PRIMARY KEY (agent_id, number)
+);
 CREATE TABLE IF NOT EXISTS agent_sessions (
     agent_id INTEGER PRIMARY KEY,
     start_after INTEGER NOT NULL
@@ -73,6 +88,52 @@ CREATE TABLE IF NOT EXISTS run_effects (
     created_at TEXT NOT NULL,
     PRIMARY KEY (agent_id, sequence, ordinal)
 );
+CREATE TABLE IF NOT EXISTS agent_model_requests (
+    agent_id INTEGER NOT NULL,
+    sequence INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    request_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    window_number INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    streaming INTEGER NOT NULL,
+    messages_json TEXT NOT NULL DEFAULT '',
+    parameters_json TEXT NOT NULL,
+    settings_json TEXT NOT NULL,
+    model_json TEXT NOT NULL,
+    response_json TEXT,
+    input_count INTEGER NOT NULL DEFAULT 0,
+    response_count INTEGER NOT NULL DEFAULT 0,
+    related_count INTEGER NOT NULL DEFAULT 0,
+    input_length INTEGER NOT NULL DEFAULT 0,
+    response_length INTEGER NOT NULL DEFAULT 0,
+    parameters_length INTEGER NOT NULL DEFAULT 0,
+    settings_length INTEGER NOT NULL DEFAULT 0,
+    model_length INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    PRIMARY KEY (agent_id, sequence, ordinal)
+);
+CREATE INDEX IF NOT EXISTS agent_model_requests_summary
+ON agent_model_requests (agent_id, sequence, ordinal, status, started_at, completed_at);
+CREATE TABLE IF NOT EXISTS agent_history_message_blobs (
+    content_hash TEXT PRIMARY KEY,
+    content_json TEXT NOT NULL,
+    byte_length INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS agent_model_request_messages (
+    agent_id INTEGER NOT NULL,
+    sequence INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    channel TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    PRIMARY KEY (agent_id, sequence, ordinal, channel, position),
+    FOREIGN KEY (content_hash) REFERENCES agent_history_message_blobs(content_hash)
+);
+CREATE INDEX IF NOT EXISTS agent_model_request_messages_lookup
+ON agent_model_request_messages (agent_id, sequence, ordinal, channel, position, content_hash);
 """
 
 
@@ -80,7 +141,32 @@ class SqliteAgentStore:
     def __init__(self, db: LockedConnection) -> None:
         self._db = db
         self._db.executescript(SCHEMA)
-        self._db.commit()
+        request_columns = {
+            row["name"]
+            for row in self._db.execute("PRAGMA table_info(agent_model_requests)")
+        }
+        request_migrations = {
+            "input_count": "INTEGER NOT NULL DEFAULT 0",
+            "response_count": "INTEGER NOT NULL DEFAULT 0",
+            "related_count": "INTEGER NOT NULL DEFAULT 0",
+            "input_length": "INTEGER NOT NULL DEFAULT 0",
+            "response_length": "INTEGER NOT NULL DEFAULT 0",
+            "parameters_length": "INTEGER NOT NULL DEFAULT 0",
+            "settings_length": "INTEGER NOT NULL DEFAULT 0",
+            "model_length": "INTEGER NOT NULL DEFAULT 0",
+        }
+        with self._db:
+            for name, definition in request_migrations.items():
+                if name not in request_columns:
+                    self._db.execute(
+                        f"ALTER TABLE agent_model_requests ADD COLUMN {name} {definition}"
+                    )
+            self._db.execute(
+                "INSERT OR IGNORE INTO agent_window_events "
+                "(agent_id, number, since_sequence, reset_at, reason) "
+                "SELECT agent_id, number, since_sequence, reset_at, reason "
+                "FROM agent_windows"
+            )
         self.update_settings(
             "model", lambda values: ModelCatalog.restore(values).model_dump()
         )
@@ -199,6 +285,9 @@ class SqliteAgentStore:
             messages_json=str(row["messages_json"]),
             usage_json=row["usage_json"],
             error=row["error"],
+            window_number=(
+                int(row["window_number"]) if row["window_number"] is not None else None
+            ),
             pending_revision=int(row["pending_revision"]),
         )
 
@@ -299,16 +388,31 @@ class SqliteAgentStore:
         sequence = int(row["v"])
         identifier = run_id or uuid.uuid4().hex
         started = self._now()
+        current_window = self.window(agent_id)
         with self._db:
             revision = self.pending_revision(agent_id)
             self._db.execute(
+                "INSERT OR IGNORE INTO agent_window_events"
+                " (agent_id, number, since_sequence, reset_at, reason)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (
+                    agent_id,
+                    current_window.number,
+                    current_window.since_sequence,
+                    current_window.reset_at,
+                    current_window.reason,
+                ),
+            )
+            self._db.execute(
                 "INSERT INTO agent_runs (agent_id, sequence, run_id, status, started_at,"
-                " messages_json, reminded_json, pending_revision)"
-                " VALUES (?, ?, ?, 'running', ?, '[]', ?, ?)",
+                " window_number, last_saved_at, messages_json, reminded_json, pending_revision)"
+                " VALUES (?, ?, ?, 'running', ?, ?, ?, '[]', ?, ?)",
                 (
                     agent_id,
                     sequence,
                     identifier,
+                    started,
+                    current_window.number,
                     started,
                     json.dumps(sorted(set(reminded))),
                     revision,
@@ -330,23 +434,25 @@ class SqliteAgentStore:
                 ],
             )
         return AgentRun(
-            agent_id,
-            sequence,
-            identifier,
-            "running",
-            started,
-            None,
-            "[]",
-            None,
-            None,
-            revision,
+            agent_id=agent_id,
+            sequence=sequence,
+            run_id=identifier,
+            status="running",
+            started_at=started,
+            completed_at=None,
+            messages_json="[]",
+            usage_json=None,
+            error=None,
+            window_number=current_window.number,
+            pending_revision=revision,
         )
 
     def save_progress(self, agent_id: int, sequence: int, messages_json: str) -> None:
         with self._db:
             self._db.execute(
-                "UPDATE agent_runs SET messages_json = ? WHERE agent_id = ? AND sequence = ?",
-                (messages_json, agent_id, sequence),
+                "UPDATE agent_runs SET messages_json = ?, last_saved_at = ?"
+                " WHERE agent_id = ? AND sequence = ?",
+                (messages_json, self._now(), agent_id, sequence),
             )
 
     def finish_run(
@@ -361,10 +467,12 @@ class SqliteAgentStore:
     ) -> None:
         with self._db:
             self._db.execute(
-                "UPDATE agent_runs SET status = ?, completed_at = ?, messages_json = ?,"
-                " usage_json = ?, error = ? WHERE agent_id = ? AND sequence = ?",
+                "UPDATE agent_runs SET status = ?, completed_at = ?, last_saved_at = ?,"
+                " messages_json = ?, usage_json = ?, error = ?"
+                " WHERE agent_id = ? AND sequence = ?",
                 (
                     status,
+                    self._now(),
                     self._now(),
                     messages_json,
                     usage_json,
@@ -373,6 +481,371 @@ class SqliteAgentStore:
                     sequence,
                 ),
             )
+            if status == "interrupted":
+                self._db.execute(
+                    "UPDATE agent_model_requests SET status = 'interrupted',"
+                    " completed_at = ? WHERE agent_id = ? AND sequence = ?"
+                    " AND status = 'pending'",
+                    (self._now(), agent_id, sequence),
+                )
+
+    def _store_message_refs(
+        self,
+        agent_id: int,
+        sequence: int,
+        ordinal: int,
+        channel: str,
+        messages_json: Sequence[str],
+    ) -> tuple[int, int]:
+        total_bytes = 0
+        count = 0
+        values = (
+            ()
+            if messages_json == "[]"
+            else (messages_json,)
+            if isinstance(messages_json, str)
+            else messages_json
+        )
+        for position, content_json in enumerate(values):
+            encoded = content_json.encode("utf-8")
+            content_hash = hashlib.sha256(encoded).hexdigest()
+            byte_length = len(encoded)
+            self._db.execute(
+                "INSERT OR IGNORE INTO agent_history_message_blobs"
+                " (content_hash, content_json, byte_length) VALUES (?, ?, ?)",
+                (content_hash, content_json, byte_length),
+            )
+            self._db.execute(
+                "INSERT INTO agent_model_request_messages"
+                " (agent_id, sequence, ordinal, channel, position, content_hash)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (agent_id, sequence, ordinal, channel, position, content_hash),
+            )
+            total_bytes += byte_length
+            count += 1
+        return count, total_bytes
+
+    def start_model_request(
+        self,
+        agent_id: int,
+        sequence: int,
+        run_id: str,
+        window_number: int,
+        messages_json: Sequence[str],
+        parameters_json: str,
+        settings_json: str,
+        model_json: str,
+        streaming: bool,
+    ) -> ModelRequestHandle:
+        row = first(
+            self._db.execute(
+                "SELECT COALESCE(MAX(ordinal), 0) + 1 AS v FROM agent_model_requests"
+                " WHERE agent_id = ? AND sequence = ?",
+                (agent_id, sequence),
+            )
+        )
+        assert row is not None
+        ordinal = int(row["v"])
+        request_id = uuid.uuid4().hex
+        started = self._now()
+        with self._db:
+            input_count, input_length = self._store_message_refs(
+                agent_id, sequence, ordinal, "input", messages_json
+            )
+            self._db.execute(
+                "INSERT INTO agent_model_requests (agent_id, sequence, ordinal, request_id,"
+                " run_id, window_number, status, started_at, streaming, messages_json,"
+                " parameters_json, settings_json, model_json, input_count, input_length,"
+                " parameters_length, settings_length, model_length)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    agent_id,
+                    sequence,
+                    ordinal,
+                    request_id,
+                    run_id,
+                    window_number,
+                    started,
+                    int(streaming),
+                    parameters_json,
+                    settings_json,
+                    model_json,
+                    input_count,
+                    input_length,
+                    len(parameters_json.encode("utf-8")),
+                    len(settings_json.encode("utf-8")),
+                    len(model_json.encode("utf-8")),
+                ),
+            )
+        return ModelRequestHandle(ordinal, request_id)
+
+    def finish_model_request(
+        self,
+        agent_id: int,
+        sequence: int,
+        handle: ModelRequestHandle,
+        response_json: Sequence[str],
+    ) -> None:
+        with self._db:
+            response_count, response_length = self._store_message_refs(
+                agent_id, sequence, handle.ordinal, "response", response_json
+            )
+            cursor = self._db.execute_cursor(
+                "UPDATE agent_model_requests SET status = 'responded', completed_at = ?,"
+                " response_json = NULL, response_count = ?, response_length = ?,"
+                " error = NULL WHERE agent_id = ? AND sequence = ?"
+                " AND ordinal = ? AND request_id = ?",
+                (
+                    self._now(),
+                    response_count,
+                    response_length,
+                    agent_id,
+                    sequence,
+                    handle.ordinal,
+                    handle.request_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DomainError("not_found", "Model request does not exist")
+
+    def link_model_request(
+        self,
+        agent_id: int,
+        sequence: int,
+        handle: ModelRequestHandle,
+        messages_json: Sequence[str],
+    ) -> None:
+        with self._db:
+            related_count, _ = self._store_message_refs(
+                agent_id, sequence, handle.ordinal, "related", messages_json
+            )
+            cursor = self._db.execute_cursor(
+                "UPDATE agent_model_requests SET related_count = related_count + ?"
+                " WHERE agent_id = ? AND sequence = ? AND ordinal = ?"
+                " AND request_id = ?",
+                (
+                    related_count,
+                    agent_id,
+                    sequence,
+                    handle.ordinal,
+                    handle.request_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DomainError("not_found", "Model request does not exist")
+
+    def fail_model_request(
+        self,
+        agent_id: int,
+        sequence: int,
+        handle: ModelRequestHandle,
+        error: str,
+    ) -> None:
+        with self._db:
+            cursor = self._db.execute_cursor(
+                "UPDATE agent_model_requests SET status = 'failed', completed_at = ?,"
+                " error = ? WHERE agent_id = ? AND sequence = ? AND ordinal = ?"
+                " AND request_id = ?",
+                (
+                    self._now(),
+                    error,
+                    agent_id,
+                    sequence,
+                    handle.ordinal,
+                    handle.request_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DomainError("not_found", "Model request does not exist")
+
+    def _model_request_summary(self, row: sqlite3.Row) -> AgentModelRequestSummary:
+        return AgentModelRequestSummary(
+            ordinal=int(row["ordinal"]),
+            request_id=str(row["request_id"]),
+            run_id=str(row["run_id"]),
+            window_number=(
+                int(row["window_number"]) if row["window_number"] is not None else None
+            ),
+            status=str(row["status"]),
+            started_at=str(row["started_at"]),
+            completed_at=row["completed_at"],
+            streaming=bool(row["streaming"]),
+            input_length=int(row["input_length"]),
+            parameters_length=int(row["parameters_length"]),
+            settings_length=int(row["settings_length"]),
+            model_length=int(row["model_length"]),
+            response_length=int(row["response_length"]),
+            input_count=int(row["input_count"]),
+            response_count=int(row["response_count"]),
+            related_count=int(row["related_count"]),
+            error=row["error"],
+        )
+
+    def _history_run(self, row: sqlite3.Row) -> AgentHistoryRun:
+        return AgentHistoryRun(
+            sequence=int(row["sequence"]),
+            run_id=str(row["run_id"]),
+            status=str(row["status"]),
+            started_at=str(row["started_at"]),
+            completed_at=row["completed_at"],
+            usage_json=row["usage_json"],
+            error=row["error"],
+            window_number=(
+                int(row["window_number"]) if row["window_number"] is not None else None
+            ),
+            window_reset_at=row["window_reset_at"],
+            window_reason=row["window_reason"],
+            request_count=int(row["request_count"]),
+            last_saved_at=row["last_saved_at"],
+        )
+
+    def run_messages(self, agent_id: int, sequence: int) -> str | None:
+        row = first(
+            self._db.execute(
+                "SELECT messages_json FROM agent_runs WHERE agent_id = ? AND sequence = ?",
+                (agent_id, sequence),
+            )
+        )
+        return str(row["messages_json"]) if row is not None else None
+
+    def history_run(self, agent_id: int, sequence: int) -> AgentHistoryRun | None:
+        row = first(
+            self._db.execute(
+                "SELECT r.sequence, r.run_id, r.status, r.started_at, r.completed_at,"
+                " r.usage_json, r.error, r.last_saved_at, r.window_number,"
+                " (SELECT reset_at FROM agent_window_events w"
+                "  WHERE w.agent_id = r.agent_id AND w.number = r.window_number"
+                "  LIMIT 1) AS window_reset_at,"
+                " (SELECT reason FROM agent_window_events w"
+                "  WHERE w.agent_id = r.agent_id AND w.number = r.window_number"
+                "  LIMIT 1) AS window_reason,"
+                " (SELECT COUNT(*) FROM agent_model_requests m"
+                "  WHERE m.agent_id = r.agent_id AND m.sequence = r.sequence) AS request_count"
+                " FROM agent_runs r WHERE r.agent_id = ? AND r.sequence = ?",
+                (agent_id, sequence),
+            )
+        )
+        return self._history_run(row) if row is not None else None
+
+    def history_runs(
+        self,
+        agent_id: int,
+        *,
+        before: int | None = None,
+        limit: int = 30,
+    ) -> tuple[AgentHistoryRun, ...]:
+        clause = "" if before is None else " AND r.sequence < ?"
+        parameters: tuple[object, ...] = (
+            (agent_id,) if before is None else (agent_id, before)
+        )
+        rows = self._db.execute(
+            "SELECT r.sequence, r.run_id, r.status, r.started_at, r.completed_at,"
+            " r.usage_json, r.error, r.last_saved_at, r.window_number,"
+            " (SELECT reset_at FROM agent_window_events w"
+            "  WHERE w.agent_id = r.agent_id AND w.number = r.window_number"
+            "  LIMIT 1) AS window_reset_at,"
+            " (SELECT reason FROM agent_window_events w"
+            "  WHERE w.agent_id = r.agent_id AND w.number = r.window_number"
+            "  LIMIT 1) AS window_reason,"
+            " (SELECT COUNT(*) FROM agent_model_requests m"
+            "  WHERE m.agent_id = r.agent_id AND m.sequence = r.sequence) AS request_count"
+            " FROM agent_runs r WHERE r.agent_id = ?"
+            f"{clause} ORDER BY r.sequence DESC LIMIT ?",
+            (*parameters, limit),
+        )
+        return tuple(self._history_run(row) for row in rows)
+
+    def model_request_summaries(
+        self, agent_id: int, sequence: int
+    ) -> tuple[AgentModelRequestSummary, ...]:
+        rows = self._db.execute(
+            "SELECT ordinal, request_id, run_id, window_number, status, started_at,"
+            " completed_at, streaming, input_length, parameters_length, settings_length,"
+            " model_length, response_length, input_count, response_count, related_count, error"
+            " FROM agent_model_requests WHERE agent_id = ? AND sequence = ?"
+            " ORDER BY ordinal",
+            (agent_id, sequence),
+        )
+        return tuple(self._model_request_summary(row) for row in rows)
+
+    def model_request(
+        self, agent_id: int, sequence: int, ordinal: int
+    ) -> AgentModelRequest | None:
+        row = first(
+            self._db.execute(
+                "SELECT ordinal, request_id, run_id, window_number, status, started_at,"
+                " completed_at, streaming, input_length, parameters_length, settings_length,"
+                " model_length, response_length, input_count, response_count, related_count, error,"
+                " parameters_json, settings_json, model_json"
+                " FROM agent_model_requests WHERE agent_id = ? AND sequence = ? AND ordinal = ?",
+                (agent_id, sequence, ordinal),
+            )
+        )
+        return (
+            AgentModelRequest(
+                summary=self._model_request_summary(row),
+                parameters_json=str(row["parameters_json"]),
+                settings_json=str(row["settings_json"]),
+                model_json=str(row["model_json"]),
+            )
+            if row is not None
+            else None
+        )
+
+    def model_request_messages(
+        self,
+        agent_id: int,
+        sequence: int,
+        ordinal: int,
+        channel: str,
+        offset: int,
+        limit: int,
+    ) -> AgentMessagePage:
+        total_row = first(
+            self._db.execute(
+                "SELECT COUNT(*) AS total, COALESCE(SUM(b.byte_length), 0) AS total_bytes"
+                " FROM agent_model_request_messages r"
+                " JOIN agent_history_message_blobs b ON b.content_hash = r.content_hash"
+                " WHERE r.agent_id = ? AND r.sequence = ? AND r.ordinal = ? AND r.channel = ?",
+                (agent_id, sequence, ordinal, channel),
+            )
+        )
+        assert total_row is not None
+        rows = self._db.execute(
+            "SELECT b.content_json FROM agent_model_request_messages r"
+            " JOIN agent_history_message_blobs b ON b.content_hash = r.content_hash"
+            " WHERE r.agent_id = ? AND r.sequence = ? AND r.ordinal = ? AND r.channel = ?"
+            " ORDER BY r.position LIMIT ? OFFSET ?",
+            (agent_id, sequence, ordinal, channel, limit, offset),
+        )
+        total = int(total_row["total"])
+        return AgentMessagePage(
+            channel=channel,
+            offset=offset,
+            total=total,
+            total_bytes=int(total_row["total_bytes"]),
+            messages=tuple(str(row["content_json"]) for row in rows),
+            has_more=offset + len(rows) < total,
+        )
+
+    def model_request_message(
+        self,
+        agent_id: int,
+        sequence: int,
+        ordinal: int,
+        channel: str,
+        position: int,
+    ) -> str | None:
+        row = first(
+            self._db.execute(
+                "SELECT b.content_json FROM agent_model_request_messages r"
+                " JOIN agent_history_message_blobs b ON b.content_hash = r.content_hash"
+                " WHERE r.agent_id = ? AND r.sequence = ? AND r.ordinal = ?"
+                " AND r.channel = ? AND r.position = ?",
+                (agent_id, sequence, ordinal, channel, position),
+            )
+        )
+        return str(row["content_json"]) if row is not None else None
 
     def window(self, agent_id: int) -> WindowState:
         row = first(
@@ -392,16 +865,49 @@ class SqliteAgentStore:
         )
 
     def reset_window(self, agent_id: int, reason: str) -> WindowState:
+        current = self.window(agent_id)
+        number = current.number + 1
+        since_sequence_row = first(
+            self._db.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS v FROM agent_runs"
+                " WHERE agent_id = ?",
+                (agent_id,),
+            )
+        )
+        assert since_sequence_row is not None
+        since_sequence = int(since_sequence_row["v"])
+        reset_at = self._now()
         with self._db:
             self._db.execute(
-                "INSERT INTO agent_windows (agent_id, number, since_sequence, reset_at, reason)"
-                " VALUES (?, 2, (SELECT COALESCE(MAX(sequence), 0) + 1 FROM agent_runs"
-                " WHERE agent_id = ?), ?, ?) ON CONFLICT (agent_id) DO UPDATE SET"
-                " number = agent_windows.number + 1, since_sequence = excluded.since_sequence,"
-                " reset_at = excluded.reset_at, reason = excluded.reason",
-                (agent_id, agent_id, self._now(), reason),
+                "INSERT INTO agent_window_events"
+                " (agent_id, number, since_sequence, reset_at, reason)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (agent_id, number, since_sequence, reset_at, reason),
             )
-            return self.window(agent_id)
+            self._db.execute(
+                "INSERT INTO agent_windows (agent_id, number, since_sequence, reset_at, reason)"
+                " VALUES (?, ?, ?, ?, ?) ON CONFLICT (agent_id) DO UPDATE SET"
+                " number = excluded.number, since_sequence = excluded.since_sequence,"
+                " reset_at = excluded.reset_at, reason = excluded.reason",
+                (agent_id, number, since_sequence, reset_at, reason),
+            )
+        return WindowState(number, since_sequence, reset_at, reason)
+
+    def window_events(self, agent_id: int) -> tuple[WindowEvent, ...]:
+        rows = self._db.execute(
+            "SELECT number, since_sequence, reset_at, reason FROM agent_window_events"
+            " WHERE agent_id = ? ORDER BY number",
+            (agent_id,),
+        )
+        return tuple(
+            WindowEvent(
+                number=int(row["number"]),
+                since_sequence=int(row["since_sequence"]),
+                reset_at=row["reset_at"],
+                reason=row["reason"],
+            )
+            for row in rows
+        )
 
     def latest_messages(self, agent_id: int) -> str:
         row = first(
@@ -420,7 +926,8 @@ class SqliteAgentStore:
     ) -> HistorySlice | None:
         row = first(
             self._db.execute(
-                "SELECT sequence, status, started_at, length(messages_json) AS total_length "
+                "SELECT sequence, status, started_at, last_saved_at,"
+                " length(messages_json) AS total_length "
                 "FROM agent_runs WHERE agent_id = ? AND sequence = ?",
                 (agent_id, sequence),
             )
@@ -446,6 +953,7 @@ class SqliteAgentStore:
             messages=str(content["messages"]),
             offset=start,
             total_length=total_length,
+            last_saved_at=row["last_saved_at"],
         )
 
     def runs(self, agent_id: int, *, limit: int = 50) -> tuple[AgentRun, ...]:
@@ -551,11 +1059,17 @@ class SqliteAgentStore:
         return stored
 
     def mark_interrupted(self) -> int:
+        completed = self._now()
         with self._db:
             cursor = self._db.execute_cursor(
-                "UPDATE agent_runs SET status = 'interrupted', completed_at = ?"
-                " WHERE status = 'running'",
-                (self._now(),),
+                "UPDATE agent_runs SET status = 'interrupted', completed_at = ?,"
+                " last_saved_at = COALESCE(last_saved_at, ?) WHERE status = 'running'",
+                (completed, completed),
+            )
+            self._db.execute(
+                "UPDATE agent_model_requests SET status = 'interrupted', completed_at = ?"
+                " WHERE status = 'pending'",
+                (completed,),
             )
         return cursor.rowcount
 

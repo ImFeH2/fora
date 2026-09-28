@@ -146,12 +146,135 @@ export type TurnEffect = { ordinal: number; tool: string; summary: string };
 
 export type AgentRun = {
   sequence: number;
+  run_id?: string | null;
   status: string;
   started_at: string;
   completed_at: string | null;
+  last_saved_at?: string | null;
+  window_number?: number | null;
+  window_reset_at?: string | null;
+  window_reason?: string | null;
+  request_count?: number;
   usage: string | null;
   error: string | null;
   effects: TurnEffect[];
+};
+
+export type HistoryValue =
+  | null
+  | boolean
+  | number
+  | string
+  | HistoryValue[]
+  | { [key: string]: HistoryValue };
+
+export type HistoryMessages = {
+  messages: HistoryValue[];
+  offset: number;
+  total: number;
+  total_bytes?: number;
+  next_offset?: number;
+  has_more: boolean;
+};
+
+export type HistoryBinary = {
+  kind: "binary";
+  source: "run" | "input" | "response" | "related";
+  request_ordinal?: number;
+  message_index: number;
+  path: (string | number)[];
+  media_type: string;
+  size: number;
+  identifier: string | null;
+};
+
+export type HistoryText = {
+  kind: "text";
+  source: "history" | "run" | "input" | "response" | "related";
+  request_ordinal?: number;
+  message_index: number;
+  path: (string | number)[];
+  offset: number;
+  next_offset: number;
+  total_bytes: number;
+  value: string;
+  has_more: boolean;
+};
+
+export type AgentHistoryRun = {
+  sequence: number;
+  run_id: string;
+  status: string;
+  started_at: string;
+  completed_at: string | null;
+  last_saved_at: string | null;
+  window_number: number | null;
+  window_reset_at: string | null;
+  window_reason: string | null;
+  request_count: number;
+  usage: string | null;
+  error: string | null;
+  legacy: boolean;
+};
+
+export type AgentHistoryRequestSummary = {
+  ordinal: number;
+  request_id: string;
+  run_id: string;
+  window_number: number | null;
+  status: string;
+  started_at: string;
+  completed_at: string | null;
+  streaming: boolean;
+  input_length: number;
+  parameters_length: number;
+  settings_length: number;
+  model_length: number;
+  response_length: number;
+  input_count: number;
+  response_count: number;
+  related_count: number;
+  error: string | null;
+};
+
+export type AgentWindowEvent = {
+  number: number;
+  since_sequence: number;
+  reset_at: string | null;
+  reason: string | null;
+};
+
+export type AgentHistoryPage = {
+  agent_id: number;
+  runs: AgentHistoryRun[];
+  windows: AgentWindowEvent[];
+  has_before: boolean;
+  next_before: number | null;
+};
+
+export type AgentHistoryRead = {
+  agent_id: number;
+  run: AgentHistoryRun;
+  windows: AgentWindowEvent[];
+  requests: AgentHistoryRequestSummary[];
+  messages: HistoryMessages;
+  missing: string[];
+  request?: {
+    summary: AgentHistoryRequestSummary;
+    input: HistoryMessages;
+    parameters: HistoryValue;
+    settings: HistoryValue;
+    model: HistoryValue;
+    response: HistoryMessages | null;
+    related: HistoryMessages;
+  };
+};
+
+export type HistoryImage = {
+  media_type: string;
+  size: number;
+  identifier: string | null;
+  data: string;
 };
 
 export type Usage = {
@@ -254,6 +377,10 @@ const READ_METHODS = new Set([
   "discussion.page",
   "discussion.search",
   "agent.detail",
+  "agent.history",
+  "agent.history.read",
+  "agent.history.text",
+  "agent.history.image",
   "library.list",
   "library.read",
   "workspace.list",
@@ -1029,6 +1156,77 @@ export class Backend {
 
   agentDetail(agent_id: number) {
     return this.call<AgentDetail>("agent.detail", { agent_id });
+  }
+
+  agentHistory(agent_id: number, before?: number, limit = 30) {
+    return this.call<AgentHistoryPage>("agent.history", {
+      agent_id,
+      before,
+      limit,
+    });
+  }
+
+  agentHistoryRead(
+    agent_id: number,
+    sequence: number,
+    ordinal?: number,
+    message_offset = 0,
+    input_offset = 0,
+    response_offset = 0,
+    related_offset = 0,
+  ) {
+    return this.call<AgentHistoryRead>("agent.history.read", {
+      agent_id,
+      sequence,
+      ordinal,
+      message_offset,
+      message_limit: 100,
+      input_offset,
+      input_limit: 100,
+      response_offset,
+      response_limit: 100,
+      related_offset,
+      related_limit: 100,
+    });
+  }
+
+  agentHistoryText(
+    agent_id: number,
+    sequence: number,
+    text: Pick<HistoryText, "source" | "message_index" | "path"> & {
+      request_ordinal?: number;
+      offset: number;
+    },
+  ) {
+    return this.call<
+      Omit<HistoryText, "kind" | "source" | "message_index" | "path">
+    >("agent.history.text", {
+      agent_id,
+      sequence,
+      source: text.source,
+      ordinal: text.request_ordinal,
+      message_index: text.message_index,
+      path: text.path,
+      offset: text.offset,
+      limit: 16 * 1024,
+    });
+  }
+
+  agentHistoryImage(
+    agent_id: number,
+    sequence: number,
+    image: Pick<HistoryBinary, "source" | "message_index" | "path"> & {
+      request_ordinal?: number;
+    },
+  ) {
+    return this.call<HistoryImage>("agent.history.image", {
+      agent_id,
+      sequence,
+      source: image.source,
+      ordinal: image.request_ordinal,
+      message_index: image.message_index,
+      path: image.path,
+    });
   }
 
   library(path?: string) {

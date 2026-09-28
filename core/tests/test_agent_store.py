@@ -87,6 +87,98 @@ def test_runs_append_and_report_the_latest_history(
     assert agent_store.latest_messages(AGENT) == '[{"kind":"request"}]'
 
 
+def test_model_request_snapshots_keep_identity_payloads_and_progress_time(
+    agent_store: SqliteAgentStore,
+) -> None:
+    run = agent_store.start_run(AGENT)
+    handle = agent_store.start_model_request(
+        AGENT,
+        run.sequence,
+        run.run_id,
+        3,
+        '[{"kind":"request"}]',
+        '{"function_tools":[{"name":"tool"}]}',
+        '{"temperature":0.2}',
+        '{"model":"test-model"}',
+        False,
+    )
+    summaries = agent_store.model_request_summaries(AGENT, run.sequence)
+    assert summaries[0].ordinal == handle.ordinal == 1
+    assert summaries[0].request_id == handle.request_id
+    assert summaries[0].status == "pending"
+    assert summaries[0].response_length == 0
+    agent_store.finish_model_request(
+        AGENT, run.sequence, handle, '[{"kind":"response"}]'
+    )
+    record = agent_store.model_request(AGENT, run.sequence, handle.ordinal)
+    assert record is not None
+    assert record.summary.status == "responded"
+    assert record.summary.run_id == run.run_id
+    assert record.summary.input_count == 1
+    assert record.summary.response_count == 1
+    assert agent_store.model_request_messages(
+        AGENT, run.sequence, handle.ordinal, "input", 0, 10
+    ).messages == ('[{"kind":"request"}]',)
+    assert agent_store.model_request_messages(
+        AGENT, run.sequence, handle.ordinal, "response", 0, 10
+    ).messages == ('[{"kind":"response"}]',)
+    history_run = agent_store.history_run(AGENT, run.sequence)
+    assert history_run is not None
+    assert history_run.window_number == run.window_number == 1
+    assert history_run.request_count == 1
+    assert history_run.last_saved_at is not None
+    assert agent_store.history_runs(AGENT, limit=1)[0] == history_run
+
+
+def test_window_events_and_run_window_numbers_survive_restart(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "window-events.sqlite3"
+    store = SqliteStore(path)
+    agent_store = SqliteAgentStore(store._db)
+    first = agent_store.start_run(AGENT)
+    state = agent_store.reset_window(AGENT, "overflow")
+    second = agent_store.start_run(AGENT)
+    assert first.window_number == 1
+    assert second.window_number == state.number == 2
+    assert [event.number for event in agent_store.window_events(AGENT)] == [1, 2]
+    assert agent_store.window_events(AGENT)[1].reason == "overflow"
+    store.close()
+    restored = SqliteStore(path)
+    restored_agent_store = SqliteAgentStore(restored._db)
+    assert restored_agent_store.runs(AGENT, limit=2)[0].window_number == 2
+    assert (
+        restored_agent_store.window_events(AGENT)[1].since_sequence
+        == state.since_sequence
+    )
+    restored.close()
+
+
+def test_model_request_message_blobs_are_deduplicated_across_requests(
+    agent_store: SqliteAgentStore,
+) -> None:
+    run = agent_store.start_run(AGENT)
+    payload = "x" * (5 * 1024 * 1024)
+    first = agent_store.start_model_request(
+        AGENT, run.sequence, run.run_id, 1, (payload,), "{}", "{}", "{}", False
+    )
+    second = agent_store.start_model_request(
+        AGENT, run.sequence, run.run_id, 1, (payload,), "{}", "{}", "{}", False
+    )
+    blobs = agent_store._db.execute(
+        "SELECT COUNT(*) AS count, SUM(byte_length) AS bytes"
+        " FROM agent_history_message_blobs"
+    )[0]
+    refs = agent_store._db.execute(
+        "SELECT COUNT(*) AS count FROM agent_model_request_messages"
+    )[0]
+    assert first.ordinal == 1
+    assert second.ordinal == 2
+    assert blobs["count"] == 1
+    assert blobs["bytes"] == len(payload.encode())
+    assert refs["count"] == 2
+
+
 def test_reminder_snapshot_survives_upgrade_restart_and_window_reset(tmp_path) -> None:
     path = tmp_path / "huddol.sqlite3"
     base = SqliteStore(path)

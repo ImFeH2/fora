@@ -3,13 +3,19 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
 from huddol.core.errors import DomainError
 from huddol.core.parameters import AgentParameters, agent_parameters
-from huddol.ports.agent import AgentLifecycle, AgentRun, HistoryStore, SettingsStore
+from huddol.ports.agent import (
+    AgentLifecycle,
+    AgentRun,
+    HistoryStore,
+    ModelRequestHandle,
+    SettingsStore,
+)
 from huddol.ports.execution import ExecutionControl
 from huddol.ports.store import OrganizationStore
 from huddol.runtime.reminder import (
@@ -55,6 +61,62 @@ class FailedFinalization:
     messages: str
     usage: str | None
     error: str
+
+
+class _TurnRequestRecorder:
+    def __init__(
+        self,
+        history: HistoryStore,
+        run: AgentRun,
+        window_number: int,
+        progress: Callable[[str], None],
+    ) -> None:
+        self._history = history
+        self._run = run
+        self._window_number = window_number
+        self._progress = progress
+
+    def start(
+        self,
+        messages_json: Sequence[str],
+        parameters_json: str,
+        settings_json: str,
+        model_json: str,
+        streaming: bool,
+    ) -> ModelRequestHandle:
+        handle = self._history.start_model_request(
+            self._run.agent_id,
+            self._run.sequence,
+            self._run.run_id,
+            self._window_number,
+            messages_json,
+            parameters_json,
+            settings_json,
+            model_json,
+            streaming,
+        )
+        self._progress("request.started")
+        return handle
+
+    def response(
+        self, handle: ModelRequestHandle, response_json: Sequence[str]
+    ) -> None:
+        self._history.finish_model_request(
+            self._run.agent_id, self._run.sequence, handle, response_json
+        )
+        self._progress("request.response")
+
+    def related(self, handle: ModelRequestHandle, messages_json: Sequence[str]) -> None:
+        self._history.link_model_request(
+            self._run.agent_id, self._run.sequence, handle, messages_json
+        )
+        self._progress("tool.result")
+
+    def error(self, handle: ModelRequestHandle, error: str) -> None:
+        self._history.fail_model_request(
+            self._run.agent_id, self._run.sequence, handle, error
+        )
+        self._progress("request.error")
 
 
 class Scheduler:
@@ -609,10 +671,27 @@ class Scheduler:
         discussion_ids = tuple(item.discussion_id for item in items)
         persisted_history = prepared.history
 
+        def progress(phase: str) -> None:
+            saved = self.history.history_run(agent_id, run.sequence)
+            self.emit(
+                "turn.progress",
+                {
+                    "agent_id": agent_id,
+                    "sequence": run.sequence,
+                    "phase": phase,
+                    "saved_at": saved.last_saved_at if saved is not None else None,
+                },
+            )
+
+        request_recorder = _TurnRequestRecorder(
+            self.history, run, self.history.window(agent_id).number, progress
+        )
+
         def persist(messages_json: str) -> None:
             nonlocal persisted_history
             self.history.save_progress(agent_id, run.sequence, messages_json)
             persisted_history = messages_json
+            progress("history.saved")
 
         request = TurnRequest(
             agent_id=agent_id,
@@ -624,6 +703,7 @@ class Scheduler:
             resident="",
             environment=lambda: self.environment_facts(agent_id),
             persist=persist,
+            request_recorder=request_recorder,
             ephemeral=lambda: exchange_nudge(
                 self.store,
                 agent_id,

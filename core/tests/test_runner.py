@@ -2406,3 +2406,143 @@ def test_first_model_request_failure_preserves_snapshot(settings):
     resident = ModelMessagesTypeAdapter.validate_json(outcome.messages_json)[0]
     assert resident.metadata["huddol"]["agents_instructions"] == "raw\n "
     assert resident == ModelMessagesTypeAdapter.validate_json(persisted[0])[0]
+
+
+def test_live_model_records_the_provider_boundary_after_outgoing_changes(settings):
+    started = []
+    responses = []
+
+    class Recorder:
+        def start(
+            self, messages_json, parameters_json, settings_json, model_json, streaming
+        ):
+            started.append(
+                (messages_json, parameters_json, settings_json, model_json, streaming)
+            )
+            return "request-1"
+
+        def response(self, handle, response_json):
+            responses.append((handle, response_json))
+
+        def related(self, handle, messages_json):
+            raise AssertionError(handle)
+
+        def error(self, handle, error):
+            raise AssertionError(error)
+
+    wrapped = FunctionModel(
+        lambda messages, info: ModelResponse(parts=[TextPart("ok")])
+    )
+    live = LiveModel(
+        lambda: wrapped,
+        lambda: "EPHEMERAL",
+        "cache-key",
+        request_recorder=Recorder(),
+        model_snapshot={"model": "test-model"},
+    )
+    asyncio.run(
+        live.request(
+            [ModelRequest(parts=[UserPromptPart("input")])],
+            None,
+            ModelRequestParameters(),
+        )
+    )
+    assert len(started) == 1
+    assert len(started[0][0]) == 1
+    sent_messages = ModelMessagesTypeAdapter.validate_json(started[0][0][0])
+    assert sent_messages[-1].parts[-1].content == "EPHEMERAL"
+    assert json.loads(started[0][1])["function_tools"] == []
+    assert json.loads(started[0][3])["model"] == "test-model"
+    assert started[0][4] is False
+    assert responses[0][0] == "request-1"
+    assert (
+        ModelMessagesTypeAdapter.validate_json(responses[0][1][0])[-1].parts[0].content
+        == "ok"
+    )
+
+
+def test_live_model_links_tool_results_to_the_current_request(settings):
+    related = []
+    starts = 0
+
+    class Recorder:
+        def start(
+            self, messages_json, parameters_json, settings_json, model_json, streaming
+        ):
+            nonlocal starts
+            starts += 1
+            return f"request-{starts}"
+
+        def response(self, handle, response_json):
+            pass
+
+        def related(self, handle, messages_json):
+            related.append((handle, messages_json))
+
+        def error(self, handle, error):
+            raise AssertionError(error)
+
+    responses = iter(
+        [
+            ModelResponse(
+                parts=[ToolCallPart("tool", {"value": 1}, tool_call_id="call-1")]
+            ),
+            ModelResponse(parts=[TextPart("done")]),
+        ]
+    )
+    wrapped = FunctionModel(lambda messages, info: next(responses))
+    live = LiveModel(
+        lambda: wrapped,
+        lambda: "",
+        "cache-key",
+        request_recorder=Recorder(),
+    )
+    parameters = ModelRequestParameters()
+    first_messages = [ModelRequest(parts=[UserPromptPart("input")])]
+    first_response = asyncio.run(live.request(first_messages, None, parameters))
+    second_messages = [
+        *first_messages,
+        first_response,
+        ModelRequest(parts=[ToolReturnPart("tool", "result", tool_call_id="call-1")]),
+    ]
+    asyncio.run(live.request(second_messages, None, parameters))
+    assert len(related) == 1
+    linked = ModelMessagesTypeAdapter.validate_json(related[0][1][0])
+    assert linked[0].parts[0].part_kind == "tool-return"
+
+
+def test_live_model_request_snapshot_failure_prevents_provider_call(settings):
+    calls = []
+
+    class Recorder:
+        def start(
+            self, messages_json, parameters_json, settings_json, model_json, streaming
+        ):
+            raise OSError("snapshot unavailable")
+
+        def response(self, handle, response_json):
+            raise AssertionError(handle)
+
+        def error(self, handle, error):
+            raise AssertionError(handle)
+
+    def respond(messages, info):
+        calls.append(1)
+        return ModelResponse(parts=[TextPart("ok")])
+
+    wrapped = FunctionModel(respond)
+    live = LiveModel(
+        lambda: wrapped,
+        lambda: "",
+        "cache-key",
+        request_recorder=Recorder(),
+    )
+    with pytest.raises(HistoryPersistenceError):
+        asyncio.run(
+            live.request(
+                [ModelRequest(parts=[UserPromptPart("input")])],
+                None,
+                ModelRequestParameters(),
+            )
+        )
+    assert calls == []

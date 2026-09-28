@@ -1572,6 +1572,11 @@ def test_turn_model_snapshot_survives_history_saving_and_failure(
     assert calls == [first.resolve(MAIN)] * expected_calls
     assert len(executions) == expected_tools
     assert built == ([first.resolve(MAIN)] if expected_calls else [])
+    requests = world.history.model_request_summaries(MAIN, result.sequence)
+    assert len(requests) == expected_calls
+    assert all(
+        item.run_id == world.history.runs(MAIN, limit=1)[0].run_id for item in requests
+    )
     assert world.history.window(MAIN) == window
     history = world.history.latest_messages(MAIN)
     assert history == (saved[-1] if saved else "[]")

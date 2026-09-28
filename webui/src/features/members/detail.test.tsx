@@ -8,11 +8,17 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { TreeView } from "@/features/library/tree-view";
 import {
   AgentDetailStatus,
+  HistorySection,
   MemberPage,
   WorkspaceContent,
   WorkspaceSection,
 } from "@/features/members/detail";
-import { type AgentDetail, backend, type LibraryEntry } from "@/lib/backend";
+import {
+  type AgentDetail,
+  type AgentRun,
+  backend,
+  type LibraryEntry,
+} from "@/lib/backend";
 
 vi.mock("@/components/ui/dialog", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/components/ui/dialog")>()),
@@ -141,6 +147,33 @@ describe("Agent detail status", () => {
     expect(html).toContain("Window 1,200");
     expect(html).toContain("<button");
     expect(html).not.toContain("title=");
+  });
+});
+
+describe("Agent history", () => {
+  it("shows the complete Turn entry and request count", () => {
+    const run: AgentRun = {
+      sequence: 4,
+      run_id: "run-4",
+      status: "failed",
+      started_at: "2026-01-01T00:00:00Z",
+      completed_at: "2026-01-01T00:01:00Z",
+      last_saved_at: "2026-01-01T00:00:30Z",
+      window_number: 2,
+      request_count: 2,
+      usage: null,
+      error: "Provider failed",
+      effects: [],
+    };
+    const html = renderToStaticMarkup(
+      <TooltipProvider>
+        <HistorySection agentId={2} initialRuns={[run]} />
+      </TooltipProvider>,
+    );
+    expect(html).toContain("History");
+    expect(html).toContain("2 model requests");
+    expect(html).toContain("View full context");
+    expect(html).toContain("Provider failed");
   });
 });
 
