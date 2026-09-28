@@ -821,6 +821,72 @@ def test_agent_tools_create_and_query_model_selection_atomically(world) -> None:
     assert changes == [("member.created", created)]
 
 
+def test_agent_tools_hide_models_with_disabled_providers_and_reject_them(world) -> None:
+    world.settings.set_settings(
+        "model",
+        {
+            "version": 2,
+            "providers": [
+                {
+                    "id": "provider",
+                    "name": "Provider",
+                    "api_type": "openai-chat",
+                    "base_url": "https://provider.invalid/v1",
+                    "api_key": "private-key",
+                    "enabled": False,
+                }
+            ],
+            "models": [
+                {
+                    "id": "model",
+                    "provider_id": "provider",
+                    "name": "Model",
+                    "model": "custom-model",
+                    "enabled": True,
+                    "thinking_budget_tokens": None,
+                }
+            ],
+            "default_model_id": None,
+            "default_thinking": "default",
+            "agent_configs": {},
+        },
+    )
+    changes: list[tuple[str, dict[str, object]]] = []
+    human = tools_for(
+        world,
+        HUMAN,
+        on_change=lambda name, payload: changes.append((name, payload)),
+    )
+    assert human.list_models() == {
+        "models": [
+            {
+                "id": "model",
+                "name": "Model",
+                "enabled": False,
+                "thinking_options": [
+                    "default",
+                    "none",
+                    "minimal",
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                ],
+                "thinking_budget_tokens": None,
+            }
+        ],
+        "default_model_id": None,
+        "default_thinking": "default",
+    }
+    before = world.store.list_members()
+    with pytest.raises(DomainError) as error:
+        human.create_agent("Rejected", {"model_id": "model", "thinking": "default"})
+    assert error.value.code == "model_in_use"
+    assert world.store.list_members() == before
+    assert changes == []
+
+
 def test_runtime_organization_creates_and_reads_model_selection(world) -> None:
     world.settings.set_settings(
         "model",

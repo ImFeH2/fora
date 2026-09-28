@@ -636,7 +636,8 @@ class SqliteAgentStore:
                 {
                     "id": model.id,
                     "name": model.name,
-                    "enabled": model.enabled,
+                    "enabled": model.enabled
+                    and catalog.provider(model.provider_id).enabled,
                     "thinking_options": thinking_options(
                         catalog.provider(model.provider_id).api_type,
                         model.model,
