@@ -1043,3 +1043,41 @@ def test_the_full_tool_surface_matches_the_specification() -> None:
         "view_attachment",
         "view_image",
     }
+
+
+def test_organization_schema_exposes_the_shared_agent_model_config() -> None:
+    from test_runner import FakeSettings
+
+    from huddol.adapters.model.runner import PydanticModelRunner
+
+    tool = PydanticModelRunner(FakeSettings())._agent._function_toolset.tools[
+        "organization"
+    ]
+    schema = tool.function_schema.json_schema
+    model_config = schema["properties"]["model_config"]
+    assert model_config["anyOf"][0]["$ref"] == "#/$defs/AgentModelConfig"
+    assert schema["$defs"]["AgentModelConfig"]["properties"] == {
+        "model_id": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None},
+        "thinking": {
+            "anyOf": [
+                {
+                    "enum": [
+                        "default",
+                        "none",
+                        "minimal",
+                        "low",
+                        "medium",
+                        "high",
+                        "xhigh",
+                        "max",
+                        "budget",
+                    ],
+                    "type": "string",
+                },
+                {"type": "null"},
+            ],
+            "default": None,
+        },
+    }
+    assert "list_models" in tool.description
+    assert "inherits" in tool.description

@@ -68,7 +68,12 @@ from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import RunUsage, UsageLimits
 
-from huddol.adapters.model.config import ModelCatalog, ModelConfig, thinking_settings
+from huddol.adapters.model.config import (
+    AgentModelConfig,
+    ModelCatalog,
+    ModelConfig,
+    thinking_settings,
+)
 from huddol.adapters.model.observability import (
     Observability,
     ObservabilityConfig,
@@ -467,19 +472,40 @@ class PydanticModelRunner:
 
             return register
 
-        @tool(sequential=True)
+        @tool(
+            sequential=True,
+            description=(
+                "Manage organization Members and Agent model settings. "
+                "list_models returns public model IDs, thinking options, budgets, and defaults. "
+                "get_model returns an Agent's saved model_config and effective selection. "
+                "create_agent accepts model_config with optional model_id and thinking fields; "
+                "omitting the object or either field inherits the matching global setting, "
+                "while thinking=default keeps the model's default thinking behavior."
+            ),
+        )
         def organization(
             ctx: RunContext[AgentTools],
             action: str,
             member_id: int | None = None,
             name: str | None = None,
+            model_config: AgentModelConfig | None = None,
         ) -> Any:
             tools = ctx.deps
             if action == "list_members":
                 return _guard(tools.list_members)
+            if action == "list_models":
+                return _guard(tools.list_models)
+            if action in ("get_model", "get_agent_model"):
+                return _guard(
+                    lambda: tools.get_agent_model(
+                        _required(member_id, "member_id", action)
+                    )
+                )
             if action == "create_agent":
                 return _guard(
-                    lambda: tools.create_agent(_required(name, "name", action))
+                    lambda: tools.create_agent(
+                        _required(name, "name", action), model_config
+                    )
                 )
             if action == "rename_member":
                 return _guard(

@@ -168,3 +168,14 @@ class SettingsStore(Protocol):
         section: str,
         update: Callable[[dict[str, object] | None], dict[str, object]],
     ) -> dict[str, object]: ...
+
+    def create_agent_with_model(
+        self,
+        name: str,
+        model_config: object | None,
+        create_member: Callable[[str], dict[str, object]],
+    ) -> dict[str, object]: ...
+
+    def model_catalog(self) -> dict[str, object]: ...
+
+    def agent_model_selection(self, agent_id: int) -> dict[str, object]: ...

@@ -4,10 +4,8 @@ from collections.abc import Callable
 from dataclasses import asdict
 from typing import Any
 
-from pydantic import ValidationError
-
 from huddol.adapters.jsonl.protocol import Dispatcher
-from huddol.adapters.model.config import AgentModelConfig, ModelCatalog
+from huddol.adapters.model.config import ModelCatalog
 from huddol.adapters.voice.config import VoiceConfig
 from huddol.core.errors import DomainError
 from huddol.core.parameters import agent_parameters, validate_parameters
@@ -83,27 +81,9 @@ class Api:
             }
 
         def create_agent(params: dict[str, Any]) -> Any:
-            result: dict[str, Any] = {}
-
-            def create(stored: dict[str, object] | None) -> dict[str, object]:
-                nonlocal result
-                catalog = ModelCatalog.restore(stored)
-                try:
-                    selection = AgentModelConfig.model_validate(
-                        params.get("model_config", {})
-                    )
-                except ValidationError:
-                    raise DomainError(
-                        "invalid_model_config", "Invalid Agent model configuration"
-                    ) from None
-                catalog.validate_selection(selection, "New Agent")
-                result = self._human().create_agent(str(params.get("name", "")))
-                catalog.agent_configs[str(result["id"])] = selection
-                return catalog.model_dump()
-
-            settings.update_settings("model", create)
-            self._changed("member.created", result)
-            return result
+            return self._human().create_agent(
+                str(params.get("name", "")), params.get("model_config")
+            )
 
         def rename_member(params: dict[str, Any]) -> Any:
             result = self._human().rename_member(

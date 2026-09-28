@@ -22,6 +22,7 @@ from huddol.adapters.files.tree import DirectoryTree
 from huddol.adapters.files.uploads import DirectoryUploads, decode_image
 from huddol.adapters.jsonl.api import HUMAN_ID, Api
 from huddol.adapters.jsonl.protocol import Dispatcher, parse, wait_for_shutdown
+from huddol.adapters.model.config import ModelCatalog
 from huddol.adapters.model.runner import PydanticModelRunner
 from huddol.adapters.sqlite.agent import SqliteAgentStore
 from huddol.adapters.sqlite.store import SqliteStore
@@ -737,6 +738,77 @@ def test_agent_creation_and_model_configuration_are_atomic(server) -> None:
         frame for frame in output.frames() if frame.get("type") == "member.created"
     ]
     assert len(created_events) == 1
+
+
+def test_agent_creation_uses_model_selection_and_keeps_queries_public(server) -> None:
+    dispatcher, output, deps = server
+    deps.settings.set_settings(
+        "model",
+        {
+            "version": 2,
+            "providers": [
+                {
+                    "id": "provider",
+                    "name": "Provider",
+                    "api_type": "anthropic",
+                    "base_url": "https://provider.invalid",
+                    "api_key": "private-key",
+                    "enabled": True,
+                }
+            ],
+            "models": [
+                {
+                    "id": "model",
+                    "provider_id": "provider",
+                    "name": "Model",
+                    "model": "claude-sonnet",
+                    "enabled": True,
+                    "thinking_budget_tokens": 4096,
+                }
+            ],
+            "default_model_id": "model",
+            "default_thinking": "high",
+            "agent_configs": {},
+        },
+    )
+    created = call(
+        dispatcher,
+        output,
+        "organization.create_agent",
+        name="Configured",
+        model_config={"model_id": "model", "thinking": "budget"},
+    )["result"]
+    stored = deps.settings.get_settings("model")
+    assert stored["agent_configs"][str(created["id"])] == {
+        "model_id": "model",
+        "thinking": "budget",
+    }
+    assert ModelCatalog.restore(stored).resolve(created["id"]).thinking == "budget"
+    selected = deps.settings.agent_model_selection(created["id"])
+    assert selected == {
+        "agent_id": created["id"],
+        "model_config": {"model_id": "model", "thinking": "budget"},
+        "effective": {"model_id": "model", "thinking": "budget"},
+    }
+    catalog = deps.settings.model_catalog()
+    assert "private-key" not in json.dumps(catalog)
+    assert "budget" in catalog["models"][0]["thinking_options"]
+
+    before = deps.store.list_members()
+    rejected = call(
+        dispatcher,
+        output,
+        "organization.create_agent",
+        name="Rejected",
+        model_config={"model_id": "missing", "thinking": "default"},
+    )
+    assert rejected["error"]["code"] == "model_not_found"
+    assert deps.store.list_members() == before
+    assert not any(
+        frame.get("name") == "Rejected"
+        for frame in output.frames()
+        if frame.get("type") == "member.created"
+    )
 
 
 def test_settings_never_return_the_api_key(server) -> None:

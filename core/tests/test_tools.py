@@ -739,6 +739,175 @@ def test_duplicate_agent_names_are_rejected(world) -> None:
     assert error.value.code == "duplicate_name"
 
 
+def test_agent_tools_create_and_query_model_selection_atomically(world) -> None:
+    world.settings.set_settings(
+        "model",
+        {
+            "version": 2,
+            "providers": [
+                {
+                    "id": "provider",
+                    "name": "Provider",
+                    "api_type": "anthropic",
+                    "base_url": "https://provider.invalid",
+                    "api_key": "private-key",
+                    "enabled": True,
+                }
+            ],
+            "models": [
+                {
+                    "id": "model",
+                    "provider_id": "provider",
+                    "name": "Model",
+                    "model": "claude-sonnet",
+                    "enabled": True,
+                    "thinking_budget_tokens": 4096,
+                }
+            ],
+            "default_model_id": "model",
+            "default_thinking": "high",
+            "agent_configs": {},
+        },
+    )
+    changes: list[tuple[str, dict[str, object]]] = []
+    human = tools_for(
+        world,
+        HUMAN,
+        on_change=lambda name, payload: changes.append((name, payload)),
+    )
+    created = human.create_agent(
+        "Configured", {"model_id": "model", "thinking": "budget"}
+    )
+    assert created["name"] == "Configured"
+    assert changes == [("member.created", created)]
+    assert human.get_agent_model(created["id"]) == {
+        "agent_id": created["id"],
+        "model_config": {"model_id": "model", "thinking": "budget"},
+        "effective": {"model_id": "model", "thinking": "budget"},
+    }
+    catalog = human.list_models()
+    assert "private-key" not in json.dumps(catalog)
+    assert "budget" in catalog["models"][0]["thinking_options"]
+
+    before = world.store.list_members()
+    with pytest.raises(DomainError) as error:
+        human.create_agent("Rejected", {"model_id": "missing", "thinking": "default"})
+    assert error.value.code == "model_not_found"
+    assert world.store.list_members() == before
+    assert changes == [("member.created", created)]
+
+
+def test_runtime_organization_creates_and_reads_model_selection(world) -> None:
+    world.settings.set_settings(
+        "model",
+        {
+            "version": 2,
+            "providers": [
+                {
+                    "id": "provider",
+                    "name": "Provider",
+                    "api_type": "openai-chat",
+                    "base_url": "https://provider.invalid/v1",
+                    "api_key": "private-key",
+                    "enabled": True,
+                }
+            ],
+            "models": [
+                {
+                    "id": "model",
+                    "provider_id": "provider",
+                    "name": "Model",
+                    "model": "custom-model",
+                    "enabled": True,
+                    "thinking_budget_tokens": None,
+                }
+            ],
+            "default_model_id": "model",
+            "default_thinking": "high",
+            "agent_configs": {},
+        },
+    )
+    tools = tools_for(world, MAIN)
+    returned: list[dict[str, object]] = []
+    created_id: int | None = None
+
+    def respond(messages, info):
+        nonlocal created_id
+        organization_returns = [
+            part
+            for message in messages
+            for part in message.parts
+            if isinstance(part, ToolReturnPart) and part.tool_name == "organization"
+        ]
+        if not organization_returns:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "organization",
+                        {
+                            "action": "create_agent",
+                            "name": "Runtime Child",
+                            "model_config": {
+                                "model_id": "model",
+                                "thinking": "default",
+                            },
+                        },
+                        tool_call_id="create",
+                    )
+                ]
+            )
+        if created_id is None:
+            result = organization_returns[-1].content
+            assert isinstance(result, dict)
+            created_id = int(result["id"])
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "organization",
+                        {"action": "get_model", "member_id": created_id},
+                        tool_call_id="query",
+                    )
+                ]
+            )
+        returned.append(organization_returns[-1].content)
+        return ModelResponse(parts=[TextPart("done")])
+
+    reminder = Reminder(
+        MAIN,
+        "Main",
+        (ReminderItem(1, "model setup", 1, 1, "You", False),),
+    )
+    request = TurnRequest(
+        agent_id=MAIN,
+        sequence=1,
+        agent_name="Main",
+        prompt=reminder.render(),
+        reminder=reminder,
+        history_json="[]",
+        resident="",
+        environment=lambda: "environment",
+        ephemeral=lambda: "",
+        persist=lambda messages_json: None,
+    )
+    runner = PydanticModelRunner(
+        world.settings, build_model=lambda config: FunctionModel(respond)
+    )
+    outcome = runner.run(request, tools)
+    assert outcome.error is None
+    assert created_id is not None
+    assert returned == [
+        {
+            "agent_id": created_id,
+            "model_config": {"model_id": "model", "thinking": "default"},
+            "effective": {"model_id": "model", "thinking": "default"},
+        }
+    ]
+    assert world.settings.get_settings("model")["agent_configs"][str(created_id)] == {
+        "model_id": "model",
+        "thinking": "default",
+    }
+
+
 def test_running_agents_cannot_be_deleted(world) -> None:
     world.store.set_agent_state(MAIN, "running")
     with pytest.raises(DomainError) as error:

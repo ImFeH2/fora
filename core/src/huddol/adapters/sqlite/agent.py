@@ -5,7 +5,9 @@ import sqlite3
 import uuid
 from collections.abc import Callable, Sequence
 
-from huddol.adapters.model.config import ModelCatalog
+from pydantic import ValidationError
+
+from huddol.adapters.model.config import AgentModelConfig, ModelCatalog
 from huddol.adapters.sqlite.store import LockedConnection, first
 from huddol.core.errors import DomainError
 from huddol.ports.agent import (
@@ -595,6 +597,46 @@ class SqliteAgentStore:
                 "invalid_setting", f"Settings section {section} must be a JSON object"
             )
         return loaded
+
+    def create_agent_with_model(
+        self,
+        name: str,
+        model_config: object | None,
+        create_member: Callable[[str], dict[str, object]],
+    ) -> dict[str, object]:
+        result: dict[str, object] = {}
+
+        def update(stored: dict[str, object] | None) -> dict[str, object]:
+            nonlocal result
+            catalog = ModelCatalog.restore(stored)
+            try:
+                selection = AgentModelConfig.model_validate(
+                    {} if model_config is None else model_config
+                )
+            except ValidationError:
+                raise DomainError(
+                    "invalid_model_config", "Invalid Agent model configuration"
+                ) from None
+            catalog.validate_selection(selection, "New Agent")
+            result = create_member(name)
+            catalog.agent_configs[str(result["id"])] = selection
+            return catalog.model_dump()
+
+        self.update_settings("model", update)
+        return result
+
+    def model_catalog(self) -> dict[str, object]:
+        return ModelCatalog.restore(self.get_settings("model")).redacted()
+
+    def agent_model_selection(self, agent_id: int) -> dict[str, object]:
+        catalog = ModelCatalog.restore(self.get_settings("model"))
+        saved = catalog.agent_configs.get(str(agent_id), AgentModelConfig())
+        model_id, thinking = catalog.selection(agent_id)
+        return {
+            "agent_id": agent_id,
+            "model_config": saved.model_dump(),
+            "effective": {"model_id": model_id, "thinking": thinking},
+        }
 
     def update_settings(
         self,

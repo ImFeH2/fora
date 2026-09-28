@@ -114,13 +114,32 @@ class AgentTools:
             for item in self._deps.store.list_members(include_deleted=include_deleted)
         ]
 
-    def create_agent(self, name: str) -> dict[str, Any]:
+    def _create_agent_member(self, name: str) -> dict[str, object]:
+        if self._deps.store.name_taken(name):
+            raise DomainError("duplicate_name", "Member names must be unique")
+        member = self._deps.store.create_member("agent", name)
+        return {"id": member.id, "name": member.name, "state": member.state}
+
+    def create_agent(
+        self, name: str, model_config: object | None = None
+    ) -> dict[str, Any]:
         self._check("organization.create_agent")
         validated = validate_name(name)
-        if self._deps.store.name_taken(validated):
-            raise DomainError("duplicate_name", "Member names must be unique")
-        member = self._deps.store.create_member("agent", validated)
-        return {"id": member.id, "name": member.name, "state": member.state}
+        result = self._deps.settings.create_agent_with_model(
+            validated, model_config, self._create_agent_member
+        )
+        return self._changed("member.created", result)
+
+    def list_models(self) -> dict[str, object]:
+        self._check("organization.list_models")
+        return self._deps.settings.model_catalog()
+
+    def get_agent_model(self, agent_id: int) -> dict[str, object]:
+        self._check("organization.get_model", agent_id)
+        member = self._deps.store.get_member(agent_id)
+        if member is None or not member.is_agent or member.deleted:
+            raise DomainError("not_found", f"Agent {agent_id} does not exist")
+        return self._deps.settings.agent_model_selection(agent_id)
 
     def rename_member(self, member_id: int, name: str) -> dict[str, Any]:
         self._check("organization.rename_member", member_id)
