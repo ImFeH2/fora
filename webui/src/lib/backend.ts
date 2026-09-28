@@ -190,7 +190,15 @@ export type HistoryBinary = {
 
 export type HistoryText = {
   kind: "text";
-  source: "history" | "run" | "input" | "response" | "related";
+  source:
+    | "history"
+    | "run"
+    | "input"
+    | "response"
+    | "related"
+    | "parameters"
+    | "settings"
+    | "model";
   request_ordinal?: number;
   message_index: number;
   path: (string | number)[];
@@ -250,21 +258,27 @@ export type AgentHistoryPage = {
   windows: AgentWindowEvent[];
   has_before: boolean;
   next_before: number | null;
+  windows_has_more: boolean;
+  windows_next_after: number | null;
 };
 
 export type AgentHistoryRead = {
   agent_id: number;
   run: AgentHistoryRun;
   windows: AgentWindowEvent[];
+  windows_has_more: boolean;
+  windows_next_after: number | null;
   requests: AgentHistoryRequestSummary[];
+  requests_has_more: boolean;
+  requests_next_after: number | null;
   messages: HistoryMessages;
   missing: string[];
   request?: {
     summary: AgentHistoryRequestSummary;
     input: HistoryMessages;
-    parameters: HistoryValue;
-    settings: HistoryValue;
-    model: HistoryValue;
+    parameters: HistoryText;
+    settings: HistoryText;
+    model: HistoryText;
     response: HistoryMessages | null;
     related: HistoryMessages;
   };
@@ -1158,11 +1172,19 @@ export class Backend {
     return this.call<AgentDetail>("agent.detail", { agent_id });
   }
 
-  agentHistory(agent_id: number, before?: number, limit = 30) {
+  agentHistory(
+    agent_id: number,
+    before?: number,
+    limit = 30,
+    windows_after?: number,
+    windows_limit = 30,
+  ) {
     return this.call<AgentHistoryPage>("agent.history", {
       agent_id,
       before,
       limit,
+      windows_after,
+      windows_limit,
     });
   }
 
@@ -1174,6 +1196,13 @@ export class Backend {
     input_offset = 0,
     response_offset = 0,
     related_offset = 0,
+    options: {
+      requestAfter?: number;
+      windowsAfter?: number;
+      parametersOffset?: number;
+      settingsOffset?: number;
+      modelOffset?: number;
+    } = {},
   ) {
     return this.call<AgentHistoryRead>("agent.history.read", {
       agent_id,
@@ -1187,6 +1216,14 @@ export class Backend {
       response_limit: 100,
       related_offset,
       related_limit: 100,
+      request_after: options.requestAfter,
+      request_limit: 30,
+      windows_after: options.windowsAfter,
+      windows_limit: 30,
+      parameters_offset: options.parametersOffset,
+      settings_offset: options.settingsOffset,
+      model_offset: options.modelOffset,
+      field_limit: 16 * 1024,
     });
   }
 

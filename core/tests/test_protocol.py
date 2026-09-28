@@ -1258,9 +1258,50 @@ def test_agent_history_protocol_reads_turn_requests_and_legacy_data(server) -> N
         sequence=run.sequence,
     )["result"]
     assert read["requests"][0]["request_id"] == handle.request_id
-    assert read["request"]["parameters"] == {"function_tools": [{"name": "tool"}]}
-    assert read["request"]["model"] == {"model": "test-model"}
+    assert read["request"]["parameters"]["kind"] == "text"
+    assert (
+        read["request"]["parameters"]["value"] == '{"function_tools":[{"name":"tool"}]}'
+    )
+    assert read["request"]["model"]["kind"] == "text"
+    assert read["request"]["model"]["value"] == '{"model":"test-model"}'
     assert read["request"]["response"] is None
+
+    second_handle = deps.history.start_model_request(
+        agent_id,
+        run.sequence,
+        run.run_id,
+        1,
+        "[]",
+        "{}",
+        "{}",
+        "{}",
+        False,
+    )
+    deps.history.reset_window(agent_id, "overflow")
+    paged = call(
+        dispatcher,
+        output,
+        "agent.history.read",
+        agent_id=agent_id,
+        sequence=run.sequence,
+        request_limit=1,
+        windows_limit=1,
+    )["result"]
+    assert paged["requests_has_more"] is True
+    assert paged["windows_has_more"] is True
+    next_page = call(
+        dispatcher,
+        output,
+        "agent.history.read",
+        agent_id=agent_id,
+        sequence=run.sequence,
+        request_after=paged["requests_next_after"],
+        windows_after=paged["windows_next_after"],
+        request_limit=1,
+        windows_limit=1,
+    )["result"]
+    assert next_page["requests"][0]["ordinal"] == second_handle.ordinal
+    assert next_page["windows"][0]["number"] == 2
 
     legacy = deps.history.start_run(agent_id)
     deps.history.finish_run(
@@ -1487,6 +1528,44 @@ def test_agent_history_text_is_bounded_and_continuable(server) -> None:
     )["result"]
     assert following["value"]
     assert following["offset"] == value["next_offset"]
+
+    large_parameters = '{"value":"' + "汉" * 12_000 + '"}'
+    large_handle = deps.history.start_model_request(
+        agent_id,
+        run.sequence,
+        run.run_id,
+        1,
+        "[]",
+        large_parameters,
+        "{}",
+        "{}",
+        False,
+    )
+    large_read = call(
+        dispatcher,
+        output,
+        "agent.history.read",
+        agent_id=agent_id,
+        sequence=run.sequence,
+        ordinal=large_handle.ordinal,
+    )["result"]
+    field = large_read["request"]["parameters"]
+    assert len(field["value"].encode()) <= 16 * 1024
+    assert field["has_more"] is True
+    field_following = call(
+        dispatcher,
+        output,
+        "agent.history.text",
+        agent_id=agent_id,
+        sequence=run.sequence,
+        source="parameters",
+        ordinal=large_handle.ordinal,
+        message_index=0,
+        path=[],
+        offset=field["next_offset"],
+    )["result"]
+    assert field_following["value"]
+    assert field_following["offset"] == field["next_offset"]
 
 
 def test_agent_detail_reports_each_turn_output_and_the_idle_streak(server) -> None:

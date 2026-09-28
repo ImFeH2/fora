@@ -85,9 +85,18 @@ class AgentModelRequestSummary:
 @dataclass(frozen=True)
 class AgentModelRequest:
     summary: AgentModelRequestSummary
-    parameters_json: str
-    settings_json: str
-    model_json: str
+    parameters_json: str | None = None
+    settings_json: str | None = None
+    model_json: str | None = None
+
+
+@dataclass(frozen=True)
+class AgentTextPage:
+    field: str
+    offset: int
+    total_bytes: int
+    value: str
+    has_more: bool
 
 
 @dataclass(frozen=True)
@@ -183,7 +192,13 @@ class HistoryStore(Protocol):
 
     def reset_window(self, agent_id: int, reason: str) -> WindowState: ...
 
-    def window_events(self, agent_id: int) -> tuple[WindowEvent, ...]: ...
+    def window_events(
+        self,
+        agent_id: int,
+        *,
+        after: int | None = None,
+        limit: int = 30,
+    ) -> tuple[WindowEvent, ...]: ...
 
     def start_run(
         self,
@@ -273,12 +288,31 @@ class HistoryStore(Protocol):
     ) -> tuple[AgentHistoryRun, ...]: ...
 
     def model_request_summaries(
-        self, agent_id: int, sequence: int
+        self,
+        agent_id: int,
+        sequence: int,
+        *,
+        after: int | None = None,
+        limit: int = 30,
     ) -> tuple[AgentModelRequestSummary, ...]: ...
+
+    def model_request_summary(
+        self, agent_id: int, sequence: int, ordinal: int
+    ) -> AgentModelRequestSummary | None: ...
 
     def model_request(
         self, agent_id: int, sequence: int, ordinal: int
     ) -> AgentModelRequest | None: ...
+
+    def model_request_field(
+        self,
+        agent_id: int,
+        sequence: int,
+        ordinal: int,
+        field: str,
+        offset: int,
+        limit: int,
+    ) -> AgentTextPage: ...
 
     def model_request_messages(
         self,

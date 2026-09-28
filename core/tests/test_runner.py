@@ -2511,6 +2511,51 @@ def test_live_model_links_tool_results_to_the_current_request(settings):
     assert linked[0].parts[0].part_kind == "tool-return"
 
 
+def test_live_model_finalizes_tool_results_without_following_request(settings):
+    related = []
+
+    class Recorder:
+        def start(
+            self, messages_json, parameters_json, settings_json, model_json, streaming
+        ):
+            return "request-1"
+
+        def response(self, handle, response_json):
+            pass
+
+        def related(self, handle, messages_json):
+            related.append((handle, messages_json))
+
+        def error(self, handle, error):
+            raise AssertionError(error)
+
+    wrapped = FunctionModel(
+        lambda messages, info: ModelResponse(
+            parts=[ToolCallPart("tool", {"value": 1}, tool_call_id="call-1")]
+        )
+    )
+    live = LiveModel(
+        lambda: wrapped,
+        lambda: "",
+        "cache-key",
+        request_recorder=Recorder(),
+    )
+    messages = [ModelRequest(parts=[UserPromptPart("input")])]
+    response = asyncio.run(live.request(messages, None, ModelRequestParameters()))
+    live.finalize(
+        [
+            *messages,
+            response,
+            ModelRequest(
+                parts=[ToolReturnPart("tool", "result", tool_call_id="call-1")]
+            ),
+        ]
+    )
+    assert len(related) == 1
+    linked = ModelMessagesTypeAdapter.validate_json(related[0][1][0])
+    assert linked[0].parts[0].part_kind == "tool-return"
+
+
 def test_live_model_request_snapshot_failure_prevents_provider_call(settings):
     calls = []
 

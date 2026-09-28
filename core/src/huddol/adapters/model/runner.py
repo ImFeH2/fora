@@ -451,6 +451,9 @@ class LiveModel(WrapperModel):
                 "Could not save the related tool results"
             ) from error
 
+    def finalize(self, messages: list[ModelMessage]) -> None:
+        self._link_related(messages)
+
     def _start_request(
         self,
         wrapped: Model,
@@ -1012,10 +1015,26 @@ class PydanticModelRunner:
             return response
 
         counted = RunUsage()
+        live_model: LiveModel | None = None
 
         async def once() -> Any:
+            nonlocal live_model
             async with AsyncExitStack() as resources:
                 model = await resources.enter_async_context(self._build_model(config))
+                wrapper = LiveModel(
+                    lambda: model,
+                    request.ephemeral,
+                    cache_key,
+                    agents_instructions,
+                    request.request_recorder,
+                    {
+                        "api_type": config.api_type,
+                        "model": config.model,
+                        "thinking": config.thinking,
+                        "thinking_budget_tokens": config.thinking_budget_tokens,
+                    },
+                )
+                live_model = wrapper
 
                 return await self._agent.run(
                     request.prompt,
@@ -1023,19 +1042,7 @@ class PydanticModelRunner:
                     usage_limits=usage_limits,
                     deps=tools,
                     message_history=history,
-                    model=LiveModel(
-                        lambda: model,
-                        request.ephemeral,
-                        cache_key,
-                        agents_instructions,
-                        request.request_recorder,
-                        {
-                            "api_type": config.api_type,
-                            "model": config.model,
-                            "thinking": config.thinking,
-                            "thinking_budget_tokens": config.thinking_budget_tokens,
-                        },
-                    ),
+                    model=wrapper,
                     capabilities=[
                         hooks,
                         *(
@@ -1063,13 +1070,19 @@ class PydanticModelRunner:
             except Exception as failure:  # noqa: BLE001
                 messages = snapshot
                 if captured:
-                    messages = _encode_history(_settle_tool_calls(captured))
+                    final_messages = _settle_tool_calls(captured)
+                    if live_model is not None:
+                        live_model.finalize(final_messages)
+                    messages = _encode_history(final_messages)
                 new_messages = captured[history_length:]
                 input_tokens = _last_input_tokens(new_messages)
                 error = f"{type(failure).__name__}: {failure}"
                 context_exceeded = is_context_exceeded(failure)
             else:
-                messages = _encode_history(result.all_messages())
+                final_messages = _settle_tool_calls(result.all_messages())
+                assert live_model is not None
+                live_model.finalize(final_messages)
+                messages = _encode_history(final_messages)
                 new_messages = result.new_messages()
                 input_tokens = _last_input_tokens(new_messages)
 

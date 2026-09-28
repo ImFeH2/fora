@@ -432,6 +432,30 @@ function mergeHistoryRuns(
   );
 }
 
+function mergeHistoryRequests(
+  current: AgentHistoryRead["requests"],
+  incoming: AgentHistoryRead["requests"],
+) {
+  const requests = new Map(
+    current.map((request) => [request.ordinal, request]),
+  );
+  for (const request of incoming) requests.set(request.ordinal, request);
+  return [...requests.values()].sort(
+    (left, right) => left.ordinal - right.ordinal,
+  );
+}
+
+function mergeHistoryWindows(
+  current: AgentHistoryRead["windows"],
+  incoming: AgentHistoryRead["windows"],
+) {
+  const windows = new Map(current.map((event) => [event.number, event]));
+  for (const event of incoming) windows.set(event.number, event);
+  return [...windows.values()].sort(
+    (left, right) => left.number - right.number,
+  );
+}
+
 export function HistorySection({
   agentId,
   initialRuns,
@@ -529,8 +553,16 @@ function TurnHistoryModal({
     async (
       nextOrdinal: number | undefined,
       options: {
-        target?: "run" | "input" | "response" | "related";
+        target?:
+          | "run"
+          | "input"
+          | "response"
+          | "related"
+          | "requests"
+          | "windows";
         offset?: number;
+        requestAfter?: number;
+        windowsAfter?: number;
       } = {},
     ) => {
       const target = options.target;
@@ -544,15 +576,31 @@ function TurnHistoryModal({
           target === "input" ? offset : 0,
           target === "response" ? offset : 0,
           target === "related" ? offset : 0,
+          {
+            requestAfter: options.requestAfter,
+            windowsAfter: options.windowsAfter,
+          },
         );
         if (!target && nextOrdinal === undefined && result.request) {
           setOrdinal(result.request.summary.ordinal);
         }
         setRead((current) => {
-          if (!current || !target) return result;
+          if (!current) return result;
+          const merged = {
+            ...result,
+            requests: mergeHistoryRequests(current.requests, result.requests),
+            windows: mergeHistoryWindows(current.windows, result.windows),
+          };
+          if (!target) return merged;
+          if (target === "requests" || target === "windows") {
+            return {
+              ...merged,
+              request: current.request ?? result.request,
+            };
+          }
           if (target === "run") {
             return {
-              ...result,
+              ...merged,
               messages: {
                 ...result.messages,
                 offset: current.messages.offset,
@@ -563,9 +611,9 @@ function TurnHistoryModal({
               },
             };
           }
-          if (!current.request || !result.request) return result;
+          if (!current.request || !result.request) return merged;
           return {
-            ...result,
+            ...merged,
             request: {
               ...result.request,
               input:
@@ -672,6 +720,22 @@ function TurnHistoryModal({
                   read.messages.offset + read.messages.messages.length,
               })
             }
+            onLoadMoreRequests={() =>
+              read.requests_next_after === null
+                ? undefined
+                : void load(ordinal, {
+                    target: "requests",
+                    requestAfter: read.requests_next_after,
+                  })
+            }
+            onLoadMoreWindows={() =>
+              read.windows_next_after === null
+                ? undefined
+                : void load(ordinal, {
+                    target: "windows",
+                    windowsAfter: read.windows_next_after,
+                  })
+            }
             onLoadMoreInput={() =>
               read.request
                 ? void load(ordinal, {
@@ -720,6 +784,8 @@ function HistoryReadPanel({
   ordinal,
   onSelectRequest,
   onLoadMoreRun,
+  onLoadMoreRequests,
+  onLoadMoreWindows,
   onLoadMoreInput,
   onLoadMoreResponse,
   onLoadMoreRelated,
@@ -728,6 +794,8 @@ function HistoryReadPanel({
   ordinal: number | undefined;
   onSelectRequest: (ordinal: number) => void;
   onLoadMoreRun: () => void;
+  onLoadMoreRequests: () => void;
+  onLoadMoreWindows: () => void;
   onLoadMoreInput: () => void;
   onLoadMoreResponse: () => void;
   onLoadMoreRelated: () => void;
@@ -758,6 +826,30 @@ function HistoryReadPanel({
           Missing historical data: {read.missing.join(", ")}
         </p>
       ) : null}
+      {read.windows.length > 0 ? (
+        <section className="flex flex-col gap-2">
+          <h3 className="m-0 text-sm font-semibold tracking-title">
+            Context windows
+          </h3>
+          <ul className="flex flex-col gap-1 text-xs text-fg-muted">
+            {read.windows.map((event) => (
+              <li key={event.number} className="flex flex-wrap gap-x-3 gap-y-1">
+                <span>Window {event.number}</span>
+                <span>From Turn {event.since_sequence}</span>
+                {event.reason ? <span>{event.reason}</span> : null}
+                {event.reset_at ? (
+                  <span>{formatTime(event.reset_at)}</span>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+          {read.windows_has_more ? (
+            <Button size="sm" onClick={onLoadMoreWindows}>
+              Load more windows
+            </Button>
+          ) : null}
+        </section>
+      ) : null}
       {read.requests.length > 0 ? (
         <div
           className="flex flex-wrap gap-1 border-b border-line pb-3"
@@ -783,6 +875,11 @@ function HistoryReadPanel({
             </button>
           ))}
         </div>
+      ) : null}
+      {read.requests_has_more ? (
+        <Button size="sm" onClick={onLoadMoreRequests}>
+          Load more requests
+        </Button>
       ) : null}
       {read.request ? (
         <RequestHistoryContent
@@ -842,11 +939,23 @@ function RequestHistoryContent({
         onLoadMore={request.input.has_more ? onLoadMoreInput : undefined}
       />
       <HistoryValuePanel
+        agentId={agentId}
+        sequence={sequence}
         title="Model request parameters"
         value={request.parameters}
       />
-      <HistoryValuePanel title="Model settings" value={request.settings} />
-      <HistoryValuePanel title="Model" value={request.model} />
+      <HistoryValuePanel
+        agentId={agentId}
+        sequence={sequence}
+        title="Model settings"
+        value={request.settings}
+      />
+      <HistoryValuePanel
+        agentId={agentId}
+        sequence={sequence}
+        title="Model"
+        value={request.model}
+      />
       {request.response ? (
         <HistoryMessagesPanel
           agentId={agentId}
@@ -912,16 +1021,25 @@ function HistoryMessagesPanel({
 }
 
 function HistoryValuePanel({
+  agentId,
+  sequence,
   title,
   value,
 }: {
+  agentId?: number;
+  sequence?: number;
   title: string;
   value: HistoryValue;
 }) {
   return (
     <section className="flex flex-col gap-2">
       <h3 className="m-0 text-sm font-semibold tracking-title">{title}</h3>
-      <HistoryValueView value={value} label={title} />
+      <HistoryValueView
+        agentId={agentId}
+        sequence={sequence}
+        value={value}
+        label={title}
+      />
     </section>
   );
 }

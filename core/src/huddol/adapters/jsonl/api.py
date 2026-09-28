@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import json
 from collections.abc import Callable
 from dataclasses import asdict
 from typing import Any
@@ -49,10 +48,6 @@ def _required_integer(params: dict[str, Any], name: str) -> int:
     if value is None:
         raise DomainError("invalid_params", f"{name} is required")
     return value
-
-
-def _json_value(raw: str) -> Any:
-    return json.loads(raw)
 
 
 def _history_run_payload(run: Any) -> dict[str, Any]:
@@ -122,6 +117,24 @@ def _render_message_page(
         "offset": page.offset,
         "total": page.total,
         "total_bytes": page.total_bytes,
+        "has_more": page.has_more,
+    }
+
+
+def _render_model_field_page(
+    page: Any, source: str, request_ordinal: int
+) -> dict[str, Any]:
+    value_bytes = len(page.value.encode("utf-8"))
+    return {
+        "kind": "text",
+        "source": source,
+        "request_ordinal": request_ordinal,
+        "message_index": 0,
+        "path": [],
+        "offset": page.offset,
+        "next_offset": page.offset + value_bytes,
+        "total_bytes": page.total_bytes,
+        "value": page.value,
         "has_more": page.has_more,
     }
 
@@ -395,22 +408,33 @@ class Api:
             agent_id = _required_integer(params, "agent_id")
             self._human().authorize_agent_history(agent_id)
             limit = _integer_param(params, "limit", default=30, maximum=50)
+            windows_after = _integer_param(params, "windows_after", maximum=2**63 - 1)
+            windows_limit = _integer_param(
+                params, "windows_limit", default=30, maximum=30
+            )
             assert limit is not None
-            if limit == 0:
-                raise DomainError("invalid_params", "limit must be positive")
+            assert windows_limit is not None
+            if limit == 0 or windows_limit == 0:
+                raise DomainError("invalid_params", "history limits must be positive")
             before = _integer_param(params, "before", maximum=2**63 - 1)
             runs = self._scheduler.history.history_runs(
                 agent_id, before=before, limit=limit
             )
+            window_page = self._scheduler.history.window_events(
+                agent_id, after=windows_after, limit=windows_limit + 1
+            )
+            windows = window_page[:windows_limit]
+            has_more_windows = len(window_page) > windows_limit
             return {
                 "agent_id": agent_id,
                 "runs": [_history_run_payload(run) for run in runs],
-                "windows": [
-                    _window_event_payload(event)
-                    for event in self._scheduler.history.window_events(agent_id)
-                ],
+                "windows": [_window_event_payload(event) for event in windows],
                 "has_before": len(runs) == limit,
                 "next_before": runs[-1].sequence if len(runs) == limit else None,
+                "windows_has_more": has_more_windows,
+                "windows_next_after": (
+                    windows[-1].number if has_more_windows and windows else None
+                ),
             }
 
         def agent_history_read(params: dict[str, Any]) -> Any:
@@ -441,6 +465,26 @@ class Api:
             related_limit = _integer_param(
                 params, "related_limit", default=100, maximum=100
             )
+            parameters_offset = _integer_param(
+                params, "parameters_offset", default=0, maximum=2**63 - 1
+            )
+            settings_offset = _integer_param(
+                params, "settings_offset", default=0, maximum=2**63 - 1
+            )
+            model_offset = _integer_param(
+                params, "model_offset", default=0, maximum=2**63 - 1
+            )
+            field_limit = _integer_param(
+                params, "field_limit", default=16 * 1024, maximum=16 * 1024
+            )
+            request_after = _integer_param(params, "request_after", maximum=2**63 - 1)
+            request_limit = _integer_param(
+                params, "request_limit", default=30, maximum=30
+            )
+            windows_after = _integer_param(params, "windows_after", maximum=2**63 - 1)
+            windows_limit = _integer_param(
+                params, "windows_limit", default=30, maximum=30
+            )
             assert message_offset is not None
             assert message_limit is not None
             assert input_offset is not None
@@ -449,14 +493,32 @@ class Api:
             assert response_limit is not None
             assert related_offset is not None
             assert related_limit is not None
+            assert parameters_offset is not None
+            assert settings_offset is not None
+            assert model_offset is not None
+            assert field_limit is not None
+            assert request_limit is not None
+            assert windows_limit is not None
             if 0 in (message_limit, input_limit, response_limit, related_limit):
                 raise DomainError("invalid_params", "message limits must be positive")
+            if 0 in (field_limit, request_limit, windows_limit):
+                raise DomainError("invalid_params", "history limits must be positive")
             run = self._scheduler.history.history_run(agent_id, sequence)
             if run is None:
                 raise DomainError("not_found", f"Turn {sequence} does not exist")
-            requests = self._scheduler.history.model_request_summaries(
-                agent_id, sequence
+            request_page = self._scheduler.history.model_request_summaries(
+                agent_id,
+                sequence,
+                after=request_after,
+                limit=request_limit + 1,
             )
+            requests = request_page[:request_limit]
+            requests_has_more = len(request_page) > request_limit
+            window_page = self._scheduler.history.window_events(
+                agent_id, after=windows_after, limit=windows_limit + 1
+            )
+            windows = window_page[:windows_limit]
+            windows_has_more = len(window_page) > windows_limit
             if requests:
                 messages: dict[str, Any] = {
                     "messages": [],
@@ -467,7 +529,7 @@ class Api:
                 }
             else:
                 legacy = self._scheduler.history.read_run_slice(
-                    agent_id, sequence, message_offset, 65536
+                    agent_id, sequence, message_offset, 16 * 1024
                 )
                 if legacy is None:
                     raise DomainError("not_found", f"Turn {sequence} does not exist")
@@ -482,11 +544,16 @@ class Api:
             result: dict[str, Any] = {
                 "agent_id": agent_id,
                 "run": _history_run_payload(run),
-                "windows": [
-                    _window_event_payload(event)
-                    for event in self._scheduler.history.window_events(agent_id)
-                ],
+                "windows": [_window_event_payload(event) for event in windows],
+                "windows_has_more": windows_has_more,
+                "windows_next_after": (
+                    windows[-1].number if windows_has_more and windows else None
+                ),
                 "requests": [_request_summary_payload(item) for item in requests],
+                "requests_has_more": requests_has_more,
+                "requests_next_after": (
+                    requests[-1].ordinal if requests_has_more and requests else None
+                ),
                 "messages": messages,
                 "missing": (
                     [
@@ -506,8 +573,10 @@ class Api:
                 ordinal = requests[0].ordinal
             if ordinal is None:
                 return result
-            record = self._scheduler.history.model_request(agent_id, sequence, ordinal)
-            if record is None:
+            summary = self._scheduler.history.model_request_summary(
+                agent_id, sequence, ordinal
+            )
+            if summary is None:
                 raise DomainError(
                     "not_found", f"Model request {ordinal} does not exist"
                 )
@@ -520,20 +589,38 @@ class Api:
             related_page = self._scheduler.history.model_request_messages(
                 agent_id, sequence, ordinal, "related", related_offset, related_limit
             )
+            parameters_page = self._scheduler.history.model_request_field(
+                agent_id,
+                sequence,
+                ordinal,
+                "parameters",
+                parameters_offset,
+                field_limit,
+            )
+            settings_page = self._scheduler.history.model_request_field(
+                agent_id, sequence, ordinal, "settings", settings_offset, field_limit
+            )
+            model_page = self._scheduler.history.model_request_field(
+                agent_id, sequence, ordinal, "model", model_offset, field_limit
+            )
             result["request"] = {
-                "summary": _request_summary_payload(record.summary),
+                "summary": _request_summary_payload(summary),
                 "input": _render_message_page(input_page, "input", ordinal),
-                "parameters": _json_value(record.parameters_json),
-                "settings": _json_value(record.settings_json),
-                "model": _json_value(record.model_json),
+                "parameters": _render_model_field_page(
+                    parameters_page, "parameters", ordinal
+                ),
+                "settings": _render_model_field_page(
+                    settings_page, "settings", ordinal
+                ),
+                "model": _render_model_field_page(model_page, "model", ordinal),
                 "response": (
                     _render_message_page(response_page, "response", ordinal)
-                    if record.summary.response_count
+                    if summary.response_count
                     else None
                 ),
                 "related": _render_message_page(related_page, "related", ordinal),
             }
-            if record.summary.status == "pending":
+            if summary.status == "pending":
                 result["missing"].append("model_response")
             return result
 
@@ -542,7 +629,15 @@ class Api:
             self._human().authorize_agent_history(agent_id)
             sequence = _required_integer(params, "sequence")
             source = params.get("source")
-            if source not in ("run", "input", "response", "related"):
+            if source not in (
+                "run",
+                "input",
+                "response",
+                "related",
+                "parameters",
+                "settings",
+                "model",
+            ):
                 raise DomainError("invalid_params", "source is invalid")
             message_index = _required_integer(params, "message_index")
             offset = _integer_param(params, "offset", default=0, maximum=2**63 - 1)
@@ -559,6 +654,14 @@ class Api:
                 for item in path
             ):
                 raise DomainError("invalid_params", "path must be a list")
+            if source in ("parameters", "settings", "model"):
+                ordinal = _integer_param(params, "ordinal")
+                if ordinal is None:
+                    raise DomainError("invalid_params", "ordinal is required")
+                page = self._scheduler.history.model_request_field(
+                    agent_id, sequence, ordinal, source, offset, limit
+                )
+                return _render_model_field_page(page, source, ordinal)
             raw = (
                 self._scheduler.history.run_messages(agent_id, sequence)
                 if source == "run"

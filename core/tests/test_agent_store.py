@@ -179,6 +179,49 @@ def test_model_request_message_blobs_are_deduplicated_across_requests(
     assert refs["count"] == 2
 
 
+def test_history_pagination_and_model_fields_are_bounded(
+    agent_store: SqliteAgentStore,
+) -> None:
+    run = agent_store.start_run(AGENT)
+    field = '{"value":"' + "漢" * 12_000 + '"}'
+    for _ in range(35):
+        agent_store.start_model_request(
+            AGENT,
+            run.sequence,
+            run.run_id,
+            1,
+            ("[]",),
+            field,
+            "{}",
+            "{}",
+            False,
+        )
+    summaries = agent_store.model_request_summaries(AGENT, run.sequence)
+    following = agent_store.model_request_summaries(
+        AGENT, run.sequence, after=summaries[-1].ordinal
+    )
+    assert len(summaries) == 30
+    assert [item.ordinal for item in following] == list(range(31, 36))
+    chunks = []
+    offset = 0
+    while True:
+        page = agent_store.model_request_field(
+            AGENT, run.sequence, 1, "parameters", offset, 16 * 1024
+        )
+        assert len(page.value.encode("utf-8")) <= 16 * 1024
+        chunks.append(page.value)
+        offset = page.offset + len(page.value.encode("utf-8"))
+        if not page.has_more:
+            break
+    assert "".join(chunks) == field
+    for _ in range(35):
+        agent_store.reset_window(AGENT, "overflow")
+    windows = agent_store.window_events(AGENT)
+    following_windows = agent_store.window_events(AGENT, after=windows[-1].number)
+    assert len(windows) == 30
+    assert [event.number for event in following_windows] == list(range(31, 37))
+
+
 def test_reminder_snapshot_survives_upgrade_restart_and_window_reset(tmp_path) -> None:
     path = tmp_path / "huddol.sqlite3"
     base = SqliteStore(path)

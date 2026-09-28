@@ -22,6 +22,7 @@ from huddol.ports.agent import (
     AgentModelRequest,
     AgentModelRequestSummary,
     AgentRun,
+    AgentTextPage,
     HistorySlice,
     ModelRequestHandle,
     RunSummary,
@@ -756,41 +757,99 @@ class SqliteAgentStore:
         return tuple(self._history_run(row) for row in rows)
 
     def model_request_summaries(
-        self, agent_id: int, sequence: int
+        self,
+        agent_id: int,
+        sequence: int,
+        *,
+        after: int | None = None,
+        limit: int = 30,
     ) -> tuple[AgentModelRequestSummary, ...]:
+        clause = "" if after is None else " AND ordinal > ?"
+        parameters: tuple[object, ...] = (
+            (agent_id, sequence) if after is None else (agent_id, sequence, after)
+        )
         rows = self._db.execute(
             "SELECT ordinal, request_id, run_id, window_number, status, started_at,"
             " completed_at, streaming, input_length, parameters_length, settings_length,"
             " model_length, response_length, input_count, response_count, related_count, error"
             " FROM agent_model_requests WHERE agent_id = ? AND sequence = ?"
-            " ORDER BY ordinal",
-            (agent_id, sequence),
+            f"{clause} ORDER BY ordinal LIMIT ?",
+            (*parameters, limit),
         )
         return tuple(self._model_request_summary(row) for row in rows)
 
-    def model_request(
+    def model_request_summary(
         self, agent_id: int, sequence: int, ordinal: int
-    ) -> AgentModelRequest | None:
+    ) -> AgentModelRequestSummary | None:
         row = first(
             self._db.execute(
                 "SELECT ordinal, request_id, run_id, window_number, status, started_at,"
                 " completed_at, streaming, input_length, parameters_length, settings_length,"
-                " model_length, response_length, input_count, response_count, related_count, error,"
-                " parameters_json, settings_json, model_json"
+                " model_length, response_length, input_count, response_count, related_count, error"
                 " FROM agent_model_requests WHERE agent_id = ? AND sequence = ? AND ordinal = ?",
                 (agent_id, sequence, ordinal),
             )
         )
-        return (
-            AgentModelRequest(
-                summary=self._model_request_summary(row),
-                parameters_json=str(row["parameters_json"]),
-                settings_json=str(row["settings_json"]),
-                model_json=str(row["model_json"]),
+        return self._model_request_summary(row) if row is not None else None
+
+    def model_request(
+        self, agent_id: int, sequence: int, ordinal: int
+    ) -> AgentModelRequest | None:
+        summary = self.model_request_summary(agent_id, sequence, ordinal)
+        return AgentModelRequest(summary) if summary is not None else None
+
+    def model_request_field(
+        self,
+        agent_id: int,
+        sequence: int,
+        ordinal: int,
+        field: str,
+        offset: int,
+        limit: int,
+    ) -> AgentTextPage:
+        columns = {
+            "parameters": "parameters_json",
+            "settings": "settings_json",
+            "model": "model_json",
+        }
+        column = columns.get(field)
+        if column is None:
+            raise DomainError("invalid_params", "Model request field is invalid")
+        if offset < 0:
+            raise DomainError("invalid_offset", "Model request field offset is invalid")
+        if limit <= 0 or limit > 16 * 1024:
+            raise DomainError("invalid_params", "Model request field limit is invalid")
+        row = first(
+            self._db.execute(
+                f"SELECT length(CAST({column} AS BLOB)) AS total_bytes FROM agent_model_requests"
+                " WHERE agent_id = ? AND sequence = ? AND ordinal = ?",
+                (agent_id, sequence, ordinal),
             )
-            if row is not None
-            else None
         )
+        if row is None:
+            raise DomainError("not_found", "Model request does not exist")
+        total_bytes = int(row["total_bytes"])
+        if offset > total_bytes:
+            raise DomainError(
+                "invalid_offset", "Model request field offset exceeds its length"
+            )
+        start = offset
+        value_row = first(
+            self._db.execute(
+                f"SELECT substr(CAST({column} AS BLOB), ?, ?) AS value"
+                " FROM agent_model_requests WHERE agent_id = ? AND sequence = ? AND ordinal = ?",
+                (start + 1, limit + 4, agent_id, sequence, ordinal),
+            )
+        )
+        assert value_row is not None
+        raw = bytes(value_row["value"] or b"")
+        while raw and raw[0] & 0xC0 == 0x80:
+            raw = raw[1:]
+            start += 1
+        value = raw[:limit].decode("utf-8", errors="ignore")
+        chunk = value.encode("utf-8")
+        end = start + len(chunk)
+        return AgentTextPage(field, start, total_bytes, value, end < total_bytes)
 
     def model_request_messages(
         self,
@@ -893,11 +952,21 @@ class SqliteAgentStore:
             )
         return WindowState(number, since_sequence, reset_at, reason)
 
-    def window_events(self, agent_id: int) -> tuple[WindowEvent, ...]:
+    def window_events(
+        self,
+        agent_id: int,
+        *,
+        after: int | None = None,
+        limit: int = 30,
+    ) -> tuple[WindowEvent, ...]:
+        clause = "" if after is None else " AND number > ?"
+        parameters: tuple[object, ...] = (
+            (agent_id,) if after is None else (agent_id, after)
+        )
         rows = self._db.execute(
             "SELECT number, since_sequence, reset_at, reason FROM agent_window_events"
-            " WHERE agent_id = ? ORDER BY number",
-            (agent_id,),
+            f" WHERE agent_id = ?{clause} ORDER BY number LIMIT ?",
+            (*parameters, limit),
         )
         return tuple(
             WindowEvent(
