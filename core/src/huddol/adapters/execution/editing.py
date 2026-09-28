@@ -125,7 +125,7 @@ def edit_file(
                 if found < 0:
                     break
                 occurrences.append((found, found + len(old_text)))
-                start = found + len(old_text)
+                start = found + 1
             if not occurrences:
                 raise _edit_error(
                     "no_match", index, "old_text does not appear in the file"

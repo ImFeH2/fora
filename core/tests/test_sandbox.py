@@ -335,6 +335,25 @@ def test_edit_refuses_ambiguous_matches_unless_replace_all(tmp_path: Path) -> No
     )
 
 
+@pytest.mark.parametrize(
+    ("replace_all", "code"),
+    [(False, "ambiguous_match"), (True, "overlapping_edits")],
+)
+def test_edit_rejects_overlapping_matches_from_one_item_atomically(
+    tmp_path: Path, replace_all: bool, code: str
+) -> None:
+    target = tmp_path / "file.txt"
+    original = b"aaaa"
+    target.write_bytes(original)
+    item = {"old_text": "aaa", "new_text": "X"}
+    if replace_all:
+        item["replace_all"] = True
+    with pytest.raises(DomainError) as error:
+        LocalExecution([str(tmp_path)], enforce=False).edit(str(target), [item])
+    assert error.value.code == code
+    assert target.read_bytes() == original
+
+
 def test_edit_rejects_paths_outside_the_writable_roots(tmp_path: Path) -> None:
     allowed = tmp_path / "allowed"
     allowed.mkdir()
