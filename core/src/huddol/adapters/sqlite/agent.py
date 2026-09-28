@@ -7,7 +7,11 @@ from collections.abc import Callable, Sequence
 
 from pydantic import ValidationError
 
-from huddol.adapters.model.config import AgentModelConfig, ModelCatalog
+from huddol.adapters.model.config import (
+    AgentModelConfig,
+    ModelCatalog,
+    thinking_options,
+)
 from huddol.adapters.sqlite.store import LockedConnection, first
 from huddol.core.errors import DomainError
 from huddol.ports.agent import (
@@ -626,7 +630,25 @@ class SqliteAgentStore:
         return result
 
     def model_catalog(self) -> dict[str, object]:
-        return ModelCatalog.restore(self.get_settings("model")).redacted()
+        catalog = ModelCatalog.restore(self.get_settings("model"))
+        return {
+            "models": [
+                {
+                    "id": model.id,
+                    "name": model.name,
+                    "enabled": model.enabled,
+                    "thinking_options": thinking_options(
+                        catalog.provider(model.provider_id).api_type,
+                        model.model,
+                        model.thinking_budget_tokens,
+                    ),
+                    "thinking_budget_tokens": model.thinking_budget_tokens,
+                }
+                for model in catalog.models
+            ],
+            "default_model_id": catalog.default_model_id,
+            "default_thinking": catalog.default_thinking,
+        }
 
     def agent_model_selection(self, agent_id: int) -> dict[str, object]:
         catalog = ModelCatalog.restore(self.get_settings("model"))

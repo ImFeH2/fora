@@ -768,7 +768,7 @@ def test_agent_creation_uses_model_selection_and_keeps_queries_public(server) ->
             ],
             "default_model_id": "model",
             "default_thinking": "high",
-            "agent_configs": {},
+            "agent_configs": {"99": {"model_id": "model", "thinking": "default"}},
         },
     )
     created = call(
@@ -791,8 +791,32 @@ def test_agent_creation_uses_model_selection_and_keeps_queries_public(server) ->
         "effective": {"model_id": "model", "thinking": "budget"},
     }
     catalog = deps.settings.model_catalog()
-    assert "private-key" not in json.dumps(catalog)
-    assert "budget" in catalog["models"][0]["thinking_options"]
+    assert catalog == {
+        "models": [
+            {
+                "id": "model",
+                "name": "Model",
+                "enabled": True,
+                "thinking_options": [
+                    "default",
+                    "none",
+                    "minimal",
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "budget",
+                ],
+                "thinking_budget_tokens": 4096,
+            }
+        ],
+        "default_model_id": "model",
+        "default_thinking": "high",
+    }
+    assert "agent_configs" not in catalog
+    assert "base_url" not in json.dumps(catalog)
+    assert "api_key_set" not in json.dumps(catalog)
 
     before = deps.store.list_members()
     rejected = call(
