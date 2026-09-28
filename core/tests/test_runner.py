@@ -1405,21 +1405,38 @@ def test_every_call_extends_what_the_previous_call_sent(settings, start) -> None
             "edit",
             {
                 "path": "workspace/MEMORY.md",
-                "old_text": "before",
-                "new_text": "",
-                "replace_all": True,
+                "edits": [
+                    {
+                        "old_text": "before",
+                        "new_text": "",
+                        "replace_all": True,
+                    }
+                ],
             },
-            ("workspace/MEMORY.md", "before", "", True, False),
+            (
+                "workspace/MEMORY.md",
+                [
+                    {
+                        "old_text": "before",
+                        "new_text": "",
+                        "replace_all": True,
+                    }
+                ],
+                False,
+            ),
         ),
         (
             "edit",
             {
                 "path": "/data/script.py",
-                "old_text": "",
-                "new_text": "print('ready')\\n",
+                "edits": [{"old_text": "", "new_text": "print('ready')\\n"}],
                 "create": True,
             },
-            ("/data/script.py", "", "print('ready')\\n", False, True),
+            (
+                "/data/script.py",
+                [{"old_text": "", "new_text": "print('ready')\\n"}],
+                True,
+            ),
         ),
     ],
 )
@@ -1835,7 +1852,11 @@ def test_non_tool_faults_are_not_tool_failures(settings, monkeypatch, stage):
         ("organization", {"action": "list_members"}, "list_members"),
         ("discussion", {"action": "list"}, "list_discussions"),
         ("run", {"argv": ["true"]}, "run"),
-        ("edit", {"path": "/fake", "old_text": "old", "new_text": "new"}, "edit"),
+        (
+            "edit",
+            {"path": "/fake", "edits": [{"old_text": "old", "new_text": "new"}]},
+            "edit",
+        ),
         ("history", {"action": "read", "sequence": 1}, "read_history"),
         (
             "history",

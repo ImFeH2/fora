@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -47,10 +47,8 @@ class ExecutionEnvironment(Protocol):
     def edit(
         self,
         path: str,
-        old_text: str,
-        new_text: str,
+        edits: Sequence[Mapping[str, object]],
         *,
-        replace_all: bool = False,
         write_directories: Sequence[str] | None = None,
         create: bool = False,
     ) -> EditResult: ...

@@ -31,8 +31,7 @@ def _create_from_process(path: str, content: str, barrier, results) -> None:
     try:
         editing.edit_file(
             path,
-            "",
-            content,
+            [{"old_text": "", "new_text": content}],
             directories=[str(Path(path).parent)],
             create=True,
         )
@@ -146,7 +145,9 @@ def test_agent_edit_and_write_share_the_lock(tmp_path, ordered_writes, first_edi
     write = lambda: tree.write(
         "same.txt", "written", expected_hash=content_hash("original")
     )
-    edit = lambda: execution.edit(str(tmp_path / "same.txt"), "original", "edited")
+    edit = lambda: execution.edit(
+        str(tmp_path / "same.txt"), [{"old_text": "original", "new_text": "edited"}]
+    )
     try:
         winner, contender = ordered_writes(
             edit if first_edit else write, write if first_edit else edit
@@ -169,7 +170,10 @@ def test_edit_create_thread_race_has_one_winner(tmp_path):
         start.wait()
         try:
             editing.edit_file(
-                str(target), "", content, directories=[str(tmp_path)], create=True
+                str(target),
+                [{"old_text": "", "new_text": content}],
+                directories=[str(tmp_path)],
+                create=True,
             )
         except DomainError as error:
             return error.code
@@ -225,7 +229,10 @@ def test_edit_create_publishes_only_complete_content(tmp_path, monkeypatch):
 
     monkeypatch.setattr(file_writes.os, "link", observe)
     result = editing.edit_file(
-        str(target), "", "complete body", directories=[str(tmp_path)], create=True
+        str(target),
+        [{"old_text": "", "new_text": "complete body"}],
+        directories=[str(tmp_path)],
+        create=True,
     )
     assert result.replacements == 0
     assert target.read_text(encoding="utf-8") == "complete body"
@@ -238,7 +245,10 @@ def test_edit_create_publish_failure_removes_temporary_file(tmp_path, monkeypatc
     monkeypatch.setattr(file_writes.os, "link", Mock(side_effect=failure))
     with pytest.raises(PermissionError) as error:
         editing.edit_file(
-            str(target), "", "complete", directories=[str(tmp_path)], create=True
+            str(target),
+            [{"old_text": "", "new_text": "complete"}],
+            directories=[str(tmp_path)],
+            create=True,
         )
     assert error.value is failure
     assert not target.exists()
@@ -259,7 +269,10 @@ def test_edit_create_cleanup_failure_reports_published_file(tmp_path, monkeypatc
         patch.setattr(Path, "unlink", unlink)
         with pytest.raises(DomainError) as error:
             editing.edit_file(
-                str(target), "", "complete", directories=[str(tmp_path)], create=True
+                str(target),
+                [{"old_text": "", "new_text": "complete"}],
+                directories=[str(tmp_path)],
+                create=True,
             )
     assert error.value.code == "write_published"
     assert target.read_text(encoding="utf-8") == "complete"
@@ -429,7 +442,9 @@ def test_failures_preserve_file_state_and_diagnostics(
         if operation == "edit":
             return tree.edit("document.txt", "original", "updated")
         return editing.edit_file(
-            str(target), "original", "updated", directories=[str(tmp_path)]
+            str(target),
+            [{"old_text": "original", "new_text": "updated"}],
+            directories=[str(tmp_path)],
         )
 
     with pytest.raises((OSError, DomainError, ExceptionGroup)) as caught:

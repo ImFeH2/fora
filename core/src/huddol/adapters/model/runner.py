@@ -13,7 +13,7 @@ from contextvars import ContextVar
 from dataclasses import replace
 from functools import wraps
 from traceback import walk_tb
-from typing import Any, Literal, cast, get_type_hints
+from typing import Any, Literal, NotRequired, TypedDict, cast, get_type_hints
 
 import pydantic_ai
 from pydantic_ai import (
@@ -304,6 +304,12 @@ def image_result(result: ViewedImage) -> ToolReturn:
             BinaryContent(data=image.data, media_type=image.media_type),
         ]
     )
+
+
+class EditOperation(TypedDict):
+    old_text: str
+    new_text: str
+    replace_all: NotRequired[bool]
 
 
 UNAVAILABLE = "Configure a model in Settings before running Agents"
@@ -659,18 +665,15 @@ class PydanticModelRunner:
         def edit(
             ctx: RunContext[AgentTools],
             path: str,
-            old_text: str,
-            new_text: str,
-            replace_all: bool = False,
+            edits: list[EditOperation],
             create: bool = False,
         ) -> Any:
-            """Edit a file or create an absent file with create=true and empty old_text.
+            """Edit one file using one or more replacements from its original content.
 
-            Creation takes the complete file body from new_text.
+            For creation, pass create=true with one edits item whose old_text is empty.
+            The sole edit's new_text is the complete file body.
             """
-            return _guard(
-                lambda: ctx.deps.edit(path, old_text, new_text, replace_all, create)
-            )
+            return _guard(lambda: ctx.deps.edit(path, edits, create))
 
         @tool(sequential=True)
         def history(

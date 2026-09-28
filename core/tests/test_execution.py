@@ -281,7 +281,7 @@ def test_execution_helpers_ignore_other_business_modules_on_pythonpath(
     target.write_text("before", encoding="utf-8")
     environment = LocalExecution([str(tmp_path)])
     try:
-        environment.edit(str(target), "before", "after")
+        environment.edit(str(target), [{"old_text": "before", "new_text": "after"}])
         result = environment.run(
             [sys.executable, "-c", "print('command-ok')"], cwd=str(tmp_path)
         )
@@ -453,8 +453,7 @@ def test_local_edit_override_does_not_change_configuration(tmp_path, override) -
                 assert (
                     environment.edit(
                         str(root / "file.txt"),
-                        "before",
-                        "after",
+                        [{"old_text": "before", "new_text": "after"}],
                         write_directories=roots,
                     ).replacements
                     == 1
@@ -463,8 +462,7 @@ def test_local_edit_override_does_not_change_configuration(tmp_path, override) -
                 with pytest.raises(DomainError, match="outside"):
                     environment.edit(
                         str(root / "file.txt"),
-                        "before",
-                        "after",
+                        [{"old_text": "before", "new_text": "after"}],
                         write_directories=roots,
                     )
         assert environment.write_directories == (str(configured),)

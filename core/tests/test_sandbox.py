@@ -112,22 +112,119 @@ def test_edit_replaces_once_and_reports_a_diff(tmp_path: Path) -> None:
     target = tmp_path / "file.txt"
     target.write_text("alpha\nbeta\n", encoding="utf-8")
     sandbox = LocalExecution([str(tmp_path)], enforce=False)
-    result = sandbox.edit(str(target), "beta", "gamma")
+    result = sandbox.edit(str(target), [{"old_text": "beta", "new_text": "gamma"}])
     assert target.read_text(encoding="utf-8") == "alpha\ngamma\n"
     assert result.replacements == 1
     assert "-beta" in result.diff and "+gamma" in result.diff
 
 
+def test_edit_applies_multiple_replacements_from_the_same_original(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    original = "left: one\nmiddle: two\n标题: 旧值\r\n"
+    first.write_bytes(original.encode("utf-8"))
+    second.write_bytes(original.encode("utf-8"))
+    edits = [
+        {"old_text": "one", "new_text": "two"},
+        {"old_text": "two", "new_text": "done"},
+        {"old_text": "标题: 旧值", "new_text": "标题: 新值\n第二行"},
+    ]
+    first_result = LocalExecution([str(tmp_path)], enforce=False).edit(
+        str(first), edits
+    )
+    second_result = LocalExecution([str(tmp_path)], enforce=False).edit(
+        str(second), list(reversed(edits))
+    )
+    expected = "left: two\nmiddle: done\n标题: 新值\n第二行\r\n"
+    assert first.read_bytes() == expected.encode("utf-8")
+    assert second.read_bytes() == expected.encode("utf-8")
+    assert first_result.replacements == second_result.replacements == 3
+    assert "-left: one" in first_result.diff
+    assert "+left: two" in first_result.diff
+
+
+def test_edit_rejects_unmatched_ambiguous_and_overlapping_items_atomically(
+    tmp_path: Path,
+) -> None:
+    cases = [
+        (
+            "unmatched.txt",
+            "before",
+            [{"old_text": "missing", "new_text": "after"}],
+            "no_match",
+            "edit 1",
+        ),
+        (
+            "ambiguous.txt",
+            "x\nx\n",
+            [{"old_text": "x", "new_text": "y"}],
+            "ambiguous_match",
+            "edit 1",
+        ),
+        (
+            "overlapping.txt",
+            "abcdef",
+            [
+                {"old_text": "abc", "new_text": "A"},
+                {"old_text": "bcd", "new_text": "B"},
+            ],
+            "overlapping_edits",
+            "edit 2",
+        ),
+        (
+            "replace-all-overlap.txt",
+            "abcdef",
+            [
+                {"old_text": "abc", "new_text": "A", "replace_all": True},
+                {"old_text": "cde", "new_text": "C"},
+            ],
+            "overlapping_edits",
+            "edit 2",
+        ),
+    ]
+    for name, original, edits, code, message in cases:
+        target = tmp_path / name
+        target.write_bytes(original.encode("utf-8"))
+        with pytest.raises(DomainError, match=message) as error:
+            LocalExecution([str(tmp_path)], enforce=False).edit(str(target), edits)
+        assert error.value.code == code
+        assert target.read_bytes() == original.encode("utf-8")
+
+
+def test_edit_create_requires_one_complete_edit(tmp_path: Path) -> None:
+    target = tmp_path / "created.txt"
+    with pytest.raises(DomainError, match="create requires exactly one edit") as error:
+        LocalExecution([str(tmp_path)], enforce=False).edit(
+            str(target),
+            [
+                {"old_text": "", "new_text": "one"},
+                {"old_text": "", "new_text": "two"},
+            ],
+            create=True,
+        )
+    assert error.value.code == "invalid_edit"
+    assert not target.exists()
+
+
 def test_edit_creates_complete_file_and_allows_empty_content(tmp_path: Path) -> None:
     sandbox = LocalExecution([str(tmp_path)], enforce=False)
     target = tmp_path / "new.txt"
-    result = sandbox.edit(str(target), "", "alpha\nbeta\n", create=True)
+    result = sandbox.edit(
+        str(target), [{"old_text": "", "new_text": "alpha\nbeta\n"}], create=True
+    )
     assert target.read_text(encoding="utf-8") == "alpha\nbeta\n"
     assert result.path == str(target)
     assert result.replacements == 0
     assert "+alpha" in result.diff and "+beta" in result.diff
     empty = tmp_path / "empty.txt"
-    assert sandbox.edit(str(empty), "", "", create=True).replacements == 0
+    assert (
+        sandbox.edit(
+            str(empty), [{"old_text": "", "new_text": ""}], create=True
+        ).replacements
+        == 0
+    )
     assert empty.read_bytes() == b""
 
 
@@ -152,7 +249,9 @@ def test_edit_create_protects_existing_paths(tmp_path: Path, kind: str) -> None:
             pytest.skip(f"symlinks are unavailable: {error}")
     sandbox = LocalExecution([str(tmp_path)], enforce=False)
     with pytest.raises(DomainError) as error:
-        sandbox.edit(str(target), "", "replacement", create=True)
+        sandbox.edit(
+            str(target), [{"old_text": "", "new_text": "replacement"}], create=True
+        )
     assert error.value.code == "already_exists"
     if kind == "file":
         assert target.read_text(encoding="utf-8") == "preserved"
@@ -170,11 +269,11 @@ def test_edit_create_requires_existing_parent_and_writable_root(tmp_path: Path) 
     sandbox = LocalExecution([str(allowed)], enforce=False)
     missing = allowed / "missing" / "file.txt"
     with pytest.raises(DomainError) as error:
-        sandbox.edit(str(missing), "", "body", create=True)
+        sandbox.edit(str(missing), [{"old_text": "", "new_text": "body"}], create=True)
     assert error.value.code == "not_found"
     outside = tmp_path / "outside.txt"
     with pytest.raises(DomainError) as error:
-        sandbox.edit(str(outside), "", "body", create=True)
+        sandbox.edit(str(outside), [{"old_text": "", "new_text": "body"}], create=True)
     assert error.value.code == "not_writable"
     assert not outside.exists()
 
@@ -193,7 +292,9 @@ def test_edit_create_rejects_parent_symlink_outside_writable_roots(
         pytest.skip(f"directory symlinks are unavailable: {error}")
     sandbox = LocalExecution([str(allowed)], enforce=False)
     with pytest.raises(DomainError) as error:
-        sandbox.edit(str(alias / "file.txt"), "", "body", create=True)
+        sandbox.edit(
+            str(alias / "file.txt"), [{"old_text": "", "new_text": "body"}], create=True
+        )
     assert error.value.code == "not_writable"
     assert not (outside / "file.txt").exists()
 
@@ -201,16 +302,19 @@ def test_edit_create_rejects_parent_symlink_outside_writable_roots(
 def test_edit_create_rejects_incompatible_parameters(tmp_path: Path) -> None:
     target = tmp_path / "file.txt"
     with pytest.raises(DomainError) as error:
-        edit_file(str(target), "old", "body", directories=[str(tmp_path)], create=True)
+        edit_file(
+            str(target),
+            [{"old_text": "old", "new_text": "body"}],
+            directories=[str(tmp_path)],
+            create=True,
+        )
     assert error.value.code == "invalid_edit"
     with pytest.raises(DomainError) as error:
         edit_file(
             str(target),
-            "",
-            "body",
+            [{"old_text": "", "new_text": "body", "replace_all": True}],
             directories=[str(tmp_path)],
             create=True,
-            replace_all=True,
         )
     assert error.value.code == "invalid_edit"
     assert not target.exists()
@@ -221,9 +325,14 @@ def test_edit_refuses_ambiguous_matches_unless_replace_all(tmp_path: Path) -> No
     target.write_text("x\nx\n", encoding="utf-8")
     sandbox = LocalExecution([str(tmp_path)], enforce=False)
     with pytest.raises(DomainError) as error:
-        sandbox.edit(str(target), "x", "y")
+        sandbox.edit(str(target), [{"old_text": "x", "new_text": "y"}])
     assert error.value.code == "ambiguous_match"
-    assert sandbox.edit(str(target), "x", "y", replace_all=True).replacements == 2
+    assert (
+        sandbox.edit(
+            str(target), [{"old_text": "x", "new_text": "y", "replace_all": True}]
+        ).replacements
+        == 2
+    )
 
 
 def test_edit_rejects_paths_outside_the_writable_roots(tmp_path: Path) -> None:
@@ -233,7 +342,7 @@ def test_edit_rejects_paths_outside_the_writable_roots(tmp_path: Path) -> None:
     outside.write_text("secret", encoding="utf-8")
     sandbox = LocalExecution([str(allowed)])
     with pytest.raises(DomainError) as error:
-        sandbox.edit(str(outside), "secret", "leaked")
+        sandbox.edit(str(outside), [{"old_text": "secret", "new_text": "leaked"}])
     assert error.value.code == "not_writable"
     assert outside.read_text(encoding="utf-8") == "secret"
 
@@ -242,7 +351,7 @@ def test_edit_leaves_no_temporary_files(tmp_path: Path) -> None:
     target = tmp_path / "file.txt"
     target.write_text("a", encoding="utf-8")
     sandbox = LocalExecution([str(tmp_path)], enforce=False)
-    sandbox.edit(str(target), "a", "b")
+    sandbox.edit(str(target), [{"old_text": "a", "new_text": "b"}])
     assert list(tmp_path.glob("*.huddol-tmp")) == []
 
 
@@ -362,7 +471,11 @@ def test_run_rejects_a_cwd_that_is_not_a_directory(
 
 def test_edit_file_rejects_relative_paths(tmp_path: Path) -> None:
     with pytest.raises(DomainError, match="^path must be an absolute path$") as error:
-        edit_file("file.txt", "before", "after", directories=[str(tmp_path)])
+        edit_file(
+            "file.txt",
+            [{"old_text": "before", "new_text": "after"}],
+            directories=[str(tmp_path)],
+        )
     assert error.value.code == "invalid_path"
 
 

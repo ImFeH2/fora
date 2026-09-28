@@ -979,7 +979,7 @@ def test_system_prompt_states_what_structure_cannot_enforce(phrase: str) -> None
 
 
 def test_system_prompt_documents_file_creation_arguments() -> None:
-    assert 'pass create=true, old_text=""' in SYSTEM_PROMPT
+    assert 'pass create=true and one edits item with old_text=""' in SYSTEM_PROMPT
     assert "complete file body as new_text" in SYSTEM_PROMPT
     assert "parent directory must already exist" in SYSTEM_PROMPT
 

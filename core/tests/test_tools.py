@@ -284,8 +284,8 @@ def test_tools_forward_absolute_paths_in_both_platform_formats(
         calls.append((argv, cwd, timeout))
         return RunResult(0, "", "", False)
 
-    def edit(path, old_text, new_text, *, replace_all, write_directories, create):
-        calls.append((path, old_text, new_text, replace_all, create))
+    def edit(path, edits, *, write_directories, create):
+        calls.append((path, edits, create))
         return EditResult(path, "", 0 if create else 1)
 
     environment = world.execution.snapshot()
@@ -293,12 +293,19 @@ def test_tools_forward_absolute_paths_in_both_platform_formats(
     monkeypatch.setattr(environment, "edit", edit)
     monkeypatch.setattr(world.execution, "snapshot", lambda: environment)
     tools.run(["pwd"], cwd=path, timeout=7)
-    tools.edit(path, "before", "after", replace_all=True)
-    tools.edit(path, "", "complete body", create=True)
+    tools.edit(
+        path,
+        [{"old_text": "before", "new_text": "after", "replace_all": True}],
+    )
+    tools.edit(path, [{"old_text": "", "new_text": "complete body"}], create=True)
     assert calls == [
         (["pwd"], path, 7),
-        (path, "before", "after", True, False),
-        (path, "", "complete body", False, True),
+        (
+            path,
+            [{"old_text": "before", "new_text": "after", "replace_all": True}],
+            False,
+        ),
+        (path, [{"old_text": "", "new_text": "complete body"}], True),
     ]
     assert (tmp_path / "agents" / str(MAIN) / "workspace").is_dir()
 
@@ -320,7 +327,7 @@ def test_relative_edit_resolves_under_the_agents_directory_and_is_not_writable(
     monkeypatch.setattr(world.execution, "snapshot", lambda: environment)
     assert not directory.exists()
     with pytest.raises(DomainError) as error:
-        tools.edit("file.txt", "before", "after")
+        tools.edit("file.txt", [{"old_text": "before", "new_text": "after"}])
     assert paths == [str(directory / "file.txt")]
     assert error.value.code == "not_writable"
     assert directory.is_dir()
@@ -336,15 +343,15 @@ def test_existing_tools_follow_directory_changes(
     command = [sys.executable, "-c", "print('native')"]
     assert tools.run(command)["stdout"].strip() == "native"
     with pytest.raises(DomainError, match="outside"):
-        tools.edit(str(target), "before", "denied")
+        tools.edit(str(target), [{"old_text": "before", "new_text": "denied"}])
     manager.configure({"write_directories": [str(tmp_path)]}, lambda values: None)
-    tools.edit(str(target), "before", "native")
+    tools.edit(str(target), [{"old_text": "before", "new_text": "native"}])
     assert tools.run(command)["stdout"].strip() == "native"
     manager.configure({"write_directories": []}, lambda values: None)
     with pytest.raises(DomainError, match="outside"):
-        tools.edit(str(target), "native", "denied")
+        tools.edit(str(target), [{"old_text": "native", "new_text": "denied"}])
     manager.configure({"write_directories": [str(tmp_path)]}, lambda values: None)
-    tools.edit(str(target), "native", "after")
+    tools.edit(str(target), [{"old_text": "native", "new_text": "after"}])
     assert target.read_text(encoding="utf-8") == "after"
 
 
@@ -356,7 +363,9 @@ def test_edit_keeps_absolute_paths(world, tmp_path: Path) -> None:
     world.execution.configure(
         {"write_directories": [str(directory)]}, lambda values: None
     )
-    result = tools_for(world, MAIN).edit(str(target), "before", "after")
+    result = tools_for(world, MAIN).edit(
+        str(target), [{"old_text": "before", "new_text": "after"}]
+    )
     assert result["path"] == str(target)
     assert target.read_text(encoding="utf-8") == "after"
     assert (tmp_path / "agents" / str(MAIN) / "workspace").is_dir()
@@ -372,17 +381,21 @@ def test_edit_tool_creates_file_then_uses_existing_edit_behavior(
         {"write_directories": [str(directory)]}, lambda values: None
     )
     tools = tools_for(world, MAIN, turn=TurnBinding(MAIN, 1))
-    created = tools.edit(str(target), "", "before", create=True)
+    created = tools.edit(
+        str(target), [{"old_text": "", "new_text": "before"}], create=True
+    )
     assert created["path"] == str(target)
     assert created["replacements"] == 0
     assert created["created"] is True
     assert "+before" in created["diff"]
     assert target.read_text(encoding="utf-8") == "before"
     empty = directory / "empty.txt"
-    empty_created = tools.edit(str(empty), "", "", create=True)
+    empty_created = tools.edit(
+        str(empty), [{"old_text": "", "new_text": ""}], create=True
+    )
     assert empty_created["created"] is True
     assert empty_created["diff"] == ""
-    edited = tools.edit(str(target), "before", "after")
+    edited = tools.edit(str(target), [{"old_text": "before", "new_text": "after"}])
     assert edited["replacements"] == 1
     assert edited["created"] is False
     recorded = world.history.effects(MAIN, sequences=[1])
@@ -898,7 +911,7 @@ def test_a_turn_records_what_it_produced(world) -> None:
     sent = tools.send_message(discussion, "Starting now")["id"]
     tools.run([sys.executable, "-c", "print('hi')"])
     world.workspace_tree_for(MAIN).write("notes.md", "content")
-    tools.edit("workspace/notes.md", "content", "updated")
+    tools.edit("workspace/notes.md", [{"old_text": "content", "new_text": "updated"}])
 
     recorded = world.history.effects(MAIN, sequences=[1])
     assert [item.tool for item in recorded] == ["send", "run", "edit"]
@@ -1002,9 +1015,9 @@ def test_run_and_edit_add_existing_implicit_roots_to_current_configuration(
         calls.append(("run", argv, params))
         return RunResult(0, "", "", False)
 
-    def edit(path, old_text, new_text, **params):
+    def edit(path, edits, **params):
         assert workspace.is_dir() and library.is_dir()
-        calls.append(("edit", path, params))
+        calls.append(("edit", path, edits, params))
         return EditResult(path, "", 1)
 
     monkeypatch.setattr(environment, "run", run)
@@ -1013,7 +1026,10 @@ def test_run_and_edit_add_existing_implicit_roots_to_current_configuration(
     for roots in ([str(configured)], []):
         world.execution.configure({"write_directories": roots}, lambda values: None)
         tools.run(["command"], timeout=7)
-        tools.edit("workspace/MEMORY.md", "old", "new", replace_all=True)
+        tools.edit(
+            "workspace/MEMORY.md",
+            [{"old_text": "old", "new_text": "new", "replace_all": True}],
+        )
         expected = [*roots, str(workspace), str(library)]
         assert calls[-2:] == [
             (
@@ -1028,8 +1044,8 @@ def test_run_and_edit_add_existing_implicit_roots_to_current_configuration(
             (
                 "edit",
                 str(workspace / "MEMORY.md"),
+                [{"old_text": "old", "new_text": "new", "replace_all": True}],
                 {
-                    "replace_all": True,
                     "write_directories": expected,
                     "create": False,
                 },
@@ -1058,7 +1074,10 @@ def test_execution_emits_partial_library_changes_on_error(
         if operation == "run":
             tools.run(["command"])
         else:
-            tools.edit(str(world.library_tree.root / "partial.txt"), "old", "new")
+            tools.edit(
+                str(world.library_tree.root / "partial.txt"),
+                [{"old_text": "old", "new_text": "new"}],
+            )
     assert emitted == [
         (
             "library.updated",
@@ -1073,7 +1092,10 @@ def test_edit_emits_library_changes_but_workspace_run_and_edit_do_not(world) -> 
         world, MAIN, on_change=lambda name, payload: emitted.append((name, payload))
     )
     world.library_tree.write("note.txt", "before")
-    tools.edit(str(world.library_tree.root / "note.txt"), "before", "after")
+    tools.edit(
+        str(world.library_tree.root / "note.txt"),
+        [{"old_text": "before", "new_text": "after"}],
+    )
     assert emitted == [
         (
             "library.updated",
@@ -1089,7 +1111,7 @@ def test_edit_emits_library_changes_but_workspace_run_and_edit_do_not(world) -> 
         ]
     )
     assert result["exit_code"] == 0
-    tools.edit("workspace/note.md", "private", "updated")
+    tools.edit("workspace/note.md", [{"old_text": "private", "new_text": "updated"}])
     assert tools.read_workspace("note.md")["content"] == "updated"
     assert emitted == []
 

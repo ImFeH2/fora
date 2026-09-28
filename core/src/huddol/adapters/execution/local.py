@@ -5,7 +5,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from huddol.adapters.execution.editing import edit_file
@@ -246,22 +246,18 @@ class LocalExecution:
     def edit(
         self,
         path: str,
-        old_text: str,
-        new_text: str,
+        edits: Sequence[Mapping[str, object]],
         *,
-        replace_all: bool = False,
         write_directories: Sequence[str] | None = None,
         create: bool = False,
     ) -> EditResult:
         return edit_file(
             path,
-            old_text,
-            new_text,
+            edits,
             directories=list(
                 self.write_directories
                 if write_directories is None
                 else write_directories
             ),
-            replace_all=replace_all,
             create=create,
         )

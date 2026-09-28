@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from huddol.adapters.execution.local import LocalExecution
@@ -58,18 +58,14 @@ class BoundExecution:
     def edit(
         self,
         path: str,
-        old_text: str,
-        new_text: str,
+        edits: Sequence[Mapping[str, object]],
         *,
-        replace_all: bool = False,
         write_directories: Sequence[str] | None = None,
         create: bool = False,
     ) -> EditResult:
         return self._lookup().edit(
             path,
-            old_text,
-            new_text,
-            replace_all=replace_all,
+            edits,
             write_directories=write_directories,
             create=create,
         )

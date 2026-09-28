@@ -121,10 +121,14 @@ class DirectoryTree:
             self.read(path)
             result = edit_file(
                 str(target),
-                old_text,
-                new_text,
+                [
+                    {
+                        "old_text": old_text,
+                        "new_text": new_text,
+                        "replace_all": replace_all,
+                    }
+                ],
                 directories=[str(self._root)],
-                replace_all=replace_all,
             )
             try:
                 return self._entry(target), result.diff

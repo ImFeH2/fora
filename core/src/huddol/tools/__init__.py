@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -785,9 +785,7 @@ class AgentTools:
     def edit(
         self,
         path: str,
-        old_text: str,
-        new_text: str,
-        replace_all: bool = False,
+        edits: Sequence[Mapping[str, object]],
         create: bool = False,
     ) -> dict[str, Any]:
         self._check("edit", path)
@@ -799,9 +797,7 @@ class AgentTools:
         with self._library_updates():
             result = execution.edit(
                 path,
-                old_text,
-                new_text,
-                replace_all=replace_all,
+                edits,
                 write_directories=directories,
                 create=create,
             )

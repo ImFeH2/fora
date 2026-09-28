@@ -980,7 +980,13 @@ def test_resident_is_persisted_and_stays_unchanged_until_a_reset(
     for turn, state in enumerate(("OLD", "NEW"), start=1):
         if state == "NEW":
             tools.edit(
-                "workspace/MEMORY.md", "WORKSPACE_STATE_OLD", "WORKSPACE_STATE_NEW"
+                "workspace/MEMORY.md",
+                [
+                    {
+                        "old_text": "WORKSPACE_STATE_OLD",
+                        "new_text": "WORKSPACE_STATE_NEW",
+                    }
+                ],
             )
             world.store.append_message(room, HUMAN, "@Main continue")
         reminder = build_reminder(world.store, world.history, MAIN, "Main")
