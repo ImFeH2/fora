@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { type Draft, DraftController } from "@/features/discussions/draft";
-import { backend } from "@/lib/backend";
+import { BackendError, backend } from "@/lib/backend";
 
 const storage = vi.hoisted(() => ({
   put: vi.fn<(store: string, draft: Draft) => Promise<void>>(),
@@ -9,6 +9,14 @@ vi.mock("idb", () => ({
   openDB: async () => ({ put: storage.put, close: () => {} }),
 }));
 vi.mock("@/lib/backend", () => ({
+  BackendError: class BackendError extends Error {
+    transport: boolean;
+
+    constructor(_code: string, message: string, transport = true) {
+      super(message);
+      this.transport = transport;
+    }
+  },
   backend: {
     sendStatus: vi.fn(),
     cancelSend: vi.fn(),
@@ -235,6 +243,48 @@ describe("persistent send attempts", () => {
     expect(controller.snapshot().error).toBeNull();
   });
 
+  it("finishes upload cancellation after connection recovery without sending", async () => {
+    const controller = new DraftController(1, draft(""));
+    const file = new File(["content"], "recover-cancel.txt");
+    controller.addFiles([file]);
+    await vi.waitFor(() => expect(controller.snapshot().saving).toBe(false));
+    vi.mocked(backend.createUpload).mockResolvedValue({
+      id: "recover-upload",
+      state: "reserved",
+      expires_at: Date.now() / 1000 + 60,
+    });
+    vi.mocked(backend.uploadFile).mockImplementation(
+      (_id, _file, signal) =>
+        new Promise((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason));
+        }),
+    );
+    vi.mocked(backend.cancelUploads)
+      .mockRejectedValueOnce(
+        new BackendError("disconnected", "Connection lost", true),
+      )
+      .mockResolvedValue({ cancelled: 1 });
+    const send = vi.fn();
+    const operation = controller.send(send);
+    await vi.waitFor(() => expect(backend.uploadFile).toHaveBeenCalledOnce());
+    controller.cancel();
+    controller.setBody("Edited while cancelling");
+    await operation;
+
+    expect(send).not.toHaveBeenCalled();
+    expect(controller.snapshot().draft.pending?.cancelRequested).toBe(true);
+    expect(controller.snapshot().error).toBeNull();
+
+    await controller.connectionRestored();
+
+    expect(send).not.toHaveBeenCalled();
+    expect(backend.cancelUploads).toHaveBeenCalledTimes(2);
+    expect(controller.snapshot().draft.pending).toBeNull();
+    expect(controller.snapshot().draft.body).toBe("Edited while cancelling");
+    expect(controller.snapshot().draft.files[0].file).toBe(file);
+    expect(controller.snapshot().draft.files[0].upload).toBeUndefined();
+  });
+
   it("cancels upload preparation before starting file transfer", async () => {
     const controller = new DraftController(1, draft(""));
     const file = new File(["content"], "prepare-cancel.txt");
@@ -332,7 +382,10 @@ describe("persistent send attempts", () => {
       message: null,
     });
     await controller.discardAttempt();
-    expect(controller.snapshot().draft.pending).toEqual(attempt);
+    expect(controller.snapshot().draft.pending).toMatchObject({
+      id: attempt?.id,
+      cancelRequested: true,
+    });
     expect(controller.snapshot().draft.body).toBe("Current edit");
     expect(controller.snapshot().storageError).toBeNull();
     expect(controller.snapshot().error).toContain(

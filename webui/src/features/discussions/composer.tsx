@@ -194,7 +194,9 @@ export function Composer({
   const setBody = (value: string) => controller?.setBody(value);
   const sending = busy || !!view?.busy;
   const canSend =
-    !!controller && !!(body.trim() || files.length || view?.draft.pending);
+    !!controller &&
+    !view?.draft.pending?.cancelRequested &&
+    !!(body.trim() || files.length || view?.draft.pending);
   const fileInput = useRef<HTMLInputElement>(null);
   const extra = useRef<HTMLDivElement>(null);
   const [extraHeight, setExtraHeight] = useState(0);
@@ -684,7 +686,10 @@ export function Composer({
               ) : null}
             </div>
           ) : null}
-          {pending && sending && pending.phase === "uploading" ? (
+          {pending &&
+          sending &&
+          pending.phase === "uploading" &&
+          !pending.cancelRequested ? (
             <div className="px-4 pt-2 text-xs">
               <button
                 type="button"
@@ -697,7 +702,13 @@ export function Composer({
           ) : null}
           {pending && !sending ? (
             <div className="px-4 pt-2 text-xs">
-              <div className="font-medium">Pending message</div>
+              <div className="font-medium">
+                {pending.cancelRequested
+                  ? pending.phase === "uploading"
+                    ? "Cancelling upload"
+                    : "Cancelling send"
+                  : "Pending message"}
+              </div>
               <div className="mt-1 truncate">
                 {pending.body || (pendingNames.length ? "" : "Files")}
               </div>
@@ -711,43 +722,57 @@ export function Composer({
                   {confirmedSend ? "Could not update draft" : pendingError}
                 </div>
               ) : null}
-              <div className="mt-2 flex flex-wrap gap-3">
-                {confirmedSend || confirmedCancellation ? (
-                  <button
-                    type="button"
-                    className="underline"
-                    onClick={() => void controller?.checkResult()}
-                  >
-                    Retry
-                  </button>
-                ) : (
-                  <>
-                    {pending.phase === "sending" ? (
+              {pending.cancelRequested ? (
+                pendingError ? (
+                  <div className="mt-2 flex flex-wrap gap-3">
+                    <button
+                      type="button"
+                      className="underline"
+                      onClick={() => void controller?.checkResult()}
+                    >
+                      Retry
+                    </button>
+                  </div>
+                ) : null
+              ) : (
+                <div className="mt-2 flex flex-wrap gap-3">
+                  {confirmedSend || confirmedCancellation ? (
+                    <button
+                      type="button"
+                      className="underline"
+                      onClick={() => void controller?.checkResult()}
+                    >
+                      Retry
+                    </button>
+                  ) : (
+                    <>
+                      {pending.phase === "sending" ? (
+                        <button
+                          type="button"
+                          className="underline"
+                          onClick={() => void controller?.checkResult()}
+                        >
+                          Check result
+                        </button>
+                      ) : null}
                       <button
                         type="button"
                         className="underline"
-                        onClick={() => void controller?.checkResult()}
+                        onClick={() => void submit()}
                       >
-                        Check result
+                        Retry send
                       </button>
-                    ) : null}
-                    <button
-                      type="button"
-                      className="underline"
-                      onClick={() => void submit()}
-                    >
-                      Retry send
-                    </button>
-                    <button
-                      type="button"
-                      className="underline"
-                      onClick={() => void controller?.discardAttempt()}
-                    >
-                      Cancel send
-                    </button>
-                  </>
-                )}
-              </div>
+                      <button
+                        type="button"
+                        className="underline"
+                        onClick={() => void controller?.discardAttempt()}
+                      >
+                        Cancel send
+                      </button>
+                    </>
+                  )}
+                </div>
+              )}
             </div>
           ) : null}
         </div>
@@ -976,6 +1001,7 @@ export function Composer({
           }
           disabled={
             !controller ||
+            !!view?.draft.pending?.cancelRequested ||
             (!recordingActive && sending) ||
             voiceState === "finishing"
           }

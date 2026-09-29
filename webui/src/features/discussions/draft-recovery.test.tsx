@@ -13,6 +13,7 @@ import { BackendError, type BackendEvent, backend } from "@/lib/backend";
 const storage = vi.hoisted(() => ({
   get: vi.fn(),
   getAll: vi.fn(),
+  put: vi.fn(),
   close: vi.fn(),
 }));
 vi.mock("idb", () => ({
@@ -93,6 +94,7 @@ beforeEach(() => {
     pending: null,
   });
   storage.getAll.mockReset().mockResolvedValue([]);
+  storage.put.mockReset().mockResolvedValue(undefined);
   storage.close.mockReset();
   listeners = new Set();
 });
@@ -114,7 +116,10 @@ function organization() {
   } as Awaited<ReturnType<typeof backend.organization>>;
 }
 
-function mountComposer(discussionId: number) {
+function mountComposer(
+  discussionId: number,
+  onSend: () => Promise<boolean> = async () => true,
+) {
   return render(
     <Composer
       discussionId={discussionId}
@@ -122,7 +127,7 @@ function mountComposer(discussionId: number) {
       memberIds={new Set<number>()}
       busy={false}
       placeholder="Message"
-      onSend={async () => true}
+      onSend={onSend}
       onHeightChange={() => {}}
       onOpenVoiceSettings={() => {}}
     />,
@@ -167,6 +172,75 @@ it("retries a failed draft initialization from the Composer", async () => {
   expect(input().value).toBe("Recovered message");
   expect(screen.queryByRole("alert")).toBeNull();
   expect(backend.organization).toHaveBeenCalledTimes(2);
+});
+
+it("completes upload cancellation after connection recovery", async () => {
+  const file = new File(["content"], "recover.txt");
+  const upload = {
+    id: "recover-upload",
+    state: "receiving" as const,
+    expires_at: Date.now() / 1000 + 60,
+  };
+  storage.get.mockResolvedValue({
+    key: "test-organization:1:3:tab-id",
+    updatedAt: 0,
+    body: "Edited message",
+    bodyRevision: 1,
+    files: [
+      {
+        id: "file",
+        clientId: "client",
+        file,
+        upload,
+      },
+    ],
+    pending: {
+      id: "cancel-attempt",
+      body: "Edited message",
+      bodyRevision: 1,
+      files: [
+        {
+          id: "file",
+          clientId: "client",
+          file,
+          upload,
+        },
+      ],
+      phase: "uploading",
+      cancelRequested: true,
+    },
+  });
+  const connectionError = new BackendError(
+    "disconnected",
+    "Connection lost. Reconnect to continue.",
+    true,
+  );
+  vi.spyOn(backend, "organization").mockResolvedValue(organization());
+  vi.spyOn(backend, "onEvent").mockImplementation((listener) => {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  });
+  vi.spyOn(backend, "cancelUploads")
+    .mockRejectedValueOnce(connectionError)
+    .mockResolvedValue({ cancelled: 1 });
+  const send = vi.fn().mockResolvedValue(true);
+
+  mountComposer(3, send);
+  await waitFor(() => expect(backend.cancelUploads).toHaveBeenCalledOnce());
+  expect(screen.getByText("Cancelling upload")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Retry send" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Cancel upload" })).toBeNull();
+
+  act(() => {
+    for (const listener of listeners) listener({ type: "connection.restored" });
+  });
+
+  await waitFor(() =>
+    expect(screen.queryByText("Cancelling upload")).toBeNull(),
+  );
+  expect(backend.cancelUploads).toHaveBeenCalledTimes(2);
+  expect(send).not.toHaveBeenCalled();
+  expect(input().value).toBe("Edited message");
 });
 
 it("re-enables the Composer after connection recovery without duplicate feedback", async () => {

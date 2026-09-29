@@ -14,6 +14,7 @@ export type Submission = {
   bodyRevision: number;
   files: DraftFile[];
   phase: "uploading" | "sending";
+  cancelRequested?: boolean;
 };
 export type Draft = {
   key: string;
@@ -107,6 +108,8 @@ export class DraftController {
   #writes: Promise<unknown> = Promise.resolve();
   #abort: AbortController | null = null;
   #writeNumber = 0;
+  #retryCancellationAfterBusy = false;
+  #cancellationRecovery: Promise<void> | null = null;
 
   constructor(
     readonly discussionId: number,
@@ -210,7 +213,16 @@ export class DraftController {
   saveAgain = () => {
     void this.#persist(this.#view.draft);
   };
-  cancel = () => this.#abort?.abort();
+  cancel = () => {
+    const pending = this.#view.draft.pending;
+    if (pending?.phase === "uploading" && !pending.cancelRequested) {
+      const requested = { ...pending, cancelRequested: true };
+      const draft = { ...this.#view.draft, pending: requested };
+      this.#notify({ draft });
+      void this.#persist(draft);
+    }
+    this.#abort?.abort();
+  };
 
   async #pending(pending: Submission): Promise<void> {
     if (!(await this.#persist({ ...this.#view.draft, pending })))
@@ -255,16 +267,89 @@ export class DraftController {
     });
   }
 
+  #requestedCancellation(submission: Submission): Submission {
+    const current = this.#view.draft.pending;
+    return {
+      ...(current?.id === submission.id ? current : submission),
+      cancelRequested: true,
+    };
+  }
+
+  #cancellationFailure(error: unknown): string | null {
+    if (error instanceof BackendError && error.transport) return null;
+    return `Could not finish cancelling send: ${error instanceof Error ? error.message : String(error)}`;
+  }
+
+  #scheduleCancellationRecovery() {
+    if (
+      !this.#retryCancellationAfterBusy ||
+      !this.#view.draft.pending?.cancelRequested
+    )
+      return;
+    this.#retryCancellationAfterBusy = false;
+    void this.#completeCancellation();
+  }
+
+  async #completeCancellation(): Promise<void> {
+    const pending = this.#view.draft.pending;
+    if (!pending?.cancelRequested) return;
+    if (this.#view.busy) {
+      this.#retryCancellationAfterBusy = true;
+      return;
+    }
+    if (this.#cancellationRecovery) {
+      await this.#cancellationRecovery;
+      return;
+    }
+    const operation = (async () => {
+      this.#notify({ busy: true });
+      try {
+        await this.#cancelled(pending);
+      } catch (error) {
+        if (!(error instanceof BackendError && error.transport))
+          this.#notify({ error: this.#cancellationFailure(error) });
+      } finally {
+        this.#notify({ busy: false });
+      }
+    })();
+    this.#cancellationRecovery = operation;
+    try {
+      await operation;
+    } finally {
+      if (this.#cancellationRecovery === operation)
+        this.#cancellationRecovery = null;
+      this.#scheduleCancellationRecovery();
+    }
+  }
+
+  connectionRestored = () => this.#completeCancellation();
+
   async #cancelled(submission: Submission) {
+    const requested = this.#requestedCancellation(submission);
+    const marked = { ...this.#view.draft, pending: requested };
     this.#notify({
+      draft: marked,
       submissionResult: { id: submission.id, state: "cancelled" },
     });
-    const ids = submission.files.flatMap((item) =>
+    await this.#persist(marked);
+    const ids = requested.files.flatMap((item) =>
       item.upload ? [item.upload.id] : [],
     );
-    if (ids.length) await backend.cancelUploads(ids);
+    try {
+      if (ids.length) await backend.cancelUploads(ids);
+    } catch (error) {
+      const current = this.#view.draft.pending;
+      this.#notify({
+        draft: {
+          ...this.#view.draft,
+          pending: current?.id === requested.id ? current : requested,
+        },
+        error: this.#cancellationFailure(error),
+      });
+      throw error;
+    }
     const current = this.#view.draft;
-    const cancelled = new Set(submission.files.map((item) => item.id));
+    const cancelled = new Set(requested.files.map((item) => item.id));
     const saved = await this.#persist({
       ...current,
       files: current.files.map((item) =>
@@ -274,14 +359,14 @@ export class DraftController {
       ),
       pending: null,
       voiceSubmission:
-        current.voiceSubmission?.id === submission.id
+        current.voiceSubmission?.id === requested.id
           ? null
           : current.voiceSubmission,
     });
     if (!saved) {
       const reason = this.#view.storageError ?? "Draft could not be saved";
       this.#notify({
-        draft: { ...this.#view.draft, pending: submission },
+        draft: { ...this.#view.draft, pending: requested },
         storageError: null,
         error: `Could not finish cancelling send: ${reason}`,
       });
@@ -289,12 +374,16 @@ export class DraftController {
     }
     this.#notify({
       error: null,
-      submissionResult: { id: submission.id, state: "cancelled" },
+      submissionResult: { id: requested.id, state: "cancelled" },
     });
   }
 
   async checkResult() {
     const pending = this.#view.draft.pending;
+    if (pending?.cancelRequested) {
+      await this.#completeCancellation();
+      return;
+    }
     if (pending?.phase !== "sending" || this.#view.busy) return;
     this.#notify({ busy: true });
     try {
@@ -319,9 +408,16 @@ export class DraftController {
             "Send result is unconfirmed. Retry or cancel the saved send attempt.",
         });
     } catch (error) {
-      this.#notify({
-        error: `Send result is unconfirmed. ${error instanceof Error ? error.message : String(error)}`,
-      });
+      if (
+        !(
+          error instanceof BackendError &&
+          error.transport &&
+          this.#view.draft.pending?.cancelRequested
+        )
+      )
+        this.#notify({
+          error: `Send result is unconfirmed. ${error instanceof Error ? error.message : String(error)}`,
+        });
     } finally {
       this.#notify({ busy: false });
     }
@@ -329,6 +425,10 @@ export class DraftController {
 
   async discardAttempt() {
     const pending = this.#view.draft.pending;
+    if (pending?.cancelRequested) {
+      await this.#completeCancellation();
+      return;
+    }
     if (!pending || this.#view.busy) return;
     this.#notify({ busy: true });
     try {
@@ -341,17 +441,23 @@ export class DraftController {
       }
       await this.#cancelled(pending);
     } catch (error) {
-      this.#notify({
-        error: error instanceof Error ? error.message : String(error),
-      });
+      if (!(error instanceof BackendError && error.transport))
+        this.#notify({
+          error: error instanceof Error ? error.message : String(error),
+        });
     } finally {
       this.#notify({ busy: false });
+      this.#scheduleCancellationRecovery();
     }
   }
 
   async send(onSend: SendDraft) {
     if (this.#view.busy) return;
     const draft = this.#view.draft;
+    if (draft.pending?.cancelRequested) {
+      await this.#completeCancellation();
+      return;
+    }
     if (!draft.pending && !draft.body.trim() && !draft.files.length) return;
     this.#notify({
       busy: true,
@@ -462,12 +568,18 @@ export class DraftController {
         try {
           await this.#cancelled(submission);
         } catch (cancellationError) {
-          this.#notify({
-            error:
-              cancellationError instanceof Error
-                ? cancellationError.message
-                : String(cancellationError),
-          });
+          if (
+            !(
+              cancellationError instanceof BackendError &&
+              cancellationError.transport
+            )
+          )
+            this.#notify({
+              error:
+                cancellationError instanceof Error
+                  ? cancellationError.message
+                  : String(cancellationError),
+            });
         }
       } else {
         this.#notify({
@@ -477,6 +589,7 @@ export class DraftController {
     } finally {
       this.#abort = null;
       this.#notify({ busy: false });
+      this.#scheduleCancellationRecovery();
     }
   }
 }
@@ -593,7 +706,11 @@ export function useDraft(discussion: number) {
       });
     };
     const off = backend.onEvent((event) => {
-      if (event.type !== "connection.restored" || current) return;
+      if (event.type !== "connection.restored") return;
+      if (current) {
+        void current.connectionRestored();
+        return;
+      }
       setError(null);
       load();
     });
