@@ -187,17 +187,19 @@ export function useThreadData(id: number, memberId: number) {
         } else {
           setFailed(true);
           blocked.current = true;
-          toast({
-            id: `thread-${id}-page`,
-            tone: "danger",
-            title: "Could not load messages",
-            description: error instanceof Error ? error.message : String(error),
-            duration: null,
-            action: {
-              label: "Retry",
-              onClick: () => void requestRef.current(mode),
-            },
-          });
+          if (!(error instanceof BackendError && error.transport))
+            toast({
+              id: `thread-${id}-page`,
+              tone: "danger",
+              title: "Could not load messages",
+              description:
+                error instanceof Error ? error.message : String(error),
+              duration: null,
+              action: {
+                label: "Retry",
+                onClick: () => void requestRef.current(mode),
+              },
+            });
         }
       } finally {
         if (live.current && epoch === generation.current) {
@@ -226,7 +228,8 @@ export function useThreadData(id: number, memberId: number) {
       }
       readingTarget.current = Math.max(readingTarget.current, messageId);
       if (readingFailed.current && !retry)
-        throw new Error(
+        throw new BackendError(
+          "reading_position_blocked",
           "Retry saving the reading position before marking handled",
         );
       if (reading.current) return reading.current;
@@ -257,19 +260,25 @@ export function useThreadData(id: number, memberId: number) {
         .catch((error: unknown) => {
           if (!live.current || epoch !== generation.current) return;
           readingFailed.current = true;
-          toast({
-            id: `thread-${id}-read`,
-            tone: "danger",
-            title: "Could not save reading position",
-            description: error instanceof Error ? error.message : String(error),
-            duration: null,
-            action: {
-              label: "Retry",
-              onClick: () =>
-                void markRead(readingTarget.current, true).catch(() => {}),
-            },
-          });
-          throw error;
+          if (!(error instanceof BackendError && error.transport))
+            toast({
+              id: `thread-${id}-read`,
+              tone: "danger",
+              title: "Could not save reading position",
+              description:
+                error instanceof Error ? error.message : String(error),
+              duration: null,
+              action: {
+                label: "Retry",
+                onClick: () =>
+                  void markRead(readingTarget.current, true).catch(() => {}),
+              },
+            });
+          throw new BackendError(
+            "reading_position_failed",
+            error instanceof Error ? error.message : String(error),
+            error instanceof BackendError && error.transport,
+          );
         })
         .finally(() => {
           if (epoch === generation.current) reading.current = null;

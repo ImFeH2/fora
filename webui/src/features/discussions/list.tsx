@@ -26,14 +26,17 @@ import {
   Chip,
   CountPill,
   Dot,
+  dismissToast,
   IconButton,
   SearchField,
   StatusText,
+  toast,
 } from "@/components/ui/index";
 import { OverflowMenu } from "@/components/ui/menu";
 import { StatePanel } from "@/components/ui/state-panel";
 import { CreateDiscussionDialog } from "@/features/discussions/create";
 import {
+  BackendError,
   backend,
   type DiscussionSummary,
   type FoundMessage,
@@ -97,13 +100,26 @@ export function DiscussionsPage() {
   const results = search?.query === query.trim() ? search.items : null;
   const [archived, setArchived] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [archiveBusy, setArchiveBusy] = useState<number | null>(null);
   const [connectionRevision, setConnectionRevision] = useState(0);
 
   const load = useCallback(async () => {
     try {
       setList(await backend.discussions(archived));
+      dismissToast("discussions-list");
     } catch (failure) {
-      backend.reportFailure(failure);
+      if (failure instanceof BackendError && failure.transport)
+        backend.reportFailure(failure);
+      else
+        toast({
+          id: "discussions-list",
+          tone: "danger",
+          title: "Could not load Discussions",
+          description:
+            failure instanceof Error ? failure.message : String(failure),
+          duration: null,
+          action: { label: "Retry", onClick: () => void load() },
+        });
     }
   }, [archived]);
 
@@ -158,6 +174,31 @@ export function DiscussionsPage() {
     list?.find((item) => item.id === id)?.topic ?? `Discussion ${id}`;
 
   const searching = query.trim().length > 0;
+
+  const archive = async (item: DiscussionSummary) => {
+    if (archiveBusy !== null) return;
+    setArchiveBusy(item.id);
+    try {
+      await backend.archiveDiscussion(item.id, !item.archived);
+      await load();
+    } catch (failure) {
+      if (failure instanceof BackendError && failure.transport)
+        backend.reportFailure(failure);
+      else
+        toast({
+          id: `discussion-archive:${item.id}`,
+          tone: "danger",
+          title: item.archived
+            ? "Could not unarchive Discussion"
+            : "Could not archive Discussion",
+          description:
+            failure instanceof Error ? failure.message : String(failure),
+          duration: null,
+        });
+    } finally {
+      setArchiveBusy(null);
+    }
+  };
 
   return (
     <Page>
@@ -261,10 +302,8 @@ export function DiscussionsPage() {
                 item={item}
                 byId={byId}
                 onOpen={() => navigate({ name: "discussion", id: item.id })}
-                onArchive={async () => {
-                  await backend.archiveDiscussion(item.id, !item.archived);
-                  await load();
-                }}
+                archiveBusy={archiveBusy === item.id}
+                onArchive={() => void archive(item)}
               />
             ))}
           </Table>
@@ -285,11 +324,13 @@ export function DiscussionRow({
   byId,
   onOpen,
   onArchive,
+  archiveBusy = false,
 }: {
   item: DiscussionSummary;
   byId: Map<number, Member>;
   onOpen: () => void;
   onArchive: () => void;
+  archiveBusy?: boolean;
 }) {
   const people = item.member_ids
     .map((id) => byId.get(id))
@@ -340,9 +381,7 @@ export function DiscussionRow({
             {plural(item.unread, "new message")}
           </StatusText>
         ) : (
-          <StatusText dot={<Dot tone="green" />}>
-            <span className="text-fg-muted">Up to date</span>
-          </StatusText>
+          <StatusText dot={<Dot tone="green" />}>{null}</StatusText>
         )}
       </td>
       <td className="relative z-1 w-12 text-right">
@@ -357,6 +396,7 @@ export function DiscussionRow({
               ) : (
                 <Archive size={15} />
               ),
+              disabled: archiveBusy,
               onSelect: onArchive,
             },
           ]}

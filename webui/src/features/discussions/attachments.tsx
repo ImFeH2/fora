@@ -1,7 +1,7 @@
 import { Download, FileIcon, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Modal } from "@/components/ui/dialog";
-import { Button } from "@/components/ui/index";
+import { Button, Spinner } from "@/components/ui/index";
 import type { DraftFile } from "@/features/discussions/draft";
 import { type Attachment, backend } from "@/lib/backend";
 
@@ -205,10 +205,10 @@ export function MessageAttachment({
               className="h-full w-full object-contain"
               onError={() => setError("The image could not be displayed.")}
             />
+          ) : loading ? (
+            <Spinner label="Loading image" />
           ) : (
-            <span className="text-xs text-fg-muted">
-              {loading ? "Loading image…" : "Image preview"}
-            </span>
+            <span className="text-xs text-fg-muted">Image preview</span>
           )}
         </button>
       ) : null}

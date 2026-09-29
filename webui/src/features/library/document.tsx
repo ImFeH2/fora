@@ -1,5 +1,4 @@
-import { clsx } from "clsx";
-import { Check, Save, SquarePen, Trash2 } from "lucide-react";
+import { Save, SquarePen, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type Route, useNavigate } from "@/app/router";
 import {
@@ -15,6 +14,7 @@ import {
   Chip,
   dismissToast,
   EmptyState,
+  Spinner,
   Textarea,
   toast,
 } from "@/components/ui/index";
@@ -24,10 +24,6 @@ import { BackendError, backend } from "@/lib/backend";
 import { formatBytes } from "@/lib/format";
 
 type Loaded = { content: string; hash: string };
-
-type Saved = "shown" | "fading" | null;
-
-const SAVED_HOLD_MS = 2000;
 
 function conflictToastId(path: string): string {
   return `document-conflict:${path}`;
@@ -75,7 +71,7 @@ export function DocumentPage({ path }: { path: string }) {
     "not_found" | "not_readable" | null
   >(null);
   const [failed, setFailed] = useState(false);
-  const [saved, setSaved] = useState<Saved>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [doomed, setDoomed] = useState(false);
@@ -148,18 +144,13 @@ export function DocumentPage({ path }: { path: string }) {
 
   useEffect(() => () => dismissToast(conflictToastId(path)), [path]);
 
-  useEffect(() => {
-    if (saved !== "shown") return;
-    const timer = setTimeout(() => setSaved("fading"), SAVED_HOLD_MS);
-    return () => clearTimeout(timer);
-  }, [saved]);
-
   const dirty = loaded !== null && draft !== loaded.content;
   const crumb = documentCrumbs(path, navigate);
 
   const save = async () => {
     if (!dirty || loaded === null) return;
     setBusy(true);
+    setSaveError(null);
     try {
       const result = await backend.writeLibrary(path, draft, loaded.hash);
       if (result.conflict) {
@@ -174,10 +165,13 @@ export function DocumentPage({ path }: { path: string }) {
         return;
       }
       setLoaded({ content: draft, hash: result.hash });
-      setSaved("shown");
-      toast({ tone: "success", title: "Saved" });
     } catch (failure) {
-      backend.reportFailure(failure);
+      if (failure instanceof BackendError && failure.transport)
+        backend.reportFailure(failure);
+      else
+        setSaveError(
+          failure instanceof Error ? failure.message : String(failure),
+        );
     } finally {
       setBusy(false);
     }
@@ -206,8 +200,8 @@ export function DocumentPage({ path }: { path: string }) {
               disabled={!dirty || busy || failed}
               onClick={save}
             >
-              <Save size={16} />
-              {busy ? "Saving" : "Save"}
+              {busy ? <Spinner label="Saving document" /> : <Save size={16} />}
+              Save
             </Button>
             <OverflowMenu
               label={`Actions for ${path}`}
@@ -233,25 +227,14 @@ export function DocumentPage({ path }: { path: string }) {
       <Toolbar>
         <Chip>{formatBytes(new TextEncoder().encode(draft).length)}</Chip>
         {dirty ? <Chip tone="blue">Unsaved changes</Chip> : null}
-        {saved ? (
-          <span
-            className={clsx(
-              "inline-flex animate-pop-in transition-opacity duration-(--duration-slow) ease-standard",
-              saved === "fading" && "opacity-0",
-            )}
-            onTransitionEnd={() =>
-              setSaved((current) => (current === "fading" ? null : current))
-            }
-          >
-            <Chip tone="success">
-              <Check size={12} />
-              Saved
-            </Chip>
-          </span>
-        ) : null}
       </Toolbar>
       <PageBody variant="flush">
         <div className="flex flex-1 min-h-0 flex-col gap-4 px-8 pb-6">
+          {saveError ? (
+            <p role="alert" className="text-sm text-danger">
+              {saveError}
+            </p>
+          ) : null}
           {unavailable ? <DocumentUnavailable code={unavailable} /> : null}
           <div className="grid flex-1 min-h-0 grid-rows-[minmax(0,1fr)] items-stretch font-mono tracking-[0]">
             <Textarea
@@ -262,7 +245,6 @@ export function DocumentPage({ path }: { path: string }) {
               spellCheck={false}
               onChange={(event) => {
                 setDraft(event.target.value);
-                setSaved(null);
               }}
             />
           </div>

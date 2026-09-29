@@ -7,7 +7,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { Button, Field, Input } from "@/components/ui/index";
+import { Button, Field, Input, Spinner } from "@/components/ui/index";
 import {
   reportLoadFailure,
   useReportSettingsSave,
@@ -52,12 +52,14 @@ export function agentUpdate(
 export function AgentForm({
   drafts,
   disabled = false,
+  saving = false,
   first,
   onChange,
   onSave,
 }: {
   drafts: Record<string, string>;
   disabled?: boolean;
+  saving?: boolean;
   first?: Ref<HTMLInputElement>;
   onChange: (drafts: Record<string, string>) => void;
   onSave: (values: Record<string, number>) => void;
@@ -93,11 +95,13 @@ export function AgentForm({
                     label={label}
                     htmlFor={`${id}-${key}`}
                     hint={
-                      key === "request_limit"
-                        ? "0 means unlimited. Changes apply to new Turns."
-                        : key === "token_limit"
-                          ? "0 means no ceiling."
-                          : undefined
+                      key in drafts && agentInteger(key, drafts[key]) === null
+                        ? "Enter a valid whole number before saving."
+                        : key === "request_limit"
+                          ? "0 means unlimited. Changes apply to new Turns."
+                          : key === "token_limit"
+                            ? "0 means no ceiling."
+                            : undefined
                     }
                   >
                     <Input
@@ -131,7 +135,11 @@ export function AgentForm({
             type="submit"
             disabled={disabled || !update}
           >
-            <Save size={16} />
+            {saving ? (
+              <Spinner label="Saving agent settings" />
+            ) : (
+              <Save size={16} />
+            )}
             Save
           </Button>
         </div>
@@ -183,6 +191,7 @@ export function AgentPanel() {
     <AgentForm
       drafts={drafts}
       disabled={loading || saving || loadFailed}
+      saving={saving}
       first={first}
       onChange={setDrafts}
       onSave={(values) => void save("agent", values)}

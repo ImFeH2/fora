@@ -17,6 +17,7 @@ import {
 } from "@/features/settings/saver";
 import {
   type AgentModelConfig,
+  BackendError,
   backend,
   type ModelCatalog,
   type ProviderConfig,
@@ -179,18 +180,28 @@ export function AgentCreateDialog({
   const create = async () => {
     if (!catalog || !name.trim() || busy) return;
     setBusy(true);
+    let created = false;
     try {
       await backend.createAgent(name.trim(), value);
-      await onCreated();
-      onClose();
+      created = true;
     } catch (error) {
-      toast({
-        tone: "danger",
-        title: "Could not create Agent",
-        description: error instanceof Error ? error.message : String(error),
-      });
+      if (error instanceof BackendError && error.transport)
+        backend.reportFailure(error);
+      else
+        toast({
+          tone: "danger",
+          title: "Could not create Agent",
+          description: error instanceof Error ? error.message : String(error),
+        });
     } finally {
       setBusy(false);
+    }
+    if (!created) return;
+    onClose();
+    try {
+      await onCreated();
+    } catch (error) {
+      backend.reportFailure(error);
     }
   };
   return (
@@ -210,6 +221,7 @@ export function AgentCreateDialog({
             disabled={!catalog || !name.trim() || busy}
             onClick={() => void create()}
           >
+            {busy ? <Spinner label="Creating Agent" /> : null}
             Create Agent
           </Button>
         </>
@@ -244,6 +256,7 @@ export function AgentModelPanel({ agentId }: { agentId: number }) {
   });
   const [busy, setBusy] = useState(false);
   const dirty = useRef(false);
+  useReportSettingsSave(`agent-model-${agentId}`, busy);
   const loadGeneration = useRef(0);
   const load = useCallback(async () => {
     const generation = ++loadGeneration.current;
@@ -296,13 +309,16 @@ export function AgentModelPanel({ agentId }: { agentId: number }) {
           setCatalog(updated);
           setValue(updated.agent_configs[String(agentId)] ?? value);
           dirty.current = false;
-          toast({ tone: "success", title: "Agent model settings saved" });
         } catch (error) {
-          toast({
-            tone: "danger",
-            title: "Could not save Agent model settings",
-            description: error instanceof Error ? error.message : String(error),
-          });
+          if (error instanceof BackendError && error.transport)
+            backend.reportFailure(error);
+          else
+            toast({
+              tone: "danger",
+              title: "Could not save Agent model settings",
+              description:
+                error instanceof Error ? error.message : String(error),
+            });
         } finally {
           setBusy(false);
         }
@@ -319,6 +335,7 @@ export function AgentModelPanel({ agentId }: { agentId: number }) {
           <Spinner label="Loading models" />
         )}
         <Button type="submit" variant="primary">
+          {busy ? <Spinner label="Saving Agent model settings" /> : null}
           Save model settings
         </Button>
       </fieldset>
@@ -378,14 +395,16 @@ export function ModelPanel() {
         if (!created) throw new Error("Saved provider is missing");
         setProviderId(created.id);
       }
-      toast({ tone: "success", title: "Model settings saved" });
       return true;
     } catch (error) {
-      toast({
-        tone: "danger",
-        title: "Could not save model settings",
-        description: error instanceof Error ? error.message : String(error),
-      });
+      if (error instanceof BackendError && error.transport)
+        backend.reportFailure(error);
+      else
+        toast({
+          tone: "danger",
+          title: "Could not save model settings",
+          description: error instanceof Error ? error.message : String(error),
+        });
       return false;
     } finally {
       setBusy(false);
@@ -417,7 +436,7 @@ export function ModelPanel() {
         <Spinner label="Loading model settings" />
       ) : (
         <>
-          <DefaultModelForm catalog={catalog} save={save} />
+          <DefaultModelForm catalog={catalog} save={save} busy={busy} />
           <section className="provider-card">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <h2 className="text-base font-medium">Provider connection</h2>
@@ -444,6 +463,7 @@ export function ModelPanel() {
               key={provider?.id ?? "new"}
               provider={provider}
               save={save}
+              busy={busy}
               onDeleted={() => chooseProvider(null)}
             />
           </section>
@@ -490,6 +510,7 @@ export function ModelPanel() {
                         provider={provider}
                         model={model}
                         save={save}
+                        busy={busy}
                       />
                     </div>
                   </section>
@@ -515,6 +536,7 @@ export function ModelPanel() {
                     key={provider.id}
                     provider={provider}
                     save={save}
+                    busy={busy}
                   />
                 </div>
               </section>
@@ -529,9 +551,11 @@ export function ModelPanel() {
 function DefaultModelForm({
   catalog,
   save,
+  busy,
 }: {
   catalog: ModelCatalog;
   save: SaveModel;
+  busy: boolean;
 }) {
   const [value, setValue] = useState<AgentModelConfig>({
     model_id: catalog.default_model_id,
@@ -565,7 +589,7 @@ function DefaultModelForm({
         inherit={false}
       />
       <Button type="submit" variant="primary">
-        <Save size={16} />
+        {busy ? <Spinner label="Saving model defaults" /> : <Save size={16} />}
         Save defaults
       </Button>
     </form>
@@ -575,10 +599,12 @@ function DefaultModelForm({
 function ProviderForm({
   provider,
   save,
+  busy,
   onDeleted,
 }: {
   provider?: ProviderConfig;
   save: SaveModel;
+  busy: boolean;
   onDeleted: () => void;
 }) {
   const id = useId();
@@ -688,6 +714,7 @@ function ProviderForm({
       </label>
       <div className="flex gap-2">
         <Button type="submit" variant="primary">
+          {busy ? <Spinner label="Saving provider" /> : null}
           {provider ? "Save provider" : "Create provider"}
         </Button>
         {provider ? (
@@ -708,10 +735,12 @@ function ModelForm({
   provider,
   model,
   save,
+  busy,
 }: {
   provider: ProviderConfig;
   model?: RegisteredModel;
   save: SaveModel;
+  busy: boolean;
 }) {
   const id = useId();
   const [name, setName] = useState(model?.name ?? "");
@@ -767,11 +796,14 @@ function ModelForm({
       if (request === listRequest.current) setOptions(result.models);
     } catch (error) {
       if (request === listRequest.current) {
-        toast({
-          tone: "danger",
-          title: "Could not load models",
-          description: error instanceof Error ? error.message : String(error),
-        });
+        if (error instanceof BackendError && error.transport)
+          backend.reportFailure(error);
+        else
+          toast({
+            tone: "danger",
+            title: "Could not load models",
+            description: error instanceof Error ? error.message : String(error),
+          });
       }
     } finally {
       if (request === listRequest.current) setListing(false);
@@ -798,11 +830,14 @@ function ModelForm({
         description: modelTestDescription(result.latency_ms, result.reply),
       });
     } catch (error) {
-      toast({
-        tone: "danger",
-        title: "Model test failed",
-        description: error instanceof Error ? error.message : String(error),
-      });
+      if (error instanceof BackendError && error.transport)
+        backend.reportFailure(error);
+      else
+        toast({
+          tone: "danger",
+          title: "Model test failed",
+          description: error instanceof Error ? error.message : String(error),
+        });
     } finally {
       setTesting(false);
     }
@@ -869,13 +904,18 @@ function ModelForm({
         <Field
           label="Thinking token budget"
           htmlFor={`${id}-budget`}
-          hint="Used only when budget is selected."
+          hint={
+            validBudget
+              ? "Used only when budget is selected."
+              : "Enter a positive whole number."
+          }
         >
           <Input
             id={`${id}-budget`}
             type="number"
             min="1"
             step="1"
+            aria-invalid={!validBudget}
             value={budgetTokens}
             onChange={(event) => setBudgetTokens(event.target.value)}
           />
@@ -905,6 +945,7 @@ function ModelForm({
       </Field>
       <div className="flex flex-wrap gap-2">
         <Button type="submit" variant="primary">
+          {busy ? <Spinner label="Saving model" /> : null}
           {model ? "Save model" : "Add model"}
         </Button>
         <Button

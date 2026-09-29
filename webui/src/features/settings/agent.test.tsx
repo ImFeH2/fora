@@ -105,7 +105,7 @@ describe("Agent settings", () => {
       /<input[^>]*id="[^"]*-memory_index_bytes"[^>]*aria-invalid="true"/,
     );
     expect(html).toMatch(/<button(?=[^>]*type="submit")[^>]*disabled=""/);
-    expect(html).not.toContain("Enter a");
+    expect(html).toContain("Enter a valid whole number before saving.");
   });
 
   it("does not invent defaults before loading", () => {

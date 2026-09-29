@@ -10,7 +10,14 @@ import {
   useRef,
   useState,
 } from "react";
-import { Avatar, autoGrowHeight, Textarea, toast } from "@/components/ui/index";
+import {
+  Avatar,
+  autoGrowHeight,
+  dismissToast,
+  Spinner,
+  Textarea,
+  toast,
+} from "@/components/ui/index";
 import { DraftAttachments } from "@/features/discussions/attachments";
 import { type SendDraft, useDraft } from "@/features/discussions/draft";
 import {
@@ -196,7 +203,7 @@ export function Composer({
     return () => observer.disconnect();
   }, []);
   const [voiceState, setVoiceState] = useState<VoiceState>("closed");
-  const [voiceError, setVoiceError] = useState("");
+
   const [levels, setLevels] = useState([0, 0, 0, 0, 0]);
   const recording = useRef<VoiceRecording | null>(null);
   const voiceConfigRead = useRef<number | null>(null);
@@ -260,7 +267,7 @@ export function Composer({
     const version = ++nextVoiceConfigVersion.current;
     voiceConfigVersion.current = version;
     voiceConfigRead.current = version;
-    setVoiceError("");
+    dismissToast("voice-input");
     const isCurrentVoiceConfigRead = () =>
       mounted.current &&
       voiceConfigVersion.current === version &&
@@ -277,9 +284,14 @@ export function Composer({
       const current = isCurrentVoiceConfigRead();
       releaseVoiceConfigRead();
       if (current)
-        setVoiceError(
-          failure instanceof Error ? failure.message : String(failure),
-        );
+        toast({
+          id: "voice-input",
+          tone: "danger",
+          title: "Could not read voice settings",
+          description:
+            failure instanceof Error ? failure.message : String(failure),
+          duration: null,
+        });
       return;
     }
     if (!isCurrentVoiceConfigRead()) {
@@ -288,7 +300,13 @@ export function Composer({
     }
     releaseVoiceConfigRead();
     if (typeof values.api_key_set !== "boolean") {
-      setVoiceError("Voice settings did not include API key status.");
+      toast({
+        id: "voice-input",
+        tone: "danger",
+        title: "Could not read voice settings",
+        description: "Voice settings did not include API key status.",
+        duration: null,
+      });
       return;
     }
     if (!values.api_key_set) {
@@ -342,7 +360,7 @@ export function Composer({
       submissionUnsubscribe.current = unsubscribe;
       updateResult();
     }
-    setVoiceError("");
+    dismissToast("voice-input");
     setLevels([0, 0, 0, 0, 0]);
     const active = new VoiceRecording((event) => {
       if (
@@ -382,7 +400,13 @@ export function Composer({
       } else if (event.code === "voice_config") {
         showVoiceSettingsToast();
       } else {
-        setVoiceError(event.message);
+        toast({
+          id: "voice-input",
+          tone: "danger",
+          title: "Could not transcribe voice input",
+          description: event.message,
+          duration: null,
+        });
       }
     });
     recording.current = active;
@@ -553,13 +577,21 @@ export function Composer({
     await controller.send(onSend);
     if (!controller.snapshot().draft.body) setCaret(0);
   };
-  const draftStatus =
-    view?.progress ??
-    (view?.saving
-      ? "Saving draft…"
-      : view?.storageError
-        ? "Draft not saved"
-        : null);
+  const pending = view?.draft.pending ?? null;
+  const pendingError = pending && view?.error ? view.error : null;
+  const draftFailure =
+    draftError ??
+    view?.storageError ??
+    (pending ? null : (view?.error ?? null));
+  const confirmedSend =
+    pending !== null &&
+    view?.submissionResult?.id === pending.id &&
+    view.submissionResult.state === "sent";
+  const confirmedCancellation =
+    pending !== null &&
+    view?.submissionResult?.id === pending.id &&
+    view.submissionResult.state === "cancelled";
+  const pendingNames = pending?.files.map((item) => item.file.name) ?? [];
 
   return (
     <div
@@ -623,9 +655,9 @@ export function Composer({
               onRemove={(id) => controller?.removeFile(id)}
             />
           ) : null}
-          {draftError || view?.storageError || view?.error ? (
+          {draftFailure ? (
             <div role="alert" className="px-4 pt-3 text-sm text-red-300">
-              {draftError ?? view?.storageError ?? view?.error}
+              {draftFailure}
               {view?.storageError ? (
                 <button
                   type="button"
@@ -637,65 +669,73 @@ export function Composer({
               ) : null}
             </div>
           ) : null}
-          {view?.draft.pending ? (
+          {pending && sending && pending.phase === "uploading" ? (
             <div className="px-4 pt-2 text-xs">
-              <div className="truncate">
-                Saved send attempt: {view.draft.pending.body || "Files"} ·{" "}
-                {view.draft.pending.files.length} files
+              <button
+                type="button"
+                className="underline"
+                onClick={() => controller?.cancel()}
+              >
+                Cancel upload
+              </button>
+            </div>
+          ) : null}
+          {pending && !sending ? (
+            <div className="px-4 pt-2 text-xs">
+              <div className="font-medium">Pending message</div>
+              <div className="mt-1 truncate">
+                {pending.body || (pendingNames.length ? "" : "Files")}
               </div>
-              {sending ? (
-                view.draft.pending.phase === "uploading" ? (
-                  <button
-                    type="button"
-                    className="mt-1 underline"
-                    onClick={() => controller?.cancel()}
-                  >
-                    Cancel upload
-                  </button>
-                ) : null
-              ) : (
-                <div className="mt-1 flex gap-3">
+              {pendingNames.length ? (
+                <div className="mt-1 truncate text-fg-muted">
+                  {pendingNames.join(", ")}
+                </div>
+              ) : null}
+              {pendingError ? (
+                <div role="alert" className="mt-2 text-red-300">
+                  {confirmedSend ? "Could not update draft" : pendingError}
+                </div>
+              ) : null}
+              <div className="mt-2 flex flex-wrap gap-3">
+                {confirmedSend || confirmedCancellation ? (
                   <button
                     type="button"
                     className="underline"
-                    onClick={() => void submit()}
+                    onClick={() => void controller?.checkResult()}
                   >
-                    Retry saved send
+                    Retry
                   </button>
-                  {view.draft.pending.phase === "sending" ? (
+                ) : (
+                  <>
+                    {pending.phase === "sending" ? (
+                      <button
+                        type="button"
+                        className="underline"
+                        onClick={() => void controller?.checkResult()}
+                      >
+                        Check result
+                      </button>
+                    ) : null}
                     <button
                       type="button"
                       className="underline"
-                      onClick={() => void controller?.checkResult()}
+                      onClick={() => void submit()}
                     >
-                      Check send result
+                      Retry send
                     </button>
-                  ) : null}
-                  <button
-                    type="button"
-                    className="underline"
-                    onClick={() => void controller?.discardAttempt()}
-                  >
-                    Discard send attempt
-                  </button>
-                </div>
-              )}
-            </div>
-          ) : null}
-          {draftStatus ? (
-            <div role="status" className="px-4 pt-2 text-xs opacity-70">
-              {draftStatus}
+                    <button
+                      type="button"
+                      className="underline"
+                      onClick={() => void controller?.discardAttempt()}
+                    >
+                      Cancel send
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
           ) : null}
         </div>
-        {voiceError ? (
-          <div
-            role="alert"
-            className="absolute bottom-full left-0 right-0 mb-2 rounded-lg bg-surface-raised p-3 text-sm text-fg"
-          >
-            {voiceError}
-          </div>
-        ) : null}
         {suggesting ? (
           <div
             className="absolute bottom-full mb-2 left-0 right-0 z-(--layer-popover) max-h-66 overflow-y-auto rounded-sm bg-surface-raised p-1 shadow-popover origin-bottom animate-pop-in"
@@ -869,13 +909,11 @@ export function Composer({
                   />
                 ))}
               </div>
-              <span>
-                {voiceState === "starting"
-                  ? "Starting microphone…"
-                  : voiceState === "finishing"
-                    ? "Transcribing…"
-                    : "Listening…"}
-              </span>
+              {voiceState === "starting" ? (
+                <Spinner label="Starting microphone" />
+              ) : voiceState === "finishing" ? (
+                <Spinner label="Transcribing" />
+              ) : null}
               <button type="button" onClick={cancelRecording}>
                 Cancel
               </button>
@@ -933,9 +971,26 @@ export function Composer({
           }}
         >
           {recordingActive ? (
-            <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
-              <rect width="12" height="12" rx="2" fill="currentColor" />
-            </svg>
+            voiceState === "starting" || voiceState === "finishing" ? (
+              <Spinner
+                label={
+                  voiceState === "finishing"
+                    ? "Transcribing"
+                    : "Starting microphone"
+                }
+              />
+            ) : (
+              <svg
+                width="12"
+                height="12"
+                viewBox="0 0 12 12"
+                aria-hidden="true"
+              >
+                <rect width="12" height="12" rx="2" fill="currentColor" />
+              </svg>
+            )
+          ) : sending ? (
+            <Spinner label="Sending message" />
           ) : (
             <span
               className="relative flex h-full w-full items-center justify-center"

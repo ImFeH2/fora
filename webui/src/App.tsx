@@ -90,7 +90,7 @@ function View({
 const CONNECTION_TOAST = "connection";
 
 function reconnect() {
-  void backend.reconnect().catch(backend.reportFailure);
+  void backend.reconnect().catch(reportBackendFailure);
 }
 
 function reportBackendFailure(error: BackendError) {
@@ -234,6 +234,7 @@ export function useApplication() {
   const generation = useRef(0);
   const pending = useRef<Promise<void> | null>(null);
   const dirty = useRef(false);
+  const automaticRecovery = useRef(false);
 
   const refresh = useCallback((): Promise<void> => {
     if (!live.current) return Promise.resolve();
@@ -298,7 +299,7 @@ export function useApplication() {
 
   const retry = useCallback((): Promise<void> => {
     if (backend.disconnected)
-      return backend.reconnect().catch(backend.reportFailure);
+      return backend.reconnect().catch(reportBackendFailure);
     return refresh();
   }, [refresh]);
 
@@ -310,10 +311,16 @@ export function useApplication() {
       dirty.current = false;
     };
     const recover = () => {
-      if (document.visibilityState === "visible" && navigator.onLine)
-        void backend.reconnect(true).catch(backend.reportFailure);
+      if (document.visibilityState !== "visible" || !navigator.onLine)
+        return false;
+      automaticRecovery.current = false;
+      const operation = backend.reconnect(true);
+      if (!automaticRecovery.current) return false;
+      void operation.catch(reportBackendFailure);
+      return true;
     };
     const offFailure = backend.onFailure((error) => {
+      if (error.code === "disconnected") return;
       if (backend.disconnected) setReconnecting(false);
       if (booted.current) reportBackendFailure(error);
       else if (backend.disconnected) setFailure(error);
@@ -322,19 +329,16 @@ export function useApplication() {
       if (event.type === "connection.closed") {
         invalidate();
         setLoading(false);
-        recover();
+        const recovered = recover();
+        if (!recovered && event.error instanceof BackendError) {
+          if (booted.current) reportBackendFailure(event.error);
+          else setFailure(event.error);
+        }
         return;
       }
       if (event.type === "connection.reconnecting") {
+        automaticRecovery.current = true;
         setReconnecting(true);
-        if (booted.current)
-          toast({
-            id: CONNECTION_TOAST,
-            tone: "info",
-            title: "Reconnecting…",
-            duration: null,
-            closable: false,
-          });
         return;
       }
       if (event.type === "connection.restored") {

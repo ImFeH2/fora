@@ -1,10 +1,17 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
-import { Button, Chip, Field, Textarea, toast } from "@/components/ui/index";
+import {
+  Button,
+  Chip,
+  Field,
+  Spinner,
+  Textarea,
+  toast,
+} from "@/components/ui/index";
 import {
   reportLoadFailure,
   useReportSettingsSave,
 } from "@/features/settings/saver";
-import { backend } from "@/lib/backend";
+import { BackendError, backend } from "@/lib/backend";
 
 export type ExecutionSettings = {
   write_directories: string[];
@@ -69,14 +76,16 @@ export function ExecutionForm({
       previous.current = result;
       setInfo(result);
       setDraft(directoryDraft(result));
-      toast({ tone: "success", title: "Saved" });
     } catch (failure) {
-      toast({
-        tone: "danger",
-        title: "Could not save",
-        description:
-          failure instanceof Error ? failure.message : String(failure),
-      });
+      if (failure instanceof BackendError && failure.transport)
+        backend.reportFailure(failure);
+      else
+        toast({
+          tone: "danger",
+          title: "Could not save",
+          description:
+            failure instanceof Error ? failure.message : String(failure),
+        });
     } finally {
       setBusy(false);
       requestAnimationFrame(() => {
@@ -128,6 +137,7 @@ export function ExecutionForm({
         </Field>
         <div className="flex items-center gap-3 pt-1">
           <Button variant="primary" type="submit" disabled={!changed || busy}>
+            {busy ? <Spinner label="Saving execution settings" /> : null}
             Save
           </Button>
         </div>

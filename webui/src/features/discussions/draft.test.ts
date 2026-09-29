@@ -88,9 +88,8 @@ describe("persistent send attempts", () => {
     });
     await controller.send(onSend);
     expect(controller.snapshot().draft.pending?.phase).toBe("sending");
-    expect(controller.snapshot().storageError).toContain(
-      "Storage quota exceeded",
-    );
+    expect(controller.snapshot().storageError).toBeNull();
+    expect(controller.snapshot().error).toBe("Could not update draft");
     storage.put.mockResolvedValue();
     vi.mocked(backend.sendStatus).mockResolvedValue({
       state: "sent",
@@ -295,7 +294,6 @@ describe("persistent send attempts", () => {
     expect(controller.snapshot().draft.pending).toBeNull();
     expect(controller.snapshot().draft.body).toBe("Next message");
     expect(backend.cancelUploads).not.toHaveBeenCalled();
-    expect(controller.snapshot().progress).toBe("Message sent");
   });
 
   it("retains cancelled attempts when IndexedDB fails", async () => {
@@ -311,7 +309,10 @@ describe("persistent send attempts", () => {
     await controller.discardAttempt();
     expect(controller.snapshot().draft.pending).toEqual(attempt);
     expect(controller.snapshot().draft.body).toBe("Current edit");
-    expect(controller.snapshot().storageError).toContain("Storage unavailable");
+    expect(controller.snapshot().storageError).toBeNull();
+    expect(controller.snapshot().error).toContain(
+      "Could not finish cancelling send",
+    );
     storage.put.mockResolvedValue();
     vi.mocked(backend.sendStatus).mockResolvedValue({
       state: "cancelled",

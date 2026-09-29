@@ -10,7 +10,7 @@ import {
   useState,
 } from "react";
 import { toast } from "@/components/ui/index";
-import { backend } from "@/lib/backend";
+import { BackendError, backend } from "@/lib/backend";
 
 export function isSettingsSaving(sections: Record<string, boolean>): boolean {
   return Object.values(sections).some(Boolean);
@@ -55,15 +55,17 @@ export function useSaver(
     setSaving(true);
     try {
       await backend.updateSettings(section, values);
-      toast({ tone: "success", title: "Saved" });
       await load();
       return true;
     } catch (error) {
-      toast({
-        tone: "danger",
-        title: "Could not save",
-        description: error instanceof Error ? error.message : String(error),
-      });
+      if (error instanceof BackendError && error.transport)
+        backend.reportFailure(error);
+      else
+        toast({
+          tone: "danger",
+          title: "Could not save",
+          description: error instanceof Error ? error.message : String(error),
+        });
       return false;
     } finally {
       setSaving(false);
@@ -81,6 +83,10 @@ export function reportLoadFailure(
   failure: unknown,
   retry: () => void,
 ): void {
+  if (failure instanceof BackendError && failure.transport) {
+    backend.reportFailure(failure);
+    return;
+  }
   toast({
     id,
     tone: "danger",

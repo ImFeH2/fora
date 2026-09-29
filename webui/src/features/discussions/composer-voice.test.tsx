@@ -300,7 +300,12 @@ it("shows the saved voice settings read error without changing the draft", async
     expect(backend.settings).toHaveBeenCalledTimes(1);
   });
   await vi.waitFor(() =>
-    expect(voice.container.textContent).toContain("Voice settings unavailable"),
+    expect(
+      readToasts().find((item) => item.id === "voice-input"),
+    ).toMatchObject({
+      title: "Could not read voice settings",
+      description: "Voice settings unavailable",
+    }),
   );
   expect(harness.callbacks).toHaveLength(0);
   expect(controller.snapshot().draft.body).toBe("Saved message");
@@ -340,8 +345,14 @@ it("keeps ordinary voice errors in composer feedback", async () => {
     message: "Audio capacity reached",
   });
   await vi.waitFor(() =>
-    expect(voice.container.textContent).toContain("Audio capacity reached"),
+    expect(
+      readToasts().find((item) => item.id === "voice-input"),
+    ).toMatchObject({
+      title: "Could not transcribe voice input",
+      description: "Audio capacity reached",
+    }),
   );
+  expect(voice.container.textContent).not.toContain("Audio capacity reached");
   expect(
     readToasts().find((item) => item.id === "voice-settings"),
   ).toBeUndefined();
@@ -436,7 +447,7 @@ it("keeps saving feedback while draft persistence is pending", async () => {
   controller.setBody("Changed draft");
   await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
   const voice = mount(1, false);
-  expect(voice.container.textContent).toContain("Saving draft…");
+  expect(voice.container.textContent).not.toContain("Saving draft");
   finish();
   await vi.waitFor(() => expect(controller.snapshot().saving).toBe(false));
   expect(voice.container.textContent).not.toContain("Draft saved");
@@ -458,11 +469,9 @@ it("persists partial and final while keeping the active submission snapshot", as
   const pending = structuredClone(controller.snapshot().draft.pending);
   const voice = mount();
   await voice.ready();
-  expect(voice.container.textContent).toContain("Listening…");
+  expect(voice.container.textContent).not.toContain("Listening…");
   expect(voice.container.textContent).toContain("Cancel");
-  expect(voice.container.textContent).toContain(
-    "Saved send attempt: Saved message",
-  );
+  expect(voice.container.textContent).not.toContain("Saved send attempt");
   expect(voice.container.textContent).not.toContain("Draft saved");
   await voice.emit(transcript(" partial"));
   await voice.emit(transcript(" final"));
@@ -730,8 +739,8 @@ it("reconciles a recording started before unknown-send confirmation", async () =
   );
   const check = Array.from(
     voice.container.querySelectorAll<HTMLButtonElement>("button"),
-  ).find((button) => button.textContent === "Check send result");
-  if (!check) throw new Error("Check send result button is missing");
+  ).find((button) => button.textContent === "Check result");
+  if (!check) throw new Error("Check result button is missing");
   act(() => check.click());
   await vi.waitFor(() => expect(resolveStatus).toBeTypeOf("function"));
   await act(async () => {
@@ -739,7 +748,6 @@ it("reconciles a recording started before unknown-send confirmation", async () =
     await vi.waitFor(() => {
       expect(controller.snapshot().draft.pending).toBeNull();
       expect(controller.snapshot().busy).toBe(false);
-      expect(controller.snapshot().progress).toBe("Message sent");
     });
   });
   expect(body(voice)).toBe("Partial");
@@ -766,8 +774,8 @@ it("reconciles a confirmed send after receipt saving fails", async () => {
   });
   const check = Array.from(
     voice.container.querySelectorAll<HTMLButtonElement>("button"),
-  ).find((button) => button.textContent === "Check send result");
-  if (!check) throw new Error("Check send result button is missing");
+  ).find((button) => button.textContent === "Check result");
+  if (!check) throw new Error("Check result button is missing");
   await act(async () => {
     check.click();
     await vi.waitFor(() => {
@@ -783,14 +791,10 @@ it("reconciles a confirmed send after receipt saving fails", async () => {
   await voice.emit(transcript("Final"));
   expect(body(voice)).toBe("Final");
 
-  vi.spyOn(backend, "cancelSend").mockResolvedValue({
-    state: "sent",
-    message: null,
-  });
   const discard = Array.from(
     voice.container.querySelectorAll<HTMLButtonElement>("button"),
-  ).find((button) => button.textContent === "Discard send attempt");
-  if (!discard) throw new Error("Discard send attempt button is missing");
+  ).find((button) => button.textContent === "Retry");
+  if (!discard) throw new Error("Retry button is missing");
   await act(async () => {
     discard.click();
     await vi.waitFor(() => {
@@ -798,7 +802,6 @@ it("reconciles a confirmed send after receipt saving fails", async () => {
       expect(controller.snapshot().draft.pending).toBeNull();
     });
   });
-  expect(backend.cancelSend).toHaveBeenCalledWith(1, pendingId);
   expect(body(voice)).toBe("Final");
   voice.close();
 });
@@ -818,8 +821,8 @@ it("retries send-result confirmation after receipt persistence fails", async () 
   const check = () => {
     const button = Array.from(
       voice.container.querySelectorAll<HTMLButtonElement>("button"),
-    ).find((item) => item.textContent === "Check send result");
-    if (!button) throw new Error("Check send result button is missing");
+    ).find((item) => item.textContent === "Check result");
+    if (!button) throw new Error("Check result button is missing");
     return button;
   };
   await act(async () => {
@@ -836,12 +839,15 @@ it("retries send-result confirmation after receipt persistence fails", async () 
   });
   await voice.emit(transcript("Final"));
   expect(body(voice)).toBe("Final");
+  const retry = Array.from(
+    voice.container.querySelectorAll<HTMLButtonElement>("button"),
+  ).find((item) => item.textContent === "Retry");
+  if (!retry) throw new Error("Retry button is missing");
   await act(async () => {
-    check().click();
+    retry.click();
     await vi.waitFor(() => {
       expect(controller.snapshot().busy).toBe(false);
       expect(controller.snapshot().draft.pending).toBeNull();
-      expect(controller.snapshot().progress).toBe("Message sent");
     });
   });
   expect(body(voice)).toBe("Final");

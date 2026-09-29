@@ -1,5 +1,5 @@
-import { useEffect, useId, useRef, useState } from "react";
-import { Button, Field, Input } from "@/components/ui/index";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { Button, Field, Input, Spinner } from "@/components/ui/index";
 import { backend } from "@/lib/backend";
 import { VoiceRecording, type VoiceState } from "@/lib/voice";
 
@@ -16,32 +16,36 @@ export function VoicePanel() {
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [loadFailed, setLoadFailed] = useState(false);
   const [text, setText] = useState("");
   const [state, setState] = useState<VoiceState>("closed");
   const [level, setLevel] = useState(0);
   const recording = useRef<VoiceRecording | null>(null);
   const active = state !== "closed";
 
+  const load = useCallback(async () => {
+    try {
+      setValues((await backend.settings("voice")) as Values);
+      setLoadFailed(false);
+      setError("");
+    } catch (failure) {
+      setLoadFailed(true);
+      setError(failure instanceof Error ? failure.message : String(failure));
+    }
+  }, []);
+
   useEffect(() => {
-    let mounted = true;
-    void backend.settings("voice").then(
-      (value) => {
-        if (mounted) setValues(value as Values);
-      },
-      (failure: unknown) => {
-        if (mounted)
-          setError(
-            failure instanceof Error ? failure.message : String(failure),
-          );
-      },
-    );
+    void load();
+    const off = backend.onEvent((event) => {
+      if (event.type === "connection.restored") void load();
+    });
     return () => {
-      mounted = false;
+      off();
       const current = recording.current;
       recording.current = null;
       current?.cancel();
     };
-  }, []);
+  }, [load]);
 
   const change = (next: Values) => {
     setValues(next);
@@ -63,6 +67,7 @@ export function VoicePanel() {
       setValues((await backend.updateSettings("voice", update)) as Values);
       setKey("");
       setDirty(false);
+      setLoadFailed(false);
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure));
     } finally {
@@ -92,9 +97,17 @@ export function VoicePanel() {
   return (
     <div className="flex max-w-[560px] flex-col gap-4">
       {error ? (
-        <p role="alert" className="text-sm text-danger">
-          {error}
-        </p>
+        <div
+          role="alert"
+          className="flex items-center gap-2 text-sm text-danger"
+        >
+          <span className="min-w-0 flex-1">{error}</span>
+          {loadFailed ? (
+            <Button size="sm" onClick={() => void load()}>
+              Retry
+            </Button>
+          ) : null}
+        </div>
       ) : null}
       <form
         onSubmit={(event) => {
@@ -155,6 +168,7 @@ export function VoicePanel() {
             {values?.address ?? "the configured service"} for transcription.
           </p>
           <Button type="submit" variant="primary" disabled={!dirty}>
+            {busy ? <Spinner label="Saving voice settings" /> : null}
             Save
           </Button>
         </fieldset>
@@ -163,11 +177,6 @@ export function VoicePanel() {
         <p className="text-sm">
           Test saved OpenAI Realtime settings · {values?.address ?? ""}
         </p>
-        {dirty ? (
-          <p className="text-sm text-fg-muted">
-            Save the configuration to test it.
-          </p>
-        ) : null}
         <div className="flex items-center gap-2">
           {active ? (
             <>
@@ -176,18 +185,20 @@ export function VoicePanel() {
                 disabled={state === "finishing"}
                 onClick={() => recording.current?.stop()}
               >
+                {state === "starting" || state === "finishing" ? (
+                  <Spinner
+                    label={
+                      state === "finishing"
+                        ? "Transcribing"
+                        : "Starting microphone"
+                    }
+                  />
+                ) : null}
                 Stop
               </Button>
               <Button type="button" onClick={() => recording.current?.cancel()}>
                 Cancel
               </Button>
-              <span role="status">
-                {state === "starting"
-                  ? "Starting…"
-                  : state === "finishing"
-                    ? "Transcribing…"
-                    : "Listening…"}
-              </span>
               <meter
                 aria-label="Microphone volume"
                 min={0}
@@ -203,7 +214,7 @@ export function VoicePanel() {
               }
               onClick={test}
             >
-              Start microphone test
+              {dirty ? "Save to enable test" : "Start microphone test"}
             </Button>
           )}
         </div>

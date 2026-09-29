@@ -94,7 +94,6 @@ export type DraftView = {
   saving: boolean;
   storageError: string | null;
   error: string | null;
-  progress: string | null;
 };
 export type SendDraft = (
   body: string,
@@ -120,7 +119,6 @@ export class DraftController {
       saving: false,
       storageError: null,
       error: null,
-      progress: null,
     };
   }
 
@@ -165,7 +163,6 @@ export class DraftController {
 
   setBody = (body: string) => {
     const draft = this.#view.draft;
-    if (!this.#view.busy) this.#notify({ progress: null });
     void this.#persist({
       ...draft,
       body,
@@ -178,7 +175,6 @@ export class DraftController {
     const draft = this.#view.draft;
     if (voiceSubmission && !body.startsWith(voiceSubmission.submittedBody))
       throw new Error("Voice draft must retain its pending submission prefix");
-    if (!this.#view.busy) this.#notify({ progress: null });
     void this.#persist({
       ...draft,
       body,
@@ -246,14 +242,15 @@ export class DraftController {
       voiceSubmission: null,
     });
     if (!saved) {
-      this.#notify({ draft: { ...this.#view.draft, pending: submission } });
-      throw new Error(
-        "Message sent. Its local receipt could not be saved; check the send result to finish saving.",
-      );
+      this.#notify({
+        draft: { ...this.#view.draft, pending: submission },
+        storageError: null,
+        error: "Could not update draft",
+      });
+      throw new Error("Could not update draft");
     }
     this.#notify({
       error: null,
-      progress: "Message sent",
       submissionResult: { id: submission.id, state: "sent" },
     });
   }
@@ -282,14 +279,16 @@ export class DraftController {
           : current.voiceSubmission,
     });
     if (!saved) {
-      this.#notify({ draft: { ...this.#view.draft, pending: submission } });
-      throw new Error(
-        "Send attempt cancelled. Save the draft to finish recovery.",
-      );
+      const reason = this.#view.storageError ?? "Draft could not be saved";
+      this.#notify({
+        draft: { ...this.#view.draft, pending: submission },
+        storageError: null,
+        error: `Could not finish cancelling send: ${reason}`,
+      });
+      throw new Error(`Could not finish cancelling send: ${reason}`);
     }
     this.#notify({
       error: null,
-      progress: "Send attempt cancelled",
       submissionResult: { id: submission.id, state: "cancelled" },
     });
   }
@@ -299,6 +298,18 @@ export class DraftController {
     if (pending?.phase !== "sending" || this.#view.busy) return;
     this.#notify({ busy: true });
     try {
+      const known =
+        this.#view.submissionResult?.id === pending.id
+          ? this.#view.submissionResult.state
+          : null;
+      if (known === "sent") {
+        await this.#finish(pending);
+        return;
+      }
+      if (known === "cancelled") {
+        await this.#cancelled(pending);
+        return;
+      }
       const result = await backend.sendStatus(this.discussionId, pending.id);
       if (result.state === "sent") await this.#finish(pending);
       else if (result.state === "cancelled") await this.#cancelled(pending);
@@ -345,7 +356,6 @@ export class DraftController {
     this.#notify({
       busy: true,
       error: null,
-      progress: null,
       submissionResult: null,
     });
     const abort = new AbortController();
@@ -415,11 +425,7 @@ export class DraftController {
             upload.id,
             item.file,
             abort.signal,
-            (sent) => {
-              this.#notify({
-                progress: `Uploading ${item.file.name}: ${Math.round((sent / Math.max(item.file.size, 1)) * 100)}%`,
-              });
-            },
+            () => {},
           );
           upload = { ...upload, state: "ready" };
         }
@@ -435,7 +441,6 @@ export class DraftController {
       abort.signal.throwIfAborted();
       submission = { ...submission, phase: "sending" };
       await this.#pending(submission);
-      this.#notify({ progress: "Sending message…" });
       const ids = submission.files.map((item) => {
         if (!item.upload) throw new Error("An uploaded file is missing its ID");
         return item.upload.id;
@@ -453,7 +458,6 @@ export class DraftController {
     } catch (error) {
       this.#notify({
         error: error instanceof Error ? error.message : String(error),
-        progress: null,
       });
     } finally {
       this.#abort = null;

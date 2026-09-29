@@ -1,10 +1,17 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
-import { Button, Chip, Field, Input, toast } from "@/components/ui/index";
+import {
+  Button,
+  Chip,
+  Field,
+  Input,
+  Spinner,
+  toast,
+} from "@/components/ui/index";
 import {
   reportLoadFailure,
   useReportSettingsSave,
 } from "@/features/settings/saver";
-import { backend } from "@/lib/backend";
+import { BackendError, backend } from "@/lib/backend";
 
 export function langfuseUpdate(
   values: Record<string, unknown>,
@@ -57,14 +64,16 @@ export function LangfusePanel() {
       setValues(updated);
       setPublicKey("");
       setSecretKey("");
-      toast({ tone: "success", title: "Saved" });
     } catch (failure) {
-      toast({
-        tone: "danger",
-        title: "Could not save",
-        description:
-          failure instanceof Error ? failure.message : String(failure),
-      });
+      if (failure instanceof BackendError && failure.transport)
+        backend.reportFailure(failure);
+      else
+        toast({
+          tone: "danger",
+          title: "Could not save",
+          description:
+            failure instanceof Error ? failure.message : String(failure),
+        });
     } finally {
       setBusy(false);
       setSaving(false);
@@ -146,6 +155,7 @@ export function LangfusePanel() {
         </Field>
         <div className="flex items-center gap-3 pt-1">
           <Button type="submit" variant="primary">
+            {saving ? <Spinner label="Saving Langfuse settings" /> : null}
             Save
           </Button>
           {configured ? <Chip tone="success">Keys stored</Chip> : null}

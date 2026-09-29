@@ -42,6 +42,24 @@ import { renderMentions } from "@/features/mentions";
 import { BackendError, backend, type Message } from "@/lib/backend";
 import { formatTime, relativeTime } from "@/lib/format";
 
+function reportDiscussionWriteFailure(
+  id: number,
+  title: string,
+  failure: unknown,
+) {
+  if (failure instanceof BackendError && failure.transport) {
+    backend.reportFailure(failure);
+    return;
+  }
+  toast({
+    id: `discussion-write:${id}:${title}`,
+    tone: "danger",
+    title,
+    description: failure instanceof Error ? failure.message : String(failure),
+    duration: null,
+  });
+}
+
 export function ThreadPage({ id }: { id: number }) {
   return <ThreadSession key={id} id={id} />;
 }
@@ -53,6 +71,7 @@ function ThreadSession({ id }: { id: number }) {
   const { data: detail, missing, failed: loadFailed } = thread;
   const [busy, setBusy] = useState(false);
   const [ackBusy, setAckBusy] = useState(false);
+  const [archiveBusy, setArchiveBusy] = useState(false);
   const [editingMembers, setEditingMembers] = useState(false);
   const [composerSize, setComposerSize] = useState(48);
   const [lastVisible, setLastVisible] = useState(0);
@@ -272,22 +291,9 @@ function ThreadSession({ id }: { id: number }) {
     } catch (failure) {
       if (failure instanceof BackendError && failure.code === "send_cancelled")
         return "cancelled" as const;
-      if (sent) {
-        if (thread.live.current) backend.reportFailure(failure);
-        return true;
-      }
-      if (
-        thread.live.current &&
-        !(failure instanceof BackendError && failure.transport)
-      ) {
-        toast({
-          tone: "danger",
-          title: "Could not send",
-          description:
-            failure instanceof Error ? failure.message : String(failure),
-        });
-      }
-      return false;
+      if (sent) return true;
+      if (failure instanceof BackendError && failure.transport) return false;
+      throw failure;
     } finally {
       if (thread.live.current) setBusy(false);
     }
@@ -305,13 +311,20 @@ function ThreadSession({ id }: { id: number }) {
       }
       if (thread.live.current) await load();
     } catch (failure) {
-      if (!thread.live.current) return;
-      toast({
-        tone: "danger",
-        title: revoke ? "Could not undo" : "Could not mark handled",
-        description:
-          failure instanceof Error ? failure.message : String(failure),
-      });
+      if (
+        thread.live.current &&
+        !(
+          failure instanceof BackendError &&
+          ["reading_position_failed", "reading_position_blocked"].includes(
+            failure.code,
+          )
+        )
+      )
+        reportDiscussionWriteFailure(
+          id,
+          revoke ? "Could not undo" : "Could not mark handled",
+          failure,
+        );
     } finally {
       if (thread.live.current) setAckBusy(false);
     }
@@ -324,20 +337,32 @@ function ThreadSession({ id }: { id: number }) {
       await backend.ackPending(id, detail.latest);
       if (thread.live.current) await load();
     } catch (failure) {
-      if (thread.live.current) backend.reportFailure(failure);
+      if (thread.live.current)
+        reportDiscussionWriteFailure(id, "Could not mark all handled", failure);
     } finally {
       if (thread.live.current) setAckBusy(false);
     }
   };
 
   const archive = async (archived: boolean) => {
+    if (archiveBusy) return;
+    setArchiveBusy(true);
     try {
       await backend.archiveDiscussion(id, archived);
       if (!thread.live.current) return;
       if (archived) navigate({ name: "discussions" });
       else await load();
     } catch (failure) {
-      if (thread.live.current) backend.reportFailure(failure);
+      if (thread.live.current)
+        reportDiscussionWriteFailure(
+          id,
+          archived
+            ? "Could not archive Discussion"
+            : "Could not unarchive Discussion",
+          failure,
+        );
+    } finally {
+      if (thread.live.current) setArchiveBusy(false);
     }
   };
 
@@ -394,12 +419,14 @@ function ThreadSession({ id }: { id: number }) {
                         id: "unarchive",
                         label: "Unarchive",
                         icon: <ArchiveRestore size={15} />,
+                        disabled: archiveBusy,
                         onSelect: () => void archive(false),
                       }
                     : {
                         id: "archive",
                         label: "Archive",
                         icon: <Archive size={15} />,
+                        disabled: archiveBusy,
                         onSelect: () => void archive(true),
                       },
                 ]}
