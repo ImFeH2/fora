@@ -29,6 +29,9 @@ function conflictToastId(path: string): string {
   return `document-conflict:${path}`;
 }
 
+const conflictDescription =
+  "Your unsaved changes are preserved. Reopen replaces them with the current document.";
+
 export function documentCrumbs(
   path: string,
   navigate: (route: Route) => void,
@@ -97,8 +100,7 @@ export function DocumentPage({ path }: { path: string }) {
               id: conflictToastId(path),
               tone: "danger",
               title: "Saved elsewhere",
-              description:
-                "Your unsaved changes are preserved. Reopen to read the current document.",
+              description: conflictDescription,
               duration: null,
               action: { label: "Reopen", onClick: () => void load() },
             });
@@ -158,7 +160,7 @@ export function DocumentPage({ path }: { path: string }) {
           id: conflictToastId(path),
           tone: "danger",
           title: "Saved elsewhere",
-          description: path,
+          description: conflictDescription,
           duration: null,
           action: { label: "Reopen", onClick: () => void load() },
         });

@@ -74,10 +74,17 @@ function mount() {
 function emit(event: BackendEvent) {
   for (const listener of events) listener(event);
 }
-function disconnect() {
+function notifyFailure(
+  error = new BackendError("disconnected", "Connection lost", true),
+) {
   closed = true;
-  const error = new BackendError("disconnected", "Connection lost", true);
   for (const listener of failures) listener(error);
+  return error;
+}
+function disconnect(
+  error = new BackendError("disconnected", "Connection lost", true),
+) {
+  notifyFailure(error);
   emit({ type: "connection.closed", error });
 }
 async function settle() {
@@ -191,6 +198,52 @@ describe("application recovery with controlled hook effects", () => {
       expect(render().failure).toBeNull();
       expect(backend.organization).toHaveBeenCalledTimes(2);
       expect(backend.reconnect).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["connection_timeout", "connection_failed"] as const)(
+    "waits for %s recovery before showing a connection notice",
+    async (code) => {
+      mount();
+      await settle();
+      const error = new BackendError(code, "Connection failed", true);
+      notifyFailure(error);
+      expect(
+        readToasts().find((item) => item.id === "connection"),
+      ).toBeUndefined();
+      emit({ type: "connection.closed", error });
+      await settle();
+      expect(closed).toBe(false);
+      expect(
+        readToasts().find((item) => item.id === "connection"),
+      ).toBeUndefined();
+    },
+  );
+
+  it.each(["connection_timeout", "connection_failed"] as const)(
+    "reports one %s notice after automatic recovery fails",
+    async (code) => {
+      mount();
+      await settle();
+      const error = new BackendError(code, "Connection failed", true);
+      let automaticAttempted = false;
+      vi.mocked(backend.reconnect).mockImplementation((automatic = false) => {
+        if (!automatic || automaticAttempted) return Promise.resolve();
+        automaticAttempted = true;
+        emit({ type: "connection.reconnecting" });
+        return Promise.resolve().then(() => {
+          notifyFailure(error);
+          emit({ type: "connection.closed", error });
+          return Promise.reject(error);
+        });
+      });
+      notifyFailure(error);
+      emit({ type: "connection.closed", error });
+      await settle();
+      expect(render().reconnecting).toBe(false);
+      expect(
+        readToasts().filter((item) => item.open && item.id === "connection"),
+      ).toHaveLength(1);
     },
   );
 

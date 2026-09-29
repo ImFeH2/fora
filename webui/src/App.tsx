@@ -90,7 +90,7 @@ function View({
 const CONNECTION_TOAST = "connection";
 
 function reconnect() {
-  void backend.reconnect().catch(reportBackendFailure);
+  void backend.reconnect().catch(reportReconnectFailure);
 }
 
 function reportBackendFailure(error: BackendError) {
@@ -111,6 +111,18 @@ function reportBackendFailure(error: BackendError) {
       ? { label: "Reconnect", onClick: reconnect }
       : undefined,
   });
+}
+
+function reportReconnectFailure(error: unknown) {
+  if (error instanceof BackendError && error.transport) return;
+  reportBackendFailure(
+    error instanceof BackendError
+      ? error
+      : new BackendError(
+          "request_failed",
+          error instanceof Error ? error.message : String(error),
+        ),
+  );
 }
 
 function Chrome({ loaded }: { loaded: Loaded }) {
@@ -299,7 +311,7 @@ export function useApplication() {
 
   const retry = useCallback((): Promise<void> => {
     if (backend.disconnected)
-      return backend.reconnect().catch(reportBackendFailure);
+      return backend.reconnect().catch(reportReconnectFailure);
     return refresh();
   }, [refresh]);
 
@@ -316,11 +328,11 @@ export function useApplication() {
       automaticRecovery.current = false;
       const operation = backend.reconnect(true);
       if (!automaticRecovery.current) return false;
-      void operation.catch(reportBackendFailure);
+      void operation.catch(reportReconnectFailure);
       return true;
     };
     const offFailure = backend.onFailure((error) => {
-      if (error.code === "disconnected") return;
+      if (backend.disconnected && error.transport) return;
       if (backend.disconnected) setReconnecting(false);
       if (booted.current) reportBackendFailure(error);
       else if (backend.disconnected) setFailure(error);
@@ -330,9 +342,12 @@ export function useApplication() {
         invalidate();
         setLoading(false);
         const recovered = recover();
-        if (!recovered && event.error instanceof BackendError) {
-          if (booted.current) reportBackendFailure(event.error);
-          else setFailure(event.error);
+        if (!recovered) {
+          setReconnecting(false);
+          if (event.error instanceof BackendError) {
+            if (booted.current) reportBackendFailure(event.error);
+            else setFailure(event.error);
+          }
         }
         return;
       }

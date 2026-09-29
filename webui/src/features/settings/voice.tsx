@@ -21,11 +21,16 @@ export function VoicePanel() {
   const [state, setState] = useState<VoiceState>("closed");
   const [level, setLevel] = useState(0);
   const recording = useRef<VoiceRecording | null>(null);
+  const dirtyRef = useRef(false);
   const active = state !== "closed";
 
   const load = useCallback(async () => {
+    if (dirtyRef.current) return;
     try {
-      setValues((await backend.settings("voice")) as Values);
+      const next = (await backend.settings("voice")) as Values;
+      if (dirtyRef.current) return;
+      setValues(next);
+      setDirty(false);
       setLoadFailed(false);
       setError("");
     } catch (failure) {
@@ -48,6 +53,7 @@ export function VoicePanel() {
   }, [load]);
 
   const change = (next: Values) => {
+    dirtyRef.current = true;
     setValues(next);
     setDirty(true);
     setText("");
@@ -64,8 +70,10 @@ export function VoicePanel() {
         model: values.model,
       };
       if (key) update.api_key = key;
-      setValues((await backend.updateSettings("voice", update)) as Values);
+      const next = (await backend.updateSettings("voice", update)) as Values;
+      setValues(next);
       setKey("");
+      dirtyRef.current = false;
       setDirty(false);
       setLoadFailed(false);
     } catch (failure) {
