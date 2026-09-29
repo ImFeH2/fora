@@ -332,6 +332,8 @@ export function useApplication() {
       return true;
     };
     const offFailure = backend.onFailure((error) => {
+      if (error.code === "unconfirmed" && error.operation === "discussion.send")
+        return;
       if (
         backend.disconnected &&
         error.transport &&

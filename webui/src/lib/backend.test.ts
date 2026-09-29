@@ -535,7 +535,10 @@ describe("Backend", () => {
     old.onmessage?.(invalid);
     expect(await first).toMatchObject({ code: "protocol_error" });
     expect(await second).toMatchObject({ code: "protocol_error" });
-    expect(await write).toMatchObject({ code: "unconfirmed" });
+    expect(await write).toMatchObject({
+      code: "unconfirmed",
+      operation: "organization.create_agent",
+    });
     expect(old.closed).toBe(true);
     expect(failures).toHaveBeenCalledTimes(2);
     expect(JSON.stringify(failures.mock.calls)).not.toContain("private-frame");
@@ -758,11 +761,27 @@ describe("Backend", () => {
     vi.useFakeTimers();
     const { backend, socket, connected } = harness();
     const old = await connected();
+    const failures = vi.fn();
+    backend.onFailure(failures);
     const write = backend.send(1, "Only once").catch((error) => error);
     await vi.advanceTimersByTimeAsync(0);
     expect(old.sent).toHaveLength(1);
     old.fail();
-    expect(await write).toMatchObject({ code: "unconfirmed" });
+    expect(await write).toMatchObject({
+      code: "unconfirmed",
+      operation: "discussion.send",
+    });
+    expect(failures).toHaveBeenCalledWith(
+      expect.objectContaining({
+        code: "unconfirmed",
+        operation: "discussion.send",
+      }),
+    );
+    expect(
+      failures.mock.calls.filter(
+        ([error]) => error.operation === "discussion.send",
+      ),
+    ).toHaveLength(1);
     const first = backend.reconnect(true);
     expect(backend.reconnect(true)).toBe(first);
     expect(backend.reconnect()).toBe(first);

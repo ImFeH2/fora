@@ -4,8 +4,12 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { clearToasts, readToasts } from "@/components/ui/toast";
 import { Composer } from "@/features/discussions/composer";
-import { type Draft, DraftController } from "@/features/discussions/draft";
-import { backend } from "@/lib/backend";
+import {
+  type Draft,
+  DraftController,
+  type SendDraft,
+} from "@/features/discussions/draft";
+import { BackendError, backend } from "@/lib/backend";
 import type { VoiceEvent } from "@/lib/voice";
 
 const harness = vi.hoisted(() => ({
@@ -72,6 +76,7 @@ function mount(
   autoStart = true,
   onOpenVoiceSettings: () => void = () => {},
   strictMode = false,
+  onSend: SendDraft = async () => true,
 ) {
   const container = document.createElement("div");
   document.body.append(container);
@@ -86,7 +91,7 @@ function mount(
         memberIds={new Set()}
         busy={false}
         placeholder="Message"
-        onSend={async () => true}
+        onSend={onSend}
         onHeightChange={() => {}}
         onOpenVoiceSettings={onOpenVoiceSettings}
       />
@@ -356,6 +361,35 @@ it("keeps ordinary voice errors in composer feedback", async () => {
   expect(
     readToasts().find((item) => item.id === "voice-settings"),
   ).toBeUndefined();
+  voice.close();
+});
+
+it("keeps an unknown Discussion send in Composer recovery feedback", async () => {
+  const controller = harness.controller;
+  if (!controller) throw new Error("Draft controller is missing");
+  const failure = new BackendError(
+    "unconfirmed",
+    "Your message may have been sent. Check the discussion before sending it again.",
+    true,
+    "discussion.send",
+  );
+  const onSend = vi.fn<SendDraft>(async () => {
+    throw failure;
+  });
+  const voice = mount(1, false, () => {}, false, onSend);
+  const send = voice.container.querySelector<HTMLButtonElement>(
+    'button[aria-label="Send · Enter"]',
+  );
+  if (!send) throw new Error("Send button is missing");
+  await act(async () => {
+    send.click();
+    await vi.waitFor(() => expect(controller.snapshot().busy).toBe(false));
+  });
+  expect(onSend).toHaveBeenCalledOnce();
+  expect(controller.snapshot().draft.pending?.phase).toBe("sending");
+  expect(controller.snapshot().error).toBe(failure.message);
+  expect(voice.container.textContent).toContain("Check result");
+  expect(readToasts()).toEqual([]);
   voice.close();
 });
 

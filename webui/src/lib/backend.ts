@@ -215,6 +215,7 @@ export class BackendError extends Error {
     readonly code: string,
     message: string,
     readonly transport = false,
+    readonly operation: string | null = null,
   ) {
     super(message);
     this.name = "BackendError";
@@ -268,6 +269,7 @@ function unconfirmed(method: string): BackendError {
       ? "Your message may have been sent. Check the discussion before sending it again."
       : "The operation may have completed. Check the current state before trying again.",
     true,
+    method,
   );
 }
 

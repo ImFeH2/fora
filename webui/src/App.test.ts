@@ -254,6 +254,7 @@ describe("application recovery with controlled hook effects", () => {
       "unconfirmed",
       "Check the current operation before retrying.",
       true,
+      "organization.rename_member",
     );
     notifyFailure(uncertain);
     emit({
@@ -269,6 +270,28 @@ describe("application recovery with controlled hook effects", () => {
       title: "Check operation result",
       description: "Check the current operation before retrying.",
     });
+  });
+
+  it("suppresses an unconfirmed Discussion send from global feedback", async () => {
+    mount();
+    await settle();
+    const uncertain = new BackendError(
+      "unconfirmed",
+      "Your message may have been sent. Check the discussion before sending it again.",
+      true,
+      "discussion.send",
+    );
+    notifyFailure(uncertain);
+    emit({
+      type: "connection.closed",
+      error: new BackendError("disconnected", "Connection lost", true),
+    });
+    await settle();
+    expect(
+      readToasts().find(
+        (item) => item.open && item.title === "Check operation result",
+      ),
+    ).toBeUndefined();
   });
 
   it.each(["close-first", "visible-first"])(
