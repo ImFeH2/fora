@@ -406,6 +406,7 @@ export class DraftController {
             upload.expires_at * 1000 <= Date.now()
           ) {
             await backend.cancelUploads([upload.id]);
+            abort.signal.throwIfAborted();
             item = { ...item, clientId: crypto.randomUUID() };
             upload = await backend.createUpload(
               this.discussionId,
@@ -421,6 +422,7 @@ export class DraftController {
             ),
           };
           await this.#pending(submission);
+          abort.signal.throwIfAborted();
           await backend.uploadFile(
             upload.id,
             item.file,
@@ -456,9 +458,22 @@ export class DraftController {
         );
       await this.#finish(submission);
     } catch (error) {
-      this.#notify({
-        error: error instanceof Error ? error.message : String(error),
-      });
+      if (abort.signal.aborted) {
+        try {
+          await this.#cancelled(submission);
+        } catch (cancellationError) {
+          this.#notify({
+            error:
+              cancellationError instanceof Error
+                ? cancellationError.message
+                : String(cancellationError),
+          });
+        }
+      } else {
+        this.#notify({
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     } finally {
       this.#abort = null;
       this.#notify({ busy: false });

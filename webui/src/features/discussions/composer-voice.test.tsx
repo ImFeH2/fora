@@ -718,6 +718,7 @@ it("preserves voice text when upload cancellation interrupts a pending send", as
     state: "reserved",
     expires_at: Date.now() / 1000 + 3600,
   });
+  vi.spyOn(backend, "cancelUploads").mockResolvedValue({ cancelled: 1 });
   let uploadStarted!: () => void;
   vi.spyOn(backend, "uploadFile").mockImplementation(
     (_id, _file, signal) =>
@@ -738,8 +739,11 @@ it("preserves voice text when upload cancellation interrupts a pending send", as
     uploadStarted();
   });
   await act(async () => sending);
-  expect(controller.snapshot().draft.pending?.phase).toBe("uploading");
+  expect(controller.snapshot().draft.pending).toBeNull();
+  expect(controller.snapshot().error).toBeNull();
+  expect(backend.cancelUploads).toHaveBeenCalledWith(["upload-1"]);
   expect(body(voice)).toBe("Saved message partial");
+  expect(voice.container.textContent).not.toContain("signal is aborted");
   voice.close();
 });
 

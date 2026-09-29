@@ -207,7 +207,7 @@ describe("persistent send attempts", () => {
     expect(controller.snapshot().draft.files).toEqual([]);
   });
 
-  it("preserves the file and attempt after cancelling an upload", async () => {
+  it("clears the attempt after cancelling an upload and keeps the file", async () => {
     const controller = new DraftController(1, draft(""));
     const file = new File(["content"], "cancel.txt");
     controller.addFiles([file]);
@@ -229,9 +229,34 @@ describe("persistent send attempts", () => {
     await operation;
     expect(send).not.toHaveBeenCalled();
     expect(controller.snapshot().draft.files[0].file).toBe(file);
-    expect(controller.snapshot().draft.pending?.files[0].file).toBe(file);
+    expect(controller.snapshot().draft.pending).toBeNull();
+    expect(backend.cancelUploads).toHaveBeenCalledWith(["upload"]);
     expect(controller.snapshot().busy).toBe(false);
-    expect(controller.snapshot().error).toBeTruthy();
+    expect(controller.snapshot().error).toBeNull();
+  });
+
+  it("cancels upload preparation before starting file transfer", async () => {
+    const controller = new DraftController(1, draft(""));
+    const file = new File(["content"], "prepare-cancel.txt");
+    controller.addFiles([file]);
+    await vi.waitFor(() => expect(controller.snapshot().saving).toBe(false));
+    const creating =
+      deferred<Awaited<ReturnType<typeof backend.createUpload>>>();
+    vi.mocked(backend.createUpload).mockReturnValue(creating.promise);
+    const operation = controller.send(vi.fn());
+    await vi.waitFor(() => expect(backend.createUpload).toHaveBeenCalledOnce());
+    controller.cancel();
+    creating.resolve({
+      id: "prepared-upload",
+      state: "reserved",
+      expires_at: Date.now() / 1000 + 60,
+    });
+    await operation;
+    expect(backend.uploadFile).not.toHaveBeenCalled();
+    expect(backend.cancelUploads).toHaveBeenCalledWith(["prepared-upload"]);
+    expect(controller.snapshot().draft.pending).toBeNull();
+    expect(controller.snapshot().draft.files[0].file).toBe(file);
+    expect(controller.snapshot().error).toBeNull();
   });
 
   it("keeps an unknown attempt until cancellation is confirmed", async () => {
