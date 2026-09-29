@@ -294,6 +294,28 @@ describe("application recovery with controlled hook effects", () => {
     ).toBeUndefined();
   });
 
+  it.each(["upload.create", "upload.status", "upload.cancel"] as const)(
+    "suppresses an unconfirmed %s from global feedback",
+    async (operation) => {
+      mount();
+      await settle();
+      notifyFailure(
+        new BackendError(
+          "unconfirmed",
+          "The upload operation may have completed.",
+          true,
+          operation,
+        ),
+      );
+      await settle();
+      expect(
+        readToasts().find(
+          (item) => item.open && item.title === "Check operation result",
+        ),
+      ).toBeUndefined();
+    },
+  );
+
   it.each(["close-first", "visible-first"])(
     "recovers with %s ordering",
     async (order) => {

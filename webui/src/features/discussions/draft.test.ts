@@ -29,10 +29,12 @@ vi.mock("@/lib/backend", () => ({
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((complete) => {
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((complete, fail) => {
     resolve = complete;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function draft(body = "First message"): Draft {
@@ -261,7 +263,11 @@ describe("persistent send attempts", () => {
     );
     vi.mocked(backend.cancelUploads)
       .mockRejectedValueOnce(
-        new BackendError("disconnected", "Connection lost", true),
+        new BackendError(
+          "unconfirmed",
+          "Upload cancellation result unknown",
+          true,
+        ),
       )
       .mockResolvedValue({ cancelled: 1 });
     const send = vi.fn();
@@ -279,6 +285,56 @@ describe("persistent send attempts", () => {
 
     expect(send).not.toHaveBeenCalled();
     expect(backend.cancelUploads).toHaveBeenCalledTimes(2);
+    expect(controller.snapshot().draft.pending).toBeNull();
+    expect(controller.snapshot().draft.body).toBe("Edited while cancelling");
+    expect(controller.snapshot().draft.files[0].file).toBe(file);
+    expect(controller.snapshot().draft.files[0].upload).toBeUndefined();
+  });
+
+  it("resolves unknown upload preparation before finishing cancellation", async () => {
+    const controller = new DraftController(1, draft(""));
+    const file = new File(["content"], "unknown-create.txt");
+    controller.addFiles([file]);
+    await vi.waitFor(() => expect(controller.snapshot().saving).toBe(false));
+    const creating =
+      deferred<Awaited<ReturnType<typeof backend.createUpload>>>();
+    const unknown = new BackendError(
+      "unconfirmed",
+      "Upload result unknown",
+      true,
+    );
+    vi.mocked(backend.createUpload)
+      .mockReturnValueOnce(creating.promise)
+      .mockRejectedValueOnce(unknown)
+      .mockResolvedValueOnce({
+        id: "resolved-upload",
+        state: "reserved",
+        expires_at: Date.now() / 1000 + 60,
+      });
+    vi.mocked(backend.cancelUploads).mockResolvedValue({ cancelled: 1 });
+    const send = vi.fn();
+    const operation = controller.send(send);
+    await vi.waitFor(() => expect(backend.createUpload).toHaveBeenCalledOnce());
+    controller.cancel();
+    controller.setBody("Edited while cancelling");
+    creating.reject(unknown);
+    await operation;
+
+    expect(send).not.toHaveBeenCalled();
+    expect(controller.snapshot().draft.pending?.cancelRequested).toBe(true);
+    expect(backend.cancelUploads).not.toHaveBeenCalled();
+    expect(vi.mocked(backend.createUpload).mock.calls[1][1]).toBe(
+      vi.mocked(backend.createUpload).mock.calls[0][1],
+    );
+
+    await controller.connectionRestored();
+
+    expect(send).not.toHaveBeenCalled();
+    expect(backend.createUpload).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(backend.createUpload).mock.calls[2][1]).toBe(
+      vi.mocked(backend.createUpload).mock.calls[0][1],
+    );
+    expect(backend.cancelUploads).toHaveBeenCalledWith(["resolved-upload"]);
     expect(controller.snapshot().draft.pending).toBeNull();
     expect(controller.snapshot().draft.body).toBe("Edited while cancelling");
     expect(controller.snapshot().draft.files[0].file).toBe(file);

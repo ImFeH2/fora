@@ -275,6 +275,32 @@ export class DraftController {
     };
   }
 
+  async #resolveCancellationUploads(
+    submission: Submission,
+  ): Promise<Submission> {
+    let resolved = submission;
+    for (let index = 0; index < resolved.files.length; index++) {
+      const item = resolved.files[index];
+      if (item.upload) continue;
+      const upload = await backend.createUpload(
+        this.discussionId,
+        item.clientId,
+        item.file,
+      );
+      resolved = {
+        ...resolved,
+        files: resolved.files.map((entry, at) =>
+          at === index ? { ...entry, upload } : entry,
+        ),
+      };
+      const draft = { ...this.#view.draft, pending: resolved };
+      this.#notify({ draft });
+      if (!(await this.#persist(draft)))
+        throw new Error("Could not save cancellation state");
+    }
+    return resolved;
+  }
+
   #cancellationFailure(error: unknown): string | null {
     if (error instanceof BackendError && error.transport) return null;
     return `Could not finish cancelling send: ${error instanceof Error ? error.message : String(error)}`;
@@ -325,17 +351,18 @@ export class DraftController {
   connectionRestored = () => this.#completeCancellation();
 
   async #cancelled(submission: Submission) {
-    const requested = this.#requestedCancellation(submission);
+    let requested = this.#requestedCancellation(submission);
     const marked = { ...this.#view.draft, pending: requested };
     this.#notify({
       draft: marked,
-      submissionResult: { id: submission.id, state: "cancelled" },
+      submissionResult: { id: requested.id, state: "cancelled" },
     });
     await this.#persist(marked);
-    const ids = requested.files.flatMap((item) =>
-      item.upload ? [item.upload.id] : [],
-    );
     try {
+      requested = await this.#resolveCancellationUploads(requested);
+      const ids = requested.files.flatMap((item) =>
+        item.upload ? [item.upload.id] : [],
+      );
       if (ids.length) await backend.cancelUploads(ids);
     } catch (error) {
       const current = this.#view.draft.pending;

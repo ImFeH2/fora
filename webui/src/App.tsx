@@ -88,6 +88,12 @@ function View({
 }
 
 const CONNECTION_TOAST = "connection";
+const COMPOSER_OPERATIONS = new Set([
+  "discussion.send",
+  "upload.create",
+  "upload.status",
+  "upload.cancel",
+]);
 
 function reconnect() {
   void backend.reconnect().catch(reportReconnectFailure);
@@ -332,7 +338,11 @@ export function useApplication() {
       return true;
     };
     const offFailure = backend.onFailure((error) => {
-      if (error.code === "unconfirmed" && error.operation === "discussion.send")
+      if (
+        error.code === "unconfirmed" &&
+        error.operation !== null &&
+        COMPOSER_OPERATIONS.has(error.operation)
+      )
         return;
       if (
         backend.disconnected &&
