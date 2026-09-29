@@ -53,7 +53,7 @@ export function Modal({
         <Dialog.Overlay className="fixed inset-0 z-(--layer-overlay) bg-gray-1100/60 animate-fade-in [animation-duration:var(--duration-fast)] [animation-timing-function:var(--ease-out)]" />
         <Dialog.Content
           ref={content}
-          className={`fixed top-1/2 left-1/2 z-(--layer-dialog) flex max-h-[calc(100vh-32px)] flex-col gap-4 p-6 border border-line rounded-lg bg-surface-raised shadow-dialog [translate:-50%_-50%] origin-center animate-pop-in ${wide ? "w-[min(960px,calc(100vw-32px))]" : "w-[min(440px,calc(100vw-48px))]"}`}
+          className={`fixed top-1/2 left-1/2 z-(--layer-dialog) flex min-h-0 max-h-[calc(100vh-32px)] flex-col gap-4 p-6 border border-line rounded-lg bg-surface-raised shadow-dialog [translate:-50%_-50%] origin-center animate-pop-in ${wide ? "w-[min(960px,calc(100vw-32px))]" : "w-[min(440px,calc(100vw-48px))]"}`}
           onOpenAutoFocus={(event) => {
             opener.current =
               document.activeElement instanceof HTMLElement
@@ -98,7 +98,9 @@ export function Modal({
             </Dialog.Description>
           ) : null}
           {children ? (
-            <div className="flex flex-col gap-4">{children}</div>
+            <div className="min-h-0 flex-1 overflow-y-auto flex flex-col gap-4">
+              {children}
+            </div>
           ) : null}
           <div ref={footerElement} className="flex justify-end gap-2">
             {footer}
