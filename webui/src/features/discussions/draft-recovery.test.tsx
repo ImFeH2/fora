@@ -7,7 +7,7 @@ import {
   it,
   vi,
 } from "vitest";
-import { useDraft } from "@/features/discussions/draft";
+import { Composer } from "@/features/discussions/composer";
 import { BackendError, type BackendEvent, backend } from "@/lib/backend";
 
 const storage = vi.hoisted(() => ({
@@ -27,21 +27,6 @@ let act: typeof import("@testing-library/react").act;
 let closeDom: () => void;
 let listeners: Set<(event: BackendEvent) => void>;
 
-function DraftProbe() {
-  const { controller, view, error } = useDraft(1);
-  return (
-    <>
-      <textarea
-        aria-label="Message"
-        disabled={!controller}
-        readOnly
-        value={view?.draft.body ?? ""}
-      />
-      {error ? <div role="alert">{error}</div> : null}
-    </>
-  );
-}
-
 beforeAll(async () => {
   const packageName = "jsdom";
   const { JSDOM } = await import(packageName);
@@ -58,7 +43,31 @@ beforeAll(async () => {
   vi.stubGlobal("Node", dom.window.Node);
   vi.stubGlobal("Event", dom.window.Event);
   vi.stubGlobal("EventTarget", dom.window.EventTarget);
+  vi.stubGlobal("MutationObserver", dom.window.MutationObserver);
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      disconnect() {}
+    },
+  );
+  vi.stubGlobal(
+    "requestAnimationFrame",
+    vi.fn(() => 1),
+  );
+  vi.stubGlobal("cancelAnimationFrame", vi.fn());
+  vi.stubGlobal("getComputedStyle", () => ({
+    borderBottomWidth: "0px",
+    borderTopWidth: "0px",
+    lineHeight: "20px",
+    paddingBottom: "12px",
+    paddingTop: "12px",
+  }));
+  Object.defineProperty(dom.window.document, "fonts", {
+    configurable: true,
+    value: { ready: Promise.resolve() },
+  });
   Object.defineProperty(dom.window.navigator, "locks", {
     configurable: true,
     value: {
@@ -98,29 +107,93 @@ afterAll(() => {
   vi.unstubAllGlobals();
 });
 
-it("re-enables the message input and restores the draft after connection recovery", async () => {
-  const organization = {
+function organization() {
+  return {
     uuid: "test-organization",
     human_id: 1,
   } as Awaited<ReturnType<typeof backend.organization>>;
+}
+
+function mountComposer(discussionId: number) {
+  return render(
+    <Composer
+      discussionId={discussionId}
+      members={[]}
+      memberIds={new Set<number>()}
+      busy={false}
+      placeholder="Message"
+      onSend={async () => true}
+      onHeightChange={() => {}}
+      onOpenVoiceSettings={() => {}}
+    />,
+  );
+}
+
+function input() {
+  return screen.getByRole("combobox", {
+    name: "Message",
+  }) as HTMLTextAreaElement;
+}
+
+it("retries a failed draft initialization from the Composer", async () => {
+  let failureObserved!: () => void;
+  const failed = new Promise<void>((resolve) => {
+    failureObserved = resolve;
+  });
+  vi.spyOn(backend, "organization")
+    .mockImplementationOnce(async () => {
+      failureObserved();
+      throw new Error("Draft initialization failed");
+    })
+    .mockResolvedValueOnce(organization());
+  vi.spyOn(backend, "onEvent").mockImplementation((listener) => {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  });
+
+  mountComposer(1);
+  await failed;
+  await waitFor(() =>
+    expect(screen.getByRole("alert").textContent).toContain(
+      "Draft initialization failed",
+    ),
+  );
+  expect(input().disabled).toBe(true);
+  const retry = screen.getByRole("button", { name: "Retry" });
+
+  act(() => retry.click());
+
+  await waitFor(() => expect(input().disabled).toBe(false));
+  expect(input().value).toBe("Recovered message");
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(backend.organization).toHaveBeenCalledTimes(2);
+});
+
+it("re-enables the Composer after connection recovery without duplicate feedback", async () => {
+  let failureObserved!: () => void;
+  const failed = new Promise<void>((resolve) => {
+    failureObserved = resolve;
+  });
   const connectionError = new BackendError(
     "disconnected",
     "Connection lost. Reconnect to continue.",
     true,
   );
   vi.spyOn(backend, "organization")
-    .mockRejectedValueOnce(connectionError)
-    .mockResolvedValueOnce(organization);
+    .mockImplementationOnce(async () => {
+      failureObserved();
+      throw connectionError;
+    })
+    .mockResolvedValueOnce(organization());
   vi.spyOn(backend, "onEvent").mockImplementation((listener) => {
     listeners.add(listener);
     return () => listeners.delete(listener);
   });
 
-  render(<DraftProbe />);
-  const input = () =>
-    screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement;
-
-  await waitFor(() => expect(input().disabled).toBe(true));
+  mountComposer(2);
+  await failed;
+  await waitFor(() => expect(backend.organization).toHaveBeenCalledOnce());
+  expect(input().disabled).toBe(true);
   expect(screen.queryByRole("alert")).toBeNull();
 
   act(() => {

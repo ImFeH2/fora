@@ -536,6 +536,7 @@ function controllerFor(discussion: number) {
 export function useDraft(discussion: number) {
   const [controller, setController] = useState<DraftController | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [retryNumber, setRetryNumber] = useState(0);
   useEffect(() => {
     let live = true;
     let loading: Promise<void> | null = null;
@@ -586,11 +587,16 @@ export function useDraft(discussion: number) {
       live = false;
       off();
     };
-  }, [discussion]);
+  }, [discussion, retryNumber]);
   const view = useSyncExternalStore(
     controller?.subscribe ?? (() => () => {}),
     controller?.snapshot ?? (() => null),
     () => null,
   );
-  return { controller, view, error };
+  return {
+    controller,
+    view,
+    error,
+    retry: () => setRetryNumber((value) => value + 1),
+  };
 }

@@ -183,7 +183,12 @@ export function Composer({
   onHeightChange: (height: number) => void;
   onOpenVoiceSettings: () => void;
 }) {
-  const { controller, view, error: draftError } = useDraft(discussionId);
+  const {
+    controller,
+    view,
+    error: draftError,
+    retry: retryDraft,
+  } = useDraft(discussionId);
   const body = view?.draft.body ?? "";
   const files = view?.draft.files ?? [];
   const setBody = (value: string) => controller?.setBody(value);
@@ -666,6 +671,15 @@ export function Composer({
                   onClick={() => controller?.saveAgain()}
                 >
                   Retry saving draft
+                </button>
+              ) : null}
+              {draftError ? (
+                <button
+                  type="button"
+                  className="ml-2 underline"
+                  onClick={retryDraft}
+                >
+                  Retry
                 </button>
               ) : null}
             </div>
