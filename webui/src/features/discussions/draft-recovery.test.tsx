@@ -243,6 +243,75 @@ it("completes upload cancellation after connection recovery", async () => {
   expect(input().value).toBe("Edited message");
 });
 
+it("offers a retry for an upload cleanup timeout on an open connection", async () => {
+  const file = new File(["content"], "retry-cancel.txt");
+  const upload = {
+    id: "retry-upload",
+    state: "receiving" as const,
+    expires_at: Date.now() / 1000 + 60,
+  };
+  storage.get.mockResolvedValue({
+    key: "test-organization:1:4:tab-id",
+    updatedAt: 0,
+    body: "Edited message",
+    bodyRevision: 1,
+    files: [
+      {
+        id: "file",
+        clientId: "client",
+        file,
+        upload,
+      },
+    ],
+    pending: {
+      id: "retry-attempt",
+      body: "Edited message",
+      bodyRevision: 1,
+      files: [
+        {
+          id: "file",
+          clientId: "client",
+          file,
+          upload,
+        },
+      ],
+      phase: "uploading",
+      cancelRequested: true,
+    },
+  });
+  vi.spyOn(backend, "organization").mockResolvedValue(organization());
+  vi.spyOn(backend, "onEvent").mockImplementation((listener) => {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  });
+  vi.spyOn(backend, "cancelUploads")
+    .mockRejectedValueOnce(
+      new BackendError(
+        "unconfirmed",
+        "Upload cancellation result unknown",
+        true,
+        "upload.cancel",
+      ),
+    )
+    .mockResolvedValue({ cancelled: 1 });
+  const send = vi.fn().mockResolvedValue(true);
+
+  mountComposer(4, send);
+  await waitFor(() => expect(backend.cancelUploads).toHaveBeenCalledOnce());
+  expect(screen.getByText("Cancelling upload")).toBeTruthy();
+  const retry = screen.getByRole("button", { name: "Retry" });
+
+  act(() => retry.click());
+
+  await waitFor(() =>
+    expect(screen.queryByText("Cancelling upload")).toBeNull(),
+  );
+  expect(backend.cancelUploads).toHaveBeenCalledTimes(2);
+  expect(send).not.toHaveBeenCalled();
+  expect(input().value).toBe("Edited message");
+  expect(screen.queryByRole("button", { name: "Retry send" })).toBeNull();
+});
+
 it("re-enables the Composer after connection recovery without duplicate feedback", async () => {
   let failureObserved!: () => void;
   const failed = new Promise<void>((resolve) => {

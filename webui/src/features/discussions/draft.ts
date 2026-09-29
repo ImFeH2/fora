@@ -102,6 +102,11 @@ export type SendDraft = (
   id: string,
 ) => Promise<boolean | "cancelled">;
 
+const CANCELLATION_RETRY_OPERATIONS = new Set([
+  "upload.create",
+  "upload.cancel",
+]);
+
 export class DraftController {
   #view: DraftView;
   #listeners = new Set<() => void>();
@@ -302,7 +307,14 @@ export class DraftController {
   }
 
   #cancellationFailure(error: unknown): string | null {
-    if (error instanceof BackendError && error.transport) return null;
+    if (
+      error instanceof BackendError &&
+      error.transport &&
+      (error.code !== "unconfirmed" ||
+        error.operation === null ||
+        !CANCELLATION_RETRY_OPERATIONS.has(error.operation))
+    )
+      return null;
     return `Could not finish cancelling send: ${error instanceof Error ? error.message : String(error)}`;
   }
 
@@ -332,8 +344,8 @@ export class DraftController {
       try {
         await this.#cancelled(pending);
       } catch (error) {
-        if (!(error instanceof BackendError && error.transport))
-          this.#notify({ error: this.#cancellationFailure(error) });
+        const failure = this.#cancellationFailure(error);
+        if (failure) this.#notify({ error: failure });
       } finally {
         this.#notify({ busy: false });
       }
@@ -468,10 +480,8 @@ export class DraftController {
       }
       await this.#cancelled(pending);
     } catch (error) {
-      if (!(error instanceof BackendError && error.transport))
-        this.#notify({
-          error: error instanceof Error ? error.message : String(error),
-        });
+      const failure = this.#cancellationFailure(error);
+      if (failure) this.#notify({ error: failure });
     } finally {
       this.#notify({ busy: false });
       this.#scheduleCancellationRecovery();
@@ -595,18 +605,8 @@ export class DraftController {
         try {
           await this.#cancelled(submission);
         } catch (cancellationError) {
-          if (
-            !(
-              cancellationError instanceof BackendError &&
-              cancellationError.transport
-            )
-          )
-            this.#notify({
-              error:
-                cancellationError instanceof Error
-                  ? cancellationError.message
-                  : String(cancellationError),
-            });
+          const failure = this.#cancellationFailure(cancellationError);
+          if (failure) this.#notify({ error: failure });
         }
       } else {
         this.#notify({

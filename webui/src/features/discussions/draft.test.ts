@@ -10,11 +10,20 @@ vi.mock("idb", () => ({
 }));
 vi.mock("@/lib/backend", () => ({
   BackendError: class BackendError extends Error {
+    code: string;
     transport: boolean;
+    operation: string | null;
 
-    constructor(_code: string, message: string, transport = true) {
+    constructor(
+      code: string,
+      message: string,
+      transport = true,
+      operation: string | null = null,
+    ) {
       super(message);
+      this.code = code;
       this.transport = transport;
+      this.operation = operation;
     }
   },
   backend: {
@@ -267,6 +276,7 @@ describe("persistent send attempts", () => {
           "unconfirmed",
           "Upload cancellation result unknown",
           true,
+          "upload.cancel",
         ),
       )
       .mockResolvedValue({ cancelled: 1 });
@@ -279,7 +289,9 @@ describe("persistent send attempts", () => {
 
     expect(send).not.toHaveBeenCalled();
     expect(controller.snapshot().draft.pending?.cancelRequested).toBe(true);
-    expect(controller.snapshot().error).toBeNull();
+    expect(controller.snapshot().error).toContain(
+      "Could not finish cancelling send",
+    );
 
     await controller.connectionRestored();
 
@@ -289,6 +301,7 @@ describe("persistent send attempts", () => {
     expect(controller.snapshot().draft.body).toBe("Edited while cancelling");
     expect(controller.snapshot().draft.files[0].file).toBe(file);
     expect(controller.snapshot().draft.files[0].upload).toBeUndefined();
+    expect(controller.snapshot().error).toBeNull();
   });
 
   it("resolves unknown upload preparation before finishing cancellation", async () => {
@@ -302,6 +315,7 @@ describe("persistent send attempts", () => {
       "unconfirmed",
       "Upload result unknown",
       true,
+      "upload.create",
     );
     vi.mocked(backend.createUpload)
       .mockReturnValueOnce(creating.promise)
