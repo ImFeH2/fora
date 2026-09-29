@@ -157,16 +157,16 @@ describe("Library document conflict recovery", () => {
     );
 
     vi.mocked(backend.readLibrary).mockResolvedValueOnce(latest);
-    await act(async () => {
-      const readsBeforeReopen = vi.mocked(backend.readLibrary).mock.calls
-        .length;
-      notification.action?.onClick();
-      await waitFor(() =>
-        expect(
-          vi.mocked(backend.readLibrary).mock.calls.length,
-        ).toBeGreaterThan(readsBeforeReopen),
+    const readsBeforeReopen = vi.mocked(backend.readLibrary).mock.calls.length;
+    notification.action?.onClick();
+    await waitFor(() => {
+      expect(vi.mocked(backend.readLibrary).mock.calls.length).toBeGreaterThan(
+        readsBeforeReopen,
       );
     });
+    await waitFor(() =>
+      expect(editor(view.container).value).toBe(latest.content),
+    );
   });
 
   it("keeps edits until Reopen after a save conflict", async () => {
@@ -192,15 +192,15 @@ describe("Library document conflict recovery", () => {
     );
 
     vi.mocked(backend.readLibrary).mockResolvedValueOnce(latest);
-    await act(async () => {
-      const readsBeforeReopen = vi.mocked(backend.readLibrary).mock.calls
-        .length;
-      notification.action?.onClick();
-      await waitFor(() =>
-        expect(
-          vi.mocked(backend.readLibrary).mock.calls.length,
-        ).toBeGreaterThan(readsBeforeReopen),
+    const readsBeforeReopen = vi.mocked(backend.readLibrary).mock.calls.length;
+    notification.action?.onClick();
+    await waitFor(() => {
+      expect(vi.mocked(backend.readLibrary).mock.calls.length).toBeGreaterThan(
+        readsBeforeReopen,
       );
     });
+    await waitFor(() =>
+      expect(editor(view.container).value).toBe(latest.content),
+    );
   });
 });

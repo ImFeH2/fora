@@ -359,6 +359,25 @@ it("keeps ordinary voice errors in composer feedback", async () => {
   voice.close();
 });
 
+it("dismisses a voice error when Composer unmounts", async () => {
+  const voice = mount(1, false);
+  await voice.start();
+  await voice.emit({
+    type: "error",
+    code: "voice_capacity",
+    message: "Audio capacity reached",
+  });
+  await vi.waitFor(() =>
+    expect(
+      readToasts().find((item) => item.id === "voice-input" && item.open),
+    ).toBeDefined(),
+  );
+  voice.close();
+  expect(
+    readToasts().find((item) => item.id === "voice-input" && item.open),
+  ).toBeUndefined();
+});
+
 it("releases a stale voice settings read after switching discussions", async () => {
   const firstRead = deferred<Record<string, unknown>>();
   const secondRead = deferred<Record<string, unknown>>();

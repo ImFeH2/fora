@@ -180,6 +180,7 @@ export function DiscussionsPage() {
     setArchiveBusy(item.id);
     try {
       await backend.archiveDiscussion(item.id, !item.archived);
+      dismissToast(`discussion-archive:${item.id}`);
       await load();
     } catch (failure) {
       if (failure instanceof BackendError && failure.transport)

@@ -247,6 +247,30 @@ describe("application recovery with controlled hook effects", () => {
     },
   );
 
+  it("keeps an unconfirmed write result visible during disconnect recovery", async () => {
+    mount();
+    await settle();
+    const uncertain = new BackendError(
+      "unconfirmed",
+      "Check the current operation before retrying.",
+      true,
+    );
+    notifyFailure(uncertain);
+    emit({
+      type: "connection.closed",
+      error: new BackendError("disconnected", "Connection lost", true),
+    });
+    await settle();
+    expect(
+      readToasts().find(
+        (item) => item.open && item.title === "Check operation result",
+      ),
+    ).toMatchObject({
+      title: "Check operation result",
+      description: "Check the current operation before retrying.",
+    });
+  });
+
   it.each(["close-first", "visible-first"])(
     "recovers with %s ordering",
     async (order) => {

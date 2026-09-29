@@ -232,6 +232,7 @@ export function Composer({
       releaseSubmission();
       active?.cancel();
       voiceConfigRead.current = null;
+      dismissToast("voice-input");
       if (
         currentDraft.current.controller !== controller ||
         currentDraft.current.discussionId !== discussionId

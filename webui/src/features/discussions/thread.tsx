@@ -25,6 +25,7 @@ import {
   AvatarStack,
   Button,
   Chip,
+  dismissToast,
   toast,
 } from "@/components/ui/index";
 import { OverflowMenu } from "@/components/ui/menu";
@@ -42,6 +43,10 @@ import { renderMentions } from "@/features/mentions";
 import { BackendError, backend, type Message } from "@/lib/backend";
 import { formatTime, relativeTime } from "@/lib/format";
 
+function discussionWriteToastId(id: number, title: string): string {
+  return `discussion-write:${id}:${title}`;
+}
+
 function reportDiscussionWriteFailure(
   id: number,
   title: string,
@@ -52,7 +57,7 @@ function reportDiscussionWriteFailure(
     return;
   }
   toast({
-    id: `discussion-write:${id}:${title}`,
+    id: discussionWriteToastId(id, title),
     tone: "danger",
     title,
     description: failure instanceof Error ? failure.message : String(failure),
@@ -302,12 +307,16 @@ function ThreadSession({ id }: { id: number }) {
   const ack = async (messageIds: number[], revoke = false) => {
     if (ackBusy) return;
     setAckBusy(true);
+    const title = revoke ? "Could not undo" : "Could not mark handled";
     try {
-      if (revoke) await backend.revokeAck(id, messageIds);
-      else {
+      if (revoke) {
+        await backend.revokeAck(id, messageIds);
+        dismissToast(discussionWriteToastId(id, title));
+      } else {
         await thread.markRead(Math.max(...messageIds));
         if (!thread.live.current) return;
         await backend.ack(id, messageIds);
+        dismissToast(discussionWriteToastId(id, title));
       }
       if (thread.live.current) await load();
     } catch (failure) {
@@ -320,11 +329,7 @@ function ThreadSession({ id }: { id: number }) {
           )
         )
       )
-        reportDiscussionWriteFailure(
-          id,
-          revoke ? "Could not undo" : "Could not mark handled",
-          failure,
-        );
+        reportDiscussionWriteFailure(id, title, failure);
     } finally {
       if (thread.live.current) setAckBusy(false);
     }
@@ -335,6 +340,7 @@ function ThreadSession({ id }: { id: number }) {
     setAckBusy(true);
     try {
       await backend.ackPending(id, detail.latest);
+      dismissToast(discussionWriteToastId(id, "Could not mark all handled"));
       if (thread.live.current) await load();
     } catch (failure) {
       if (thread.live.current)
@@ -347,20 +353,17 @@ function ThreadSession({ id }: { id: number }) {
   const archive = async (archived: boolean) => {
     if (archiveBusy) return;
     setArchiveBusy(true);
+    const title = archived
+      ? "Could not archive Discussion"
+      : "Could not unarchive Discussion";
     try {
       await backend.archiveDiscussion(id, archived);
+      dismissToast(discussionWriteToastId(id, title));
       if (!thread.live.current) return;
       if (archived) navigate({ name: "discussions" });
       else await load();
     } catch (failure) {
-      if (thread.live.current)
-        reportDiscussionWriteFailure(
-          id,
-          archived
-            ? "Could not archive Discussion"
-            : "Could not unarchive Discussion",
-          failure,
-        );
+      if (thread.live.current) reportDiscussionWriteFailure(id, title, failure);
     } finally {
       if (thread.live.current) setArchiveBusy(false);
     }

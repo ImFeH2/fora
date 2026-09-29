@@ -332,7 +332,12 @@ export function useApplication() {
       return true;
     };
     const offFailure = backend.onFailure((error) => {
-      if (backend.disconnected && error.transport) return;
+      if (
+        backend.disconnected &&
+        error.transport &&
+        error.code !== "unconfirmed"
+      )
+        return;
       if (backend.disconnected) setReconnecting(false);
       if (booted.current) reportBackendFailure(error);
       else if (backend.disconnected) setFailure(error);
