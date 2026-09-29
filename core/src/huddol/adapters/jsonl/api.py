@@ -564,7 +564,7 @@ class Api:
                         "model_identity",
                         "request_window",
                     ]
-                    if not requests
+                    if not requests and run.status != "running"
                     else []
                 ),
             }
@@ -620,7 +620,7 @@ class Api:
                 ),
                 "related": _render_message_page(related_page, "related", ordinal),
             }
-            if summary.status == "pending":
+            if summary.status == "pending" and run.status != "running":
                 result["missing"].append("model_response")
             return result
 

@@ -611,6 +611,139 @@ describe("Agent history request fields", () => {
       }),
     );
   });
+
+  it("keeps a live request when the initial history read finishes later", async () => {
+    const emptyMessages = {
+      messages: [],
+      offset: 0,
+      total: 0,
+      has_more: false,
+    };
+    const summary: AgentHistoryRequestSummary = {
+      ordinal: 1,
+      request_id: "request-1",
+      run_id: "run-4",
+      window_number: 1,
+      status: "pending",
+      started_at: "2026-01-01T00:00:00Z",
+      completed_at: null,
+      streaming: false,
+      input_length: 0,
+      parameters_length: 2,
+      settings_length: 2,
+      model_length: 2,
+      response_length: 0,
+      input_count: 0,
+      response_count: 0,
+      related_count: 0,
+      error: null,
+    };
+    const field = (source: HistoryText["source"]): HistoryText => ({
+      kind: "text",
+      source,
+      request_ordinal: 1,
+      message_index: 0,
+      path: [],
+      offset: 0,
+      next_offset: 2,
+      total_bytes: 2,
+      value: "{}",
+      has_more: false,
+    });
+    const run = {
+      sequence: 4,
+      run_id: "run-4",
+      status: "running",
+      started_at: "2026-01-01T00:00:00Z",
+      completed_at: null,
+      last_saved_at: "2026-01-01T00:00:01Z",
+      window_number: 1,
+      window_reset_at: null,
+      window_reason: null,
+      request_count: 1,
+      usage: null,
+      error: null,
+      legacy: false,
+    };
+    const initialRead: AgentHistoryRead = {
+      agent_id: 2,
+      run: { ...run, request_count: 0, legacy: true },
+      windows: [],
+      windows_has_more: false,
+      windows_next_after: null,
+      requests: [],
+      requests_has_more: false,
+      requests_next_after: null,
+      messages: emptyMessages,
+      missing: [],
+    };
+    const liveRead: AgentHistoryRead = {
+      agent_id: 2,
+      run,
+      windows: [],
+      windows_has_more: false,
+      windows_next_after: null,
+      requests: [summary],
+      requests_has_more: false,
+      requests_next_after: null,
+      messages: emptyMessages,
+      missing: [],
+      request: {
+        summary,
+        input: emptyMessages,
+        parameters: field("parameters"),
+        settings: field("settings"),
+        model: field("model"),
+        response: null,
+        related: emptyMessages,
+      },
+    };
+    let resolveInitial!: (value: AgentHistoryRead) => void;
+    const initial = new Promise<AgentHistoryRead>((resolve) => {
+      resolveInitial = resolve;
+    });
+    let reads = 0;
+    vi.spyOn(backend, "agentHistoryRead").mockImplementation(async () => {
+      reads += 1;
+      return reads === 1 ? initial : liveRead;
+    });
+    let listener: Parameters<typeof backend.onEvent>[0] | undefined;
+    vi.spyOn(backend, "onEvent").mockImplementation((next) => {
+      listener = next;
+      return vi.fn();
+    });
+
+    render(
+      <TooltipProvider>
+        <HistorySection
+          agentId={2}
+          initialRuns={[
+            {
+              sequence: 4,
+              run_id: "run-4",
+              status: "running",
+              started_at: "2026-01-01T00:00:00Z",
+              completed_at: null,
+              last_saved_at: "2026-01-01T00:00:01Z",
+              window_number: 1,
+              request_count: 1,
+              usage: null,
+              error: null,
+              effects: [],
+            },
+          ]}
+        />
+      </TooltipProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /#4/ }));
+    fireEvent.click(screen.getByRole("button", { name: "View full context" }));
+    listener?.({ type: "turn.progress", agent_id: 2, sequence: 4 });
+    expect(await screen.findByRole("tab", { name: /Request 1/ })).toBeTruthy();
+
+    resolveInitial(initialRead);
+    await Promise.resolve();
+    expect(screen.getByRole("tab", { name: /Request 1/ })).toBeTruthy();
+  });
 });
 
 describe("Workspace tree", () => {

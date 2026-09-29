@@ -1241,6 +1241,15 @@ def test_agent_history_protocol_reads_turn_requests_and_legacy_data(server) -> N
         '{"model":"test-model"}',
         False,
     )
+    pending = call(
+        dispatcher,
+        output,
+        "agent.history.read",
+        agent_id=agent_id,
+        sequence=run.sequence,
+    )["result"]
+    assert pending["missing"] == []
+    assert pending["request"]["summary"]["status"] == "pending"
     deps.history.finish_model_request(agent_id, run.sequence, handle, "[]")
     deps.history.finish_run(
         agent_id, run.sequence, status="completed", messages_json="[]"
@@ -1328,6 +1337,26 @@ def test_agent_history_protocol_reads_turn_requests_and_legacy_data(server) -> N
     ]
     assert legacy_read["run"]["legacy"] is True
     assert legacy_read["run"]["error"] == "provider failure"
+
+
+def test_agent_history_does_not_mark_unsaved_running_data_as_missing(server) -> None:
+    dispatcher, output, deps = server
+    agent_id = call(dispatcher, output, "organization.create_agent", name="Main")[
+        "result"
+    ]["id"]
+    run = deps.history.start_run(agent_id)
+    read = call(
+        dispatcher,
+        output,
+        "agent.history.read",
+        agent_id=agent_id,
+        sequence=run.sequence,
+    )["result"]
+    assert read["missing"] == []
+    assert read["requests"] == []
+    deps.history.finish_run(
+        agent_id, run.sequence, status="completed", messages_json="[]"
+    )
 
 
 def test_agent_history_requires_human_history_permission_before_body_reads(

@@ -14,7 +14,13 @@ import {
   Terminal,
   Trash2,
 } from "lucide-react";
-import { type ReactNode, useCallback, useEffect, useState } from "react";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { useOrganization } from "@/app/organization";
 import { useNavigate } from "@/app/router";
 import { Page, PageBody, PageHeader, Section } from "@/components/layout/shell";
@@ -548,6 +554,7 @@ function TurnHistoryModal({
   const [read, setRead] = useState<AgentHistoryRead | null>(null);
   const [ordinal, setOrdinal] = useState<number | undefined>();
   const [error, setError] = useState<string | null>(null);
+  const loadGeneration = useRef(0);
 
   const load = useCallback(
     async (
@@ -565,6 +572,7 @@ function TurnHistoryModal({
         windowsAfter?: number;
       } = {},
     ) => {
+      const generation = ++loadGeneration.current;
       const target = options.target;
       const offset = options.offset ?? 0;
       try {
@@ -581,6 +589,7 @@ function TurnHistoryModal({
             windowsAfter: options.windowsAfter,
           },
         );
+        if (generation !== loadGeneration.current) return;
         if (!target && nextOrdinal === undefined && result.request) {
           setOrdinal(result.request.summary.ordinal);
         }
@@ -667,6 +676,9 @@ function TurnHistoryModal({
     setRead(null);
     setOrdinal(undefined);
     void load(undefined);
+    return () => {
+      loadGeneration.current += 1;
+    };
   }, [load, open, sequence]);
 
   useEffect(() => {
