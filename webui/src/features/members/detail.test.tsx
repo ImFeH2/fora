@@ -37,8 +37,21 @@ import {
 vi.mock("@/components/ui/dialog", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/components/ui/dialog")>()),
   ConfirmDialog: vi.fn(() => null),
-  Modal: ({ children, open }: { children?: ReactNode; open: boolean }) =>
-    open ? <div>{children}</div> : null,
+  Modal: ({
+    children,
+    footer,
+    open,
+  }: {
+    children?: ReactNode;
+    footer?: ReactNode;
+    open: boolean;
+  }) =>
+    open ? (
+      <div>
+        {children}
+        {footer}
+      </div>
+    ) : null,
 }));
 
 afterEach(() => {
@@ -612,7 +625,7 @@ describe("Agent history request fields", () => {
     );
   });
 
-  it("keeps a live request when the initial history read finishes later", async () => {
+  it("keeps a live request when a stale initial history failure finishes later", async () => {
     const emptyMessages = {
       messages: [],
       offset: 0,
@@ -665,18 +678,6 @@ describe("Agent history request fields", () => {
       error: null,
       legacy: false,
     };
-    const initialRead: AgentHistoryRead = {
-      agent_id: 2,
-      run: { ...run, request_count: 0, legacy: true },
-      windows: [],
-      windows_has_more: false,
-      windows_next_after: null,
-      requests: [],
-      requests_has_more: false,
-      requests_next_after: null,
-      messages: emptyMessages,
-      missing: [],
-    };
     const liveRead: AgentHistoryRead = {
       agent_id: 2,
       run,
@@ -698,9 +699,9 @@ describe("Agent history request fields", () => {
         related: emptyMessages,
       },
     };
-    let resolveInitial!: (value: AgentHistoryRead) => void;
-    const initial = new Promise<AgentHistoryRead>((resolve) => {
-      resolveInitial = resolve;
+    let rejectInitial!: (reason?: unknown) => void;
+    const initial = new Promise<AgentHistoryRead>((_, reject) => {
+      rejectInitial = reject;
     });
     let reads = 0;
     vi.spyOn(backend, "agentHistoryRead").mockImplementation(async () => {
@@ -740,9 +741,52 @@ describe("Agent history request fields", () => {
     listener?.({ type: "turn.progress", agent_id: 2, sequence: 4 });
     expect(await screen.findByRole("tab", { name: /Request 1/ })).toBeTruthy();
 
-    resolveInitial(initialRead);
+    rejectInitial(new Error("stale initial failure"));
     await Promise.resolve();
     expect(screen.getByRole("tab", { name: /Request 1/ })).toBeTruthy();
+    expect(screen.queryByText("stale initial failure")).toBeNull();
+  });
+
+  it("ignores a history failure after the modal closes", async () => {
+    let rejectRead!: (reason?: unknown) => void;
+    const pending = new Promise<AgentHistoryRead>((_, reject) => {
+      rejectRead = reject;
+    });
+    vi.spyOn(backend, "agentHistoryRead").mockImplementation(
+      async () => pending,
+    );
+
+    render(
+      <TooltipProvider>
+        <HistorySection
+          agentId={2}
+          initialRuns={[
+            {
+              sequence: 4,
+              run_id: "run-4",
+              status: "running",
+              started_at: "2026-01-01T00:00:00Z",
+              completed_at: null,
+              last_saved_at: "2026-01-01T00:00:01Z",
+              window_number: 1,
+              request_count: 0,
+              usage: null,
+              error: null,
+              effects: [],
+            },
+          ]}
+        />
+      </TooltipProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /#4/ }));
+    fireEvent.click(screen.getByRole("button", { name: "View full context" }));
+    expect(await screen.findByText("Loading Turn history")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(screen.queryByText("Loading Turn history")).toBeNull();
+
+    rejectRead(new Error("closed history failure"));
+    await Promise.resolve();
+    expect(screen.queryByText("closed history failure")).toBeNull();
   });
 });
 

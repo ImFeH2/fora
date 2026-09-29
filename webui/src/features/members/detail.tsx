@@ -665,6 +665,7 @@ function TurnHistoryModal({
         });
         setError(null);
       } catch (failure) {
+        if (generation !== loadGeneration.current) return;
         setError(failure instanceof Error ? failure.message : String(failure));
       }
     },
