@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
@@ -73,10 +74,41 @@ def test_private_acl_survives_broad_parent_and_replacement(tmp_path):
     for payload in ("private-test-value", "replaced-test-value"):
         write_private(path, payload)
         assert read_private(path) == payload
-        sddl = powershell(
-            f"(Get-Acl -LiteralPath {quoted(path)}).GetSecurityDescriptorSddlForm('Owner,Access')"
+        acl = json.loads(
+            powershell(
+                f"$acl=Get-Acl -LiteralPath {quoted(path)}; "
+                "$owner=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value; "
+                "$access=@($acl.Access | ForEach-Object { "
+                "[ordered]@{"
+                "IdentitySid=$_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value; "
+                "AccessType=$_.AccessControlType.ToString(); "
+                "Rights=[int]$_.FileSystemRights; "
+                "IsInherited=$_.IsInherited; "
+                "InheritanceFlags=[int]$_.InheritanceFlags; "
+                "PropagationFlags=[int]$_.PropagationFlags"
+                "}"
+                "}); "
+                "[ordered]@{"
+                "OwnerSid=$owner; "
+                "AreAccessRulesProtected=$acl.AreAccessRulesProtected; "
+                "Access=$access"
+                "} | ConvertTo-Json -Compress -Depth 4"
+            )
         )
-        assert sddl == f"O:{sid}D:P(A;;FA;;;{sid})"
+        assert acl == {
+            "OwnerSid": sid,
+            "AreAccessRulesProtected": True,
+            "Access": [
+                {
+                    "IdentitySid": sid,
+                    "AccessType": "Allow",
+                    "Rights": 0x1F01FF,
+                    "IsInherited": False,
+                    "InheritanceFlags": 0,
+                    "PropagationFlags": 0,
+                }
+            ],
+        }
         with path.open("a", encoding="utf-8") as stream:
             stream.write("-writable")
         assert read_private(path) == payload + "-writable"
