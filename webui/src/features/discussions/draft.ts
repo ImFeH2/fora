@@ -1,6 +1,6 @@
 import { type DBSchema, openDB } from "idb";
 import { useEffect, useState, useSyncExternalStore } from "react";
-import { backend, type UploadRecord } from "@/lib/backend";
+import { BackendError, backend, type UploadRecord } from "@/lib/backend";
 
 export type DraftFile = {
   id: string;
@@ -527,6 +527,9 @@ function controllerFor(discussion: number) {
     return controller;
   })();
   controllers.set(discussion, pending);
+  void pending.catch(() => {
+    if (controllers.get(discussion) === pending) controllers.delete(discussion);
+  });
   return pending;
 }
 
@@ -535,19 +538,53 @@ export function useDraft(discussion: number) {
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     let live = true;
-    controllerFor(discussion).then(
-      (value) => {
-        if (live) setController(value);
-      },
-      (failure: unknown) => {
-        if (live)
+    let loading: Promise<void> | null = null;
+    let retryAfterLoading = false;
+    let current: DraftController | null = null;
+    const load = () => {
+      if (!live || current) return;
+      if (loading) {
+        retryAfterLoading = true;
+        return;
+      }
+      setError(null);
+      const attempt = controllerFor(discussion).then(
+        (value) => {
+          if (!live) return;
+          current = value;
+          setController(value);
+          setError(null);
+        },
+        (failure: unknown) => {
+          if (!live) return;
           setError(
-            failure instanceof Error ? failure.message : String(failure),
+            failure instanceof BackendError && failure.transport
+              ? null
+              : failure instanceof Error
+                ? failure.message
+                : String(failure),
           );
-      },
-    );
+        },
+      );
+      loading = attempt;
+      void attempt.finally(() => {
+        if (loading !== attempt) return;
+        loading = null;
+        if (retryAfterLoading) {
+          retryAfterLoading = false;
+          load();
+        }
+      });
+    };
+    const off = backend.onEvent((event) => {
+      if (event.type !== "connection.restored" || current) return;
+      setError(null);
+      load();
+    });
+    load();
     return () => {
       live = false;
+      off();
     };
   }, [discussion]);
   const view = useSyncExternalStore(
