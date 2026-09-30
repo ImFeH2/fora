@@ -217,7 +217,7 @@ export function ExecutionForm({
   };
   return (
     <form
-      className="m-0 flex min-w-0 max-w-[560px] flex-col gap-4 border-0 p-0"
+      className="m-0 flex min-w-0 max-w-[560px] flex-col gap-4 border-0 p-0 [&_button]:h-auto [&_button]:min-h-[26px] [&_button]:max-w-full [&_button]:flex-wrap [&_button]:whitespace-normal [&_button]:wrap-anywhere"
       aria-label="Execution settings"
       onSubmit={(event) => {
         event.preventDefault();
@@ -225,7 +225,7 @@ export function ExecutionForm({
       }}
     >
       {info.error ? (
-        <div className="flex min-w-0 flex-wrap items-center gap-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-2 [&>span]:h-auto [&>span]:min-h-5 [&>span]:min-w-0 [&>span]:max-w-full [&>span]:whitespace-normal [&>span]:wrap-anywhere [&>span]:leading-body">
           <Chip tone="danger">Unavailable</Chip>
           <span className="min-w-0 flex-1 text-sm text-fg-muted wrap-anywhere">
             {info.error}
@@ -283,7 +283,7 @@ export function ExecutionForm({
                       <span className="min-w-0 flex-1 basis-40 whitespace-pre-wrap font-mono text-sm wrap-anywhere">
                         {row.path}
                       </span>
-                      <div className="flex shrink-0 gap-1">
+                      <div className="flex min-w-0 max-w-full flex-wrap gap-1">
                         <Button
                           ref={(button) => {
                             if (button) editButtons.current.set(row.id, button);
@@ -335,7 +335,7 @@ export function ExecutionForm({
                     </div>
                   )}
                   {reason ? (
-                    <div className="flex flex-wrap gap-2">
+                    <div className="flex min-w-0 flex-wrap gap-2 [&>span]:h-auto [&>span]:min-h-5 [&>span]:min-w-0 [&>span]:max-w-full [&>span]:whitespace-normal [&>span]:wrap-anywhere [&>span]:leading-body">
                       <Chip tone="warning">{reason}</Chip>
                     </div>
                   ) : null}
@@ -380,7 +380,7 @@ export function ExecutionForm({
             </Button>
           </div>
         </Field>
-        <div className="flex items-center gap-3 pt-1">
+        <div className="flex min-w-0 flex-wrap items-center gap-3 pt-1 [&>button]:min-h-8">
           <Button
             variant="primary"
             type="submit"
