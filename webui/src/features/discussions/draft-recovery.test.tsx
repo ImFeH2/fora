@@ -258,6 +258,89 @@ it("completes upload cancellation after connection recovery", async () => {
   expect(screen.getByText("recover.txt")).toBeTruthy();
 });
 
+it("clears a timed-out upload cancellation when the connection closes", async () => {
+  const file = new File(["content"], "cancel-timeout.txt");
+  storage.get.mockResolvedValue({
+    key: "test-organization:1:8:tab-id",
+    updatedAt: 0,
+    body: "Edited message",
+    bodyRevision: 1,
+    files: [{ id: "file", clientId: "client", file }],
+    pending: null,
+  });
+  vi.spyOn(backend, "organization").mockResolvedValue(organization());
+  vi.spyOn(backend, "disconnected", "get").mockReturnValue(false);
+  vi.spyOn(backend, "reconnecting", "get").mockReturnValue(false);
+  vi.spyOn(backend, "onEvent").mockImplementation((listener) => {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  });
+  vi.spyOn(backend, "createUpload").mockResolvedValue({
+    id: "cancel-timeout-upload",
+    state: "reserved",
+    expires_at: Date.now() / 1000 + 3600,
+  });
+  let stopUpload!: () => void;
+  vi.spyOn(backend, "uploadFile").mockImplementation(
+    (_id, _file, signal) =>
+      new Promise((_resolve, reject) => {
+        stopUpload = () => reject(signal.reason);
+      }),
+  );
+  vi.spyOn(backend, "cancelUploads")
+    .mockRejectedValueOnce(
+      new BackendError(
+        "unconfirmed",
+        "Upload cancellation result unknown",
+        true,
+        "upload.cancel",
+      ),
+    )
+    .mockResolvedValue({ cancelled: 1 });
+  const send = vi.fn().mockResolvedValue(true);
+
+  mountComposer(8, send);
+  await waitFor(() => expect(input().value).toBe("Edited message"));
+  act(() => screen.getByRole("button", { name: "Send · Enter" }).click());
+  await waitFor(() => expect(stopUpload).toBeTypeOf("function"));
+  await act(async () => {
+    screen.getByRole("button", { name: "Cancel upload" }).click();
+    stopUpload();
+  });
+  await waitFor(() =>
+    expect(screen.getByText(/Could not finish cancelling send/)).toBeTruthy(),
+  );
+  expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+
+  act(() => {
+    for (const listener of listeners)
+      listener({
+        type: "connection.closed",
+        error: new BackendError("disconnected", "Connection lost", true),
+      });
+  });
+
+  expect(screen.queryByText(/Could not finish cancelling send/)).toBeNull();
+  expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  expect(input().value).toBe("Edited message");
+  expect(
+    screen.getByRole("list", { name: "Draft attachments" }).textContent,
+  ).toContain("cancel-timeout.txt");
+
+  act(() => {
+    for (const listener of listeners) listener({ type: "connection.restored" });
+  });
+  await waitFor(() =>
+    expect(screen.queryByText("Cancelling upload")).toBeNull(),
+  );
+  expect(backend.cancelUploads).toHaveBeenCalledTimes(2);
+  expect(input().value).toBe("Edited message");
+  expect(
+    screen.getByRole("list", { name: "Draft attachments" }).textContent,
+  ).toContain("cancel-timeout.txt");
+  expect(send).not.toHaveBeenCalled();
+});
+
 it("keeps connection feedback global when cancellation fails after closure", async () => {
   const file = new File(["content"], "closed-cancel.txt");
   const upload = {
@@ -379,6 +462,9 @@ it("keeps a local cancellation save failure after connection closure", async () 
       "Local storage unavailable",
     ),
   );
+  expect(screen.getByRole("alert").textContent).toBe(
+    "Could not finish cancelling send: Draft not saved: Local storage unavailable",
+  );
   expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
 
   act(() => {
@@ -389,8 +475,8 @@ it("keeps a local cancellation save failure after connection closure", async () 
       });
   });
 
-  expect(screen.getByRole("alert").textContent).toContain(
-    "Local storage unavailable",
+  expect(screen.getByRole("alert").textContent).toBe(
+    "Could not finish cancelling send: Draft not saved: Local storage unavailable",
   );
   expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
   expect(input().value).toBe("Local draft");

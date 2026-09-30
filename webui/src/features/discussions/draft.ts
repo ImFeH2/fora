@@ -430,7 +430,7 @@ export class DraftController {
         storageError: null,
         error: `Could not finish cancelling send: ${reason}`,
       });
-      throw new Error(`Could not finish cancelling send: ${reason}`);
+      throw new Error(reason);
     }
     this.#cancellationTransportFeedback = null;
     this.#notify({
@@ -503,7 +503,13 @@ export class DraftController {
       await this.#cancelled(pending);
     } catch (error) {
       const failure = this.#cancellationFailure(error);
-      if (failure) this.#notify({ error: failure });
+      if (failure) {
+        this.#notify({ error: failure });
+        this.#cancellationTransportFeedback =
+          error instanceof BackendError && error.transport
+            ? this.#errorVersion
+            : null;
+      }
     } finally {
       this.#notify({ busy: false });
       this.#scheduleCancellationRecovery();
@@ -628,7 +634,14 @@ export class DraftController {
           await this.#cancelled(submission);
         } catch (cancellationError) {
           const failure = this.#cancellationFailure(cancellationError);
-          if (failure) this.#notify({ error: failure });
+          if (failure) {
+            this.#notify({ error: failure });
+            this.#cancellationTransportFeedback =
+              cancellationError instanceof BackendError &&
+              cancellationError.transport
+                ? this.#errorVersion
+                : null;
+          }
         }
       } else {
         this.#notify({
