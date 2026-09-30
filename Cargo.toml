@@ -3,7 +3,7 @@ resolver = "3"
 members = ["app", "cli"]
 
 [workspace.package]
-version = "0.0.7"
+version = "0.0.8"
 authors = ["ImFeH2 <i@feh2.im>"]
 edition = "2024"
 description = "Run your own organization of agents."

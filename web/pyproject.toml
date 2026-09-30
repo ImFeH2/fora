@@ -1,10 +1,10 @@
 [project]
 name = "huddol-web"
-version = "0.0.7"
+version = "0.0.8"
 description = "Browser interface for Huddol."
 requires-python = ">=3.13"
 authors = [{ name = "ImFeH2", email = "i@feh2.im" }]
-dependencies = ["huddol==0.0.7"]
+dependencies = ["huddol==0.0.8"]
 
 [project.scripts]
 huddol-web = "huddol_web.__main__:run"
