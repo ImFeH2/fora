@@ -88,6 +88,11 @@ function View({
 }
 
 const CONNECTION_TOAST = "connection";
+const HISTORY_READ_OPERATIONS = new Set([
+  "agent.history.read",
+  "agent.history.text",
+  "agent.history.image",
+]);
 const COMPOSER_OPERATIONS = new Set([
   "discussion.send",
   "upload.create",
@@ -338,6 +343,12 @@ export function useApplication() {
       return true;
     };
     const offFailure = backend.onFailure((error) => {
+      if (
+        error.code === "timeout" &&
+        error.operation !== null &&
+        HISTORY_READ_OPERATIONS.has(error.operation)
+      )
+        return;
       if (
         error.code === "unconfirmed" &&
         error.operation !== null &&

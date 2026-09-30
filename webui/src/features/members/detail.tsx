@@ -47,6 +47,7 @@ import {
   type AgentHistoryRead,
   type AgentHistoryRun,
   type AgentRun,
+  BackendError,
   backend,
   type HistoryBinary,
   type HistoryMessages,
@@ -451,6 +452,36 @@ function mergeHistoryRequests(
   );
 }
 
+function historyFailure(failure: unknown): BackendError {
+  return failure instanceof BackendError
+    ? failure
+    : new BackendError(
+        "request_failed",
+        failure instanceof Error ? failure.message : String(failure),
+      );
+}
+
+function isHistoryConnectionFailure(error: BackendError): boolean {
+  return error.transport && error.code !== "timeout";
+}
+
+function mergeHistoryMessages(
+  current: HistoryMessages,
+  incoming: HistoryMessages,
+): HistoryMessages {
+  if (current.offset !== incoming.offset) return incoming;
+  const messages = [...current.messages];
+  for (const [index, message] of incoming.messages.entries())
+    messages[index] = message;
+  const end = current.offset + messages.length;
+  return {
+    ...incoming,
+    messages,
+    has_more: end < incoming.total,
+    next_offset: end < incoming.total ? end : undefined,
+  };
+}
+
 function mergeHistoryWindows(
   current: AgentHistoryRead["windows"],
   incoming: AgentHistoryRead["windows"],
@@ -553,7 +584,7 @@ function TurnHistoryModal({
 }) {
   const [read, setRead] = useState<AgentHistoryRead | null>(null);
   const [ordinal, setOrdinal] = useState<number | undefined>();
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<BackendError | null>(null);
   const loadGeneration = useRef(0);
 
   const load = useCallback(
@@ -570,6 +601,7 @@ function TurnHistoryModal({
         offset?: number;
         requestAfter?: number;
         windowsAfter?: number;
+        refresh?: boolean;
       } = {},
     ) => {
       const generation = ++loadGeneration.current;
@@ -600,7 +632,55 @@ function TurnHistoryModal({
             requests: mergeHistoryRequests(current.requests, result.requests),
             windows: mergeHistoryWindows(current.windows, result.windows),
           };
-          if (!target) return merged;
+          if (!target) {
+            if (!options.refresh)
+              return {
+                ...merged,
+                messages: mergeHistoryMessages(
+                  current.messages,
+                  result.messages,
+                ),
+              };
+            const request = result.request;
+            const previous = current.request;
+            return {
+              ...merged,
+              requests_has_more:
+                merged.requests.length < result.run.request_count,
+              requests_next_after:
+                merged.requests[merged.requests.length - 1]?.ordinal ?? null,
+              windows_has_more:
+                current.windows.length > result.windows.length
+                  ? current.windows_has_more
+                  : result.windows_has_more,
+              windows_next_after:
+                merged.windows[merged.windows.length - 1]?.number ?? null,
+              messages: mergeHistoryMessages(current.messages, result.messages),
+              request:
+                request &&
+                previous &&
+                request.summary.ordinal === previous.summary.ordinal
+                  ? {
+                      ...request,
+                      input: mergeHistoryMessages(
+                        previous.input,
+                        request.input,
+                      ),
+                      related: mergeHistoryMessages(
+                        previous.related,
+                        request.related,
+                      ),
+                      response:
+                        previous.response && request.response
+                          ? mergeHistoryMessages(
+                              previous.response,
+                              request.response,
+                            )
+                          : request.response,
+                    }
+                  : request,
+            };
+          }
           if (target === "requests" || target === "windows") {
             return {
               ...merged,
@@ -666,7 +746,8 @@ function TurnHistoryModal({
         setError(null);
       } catch (failure) {
         if (generation !== loadGeneration.current) return;
-        setError(failure instanceof Error ? failure.message : String(failure));
+        const problem = historyFailure(failure);
+        if (!isHistoryConnectionFailure(problem)) setError(problem);
       }
     },
     [agentId, sequence],
@@ -685,12 +766,20 @@ function TurnHistoryModal({
   useEffect(() => {
     if (!open) return;
     return backend.onEvent((event) => {
+      if (event.type === "connection.closed") {
+        loadGeneration.current += 1;
+        setError((current) =>
+          current && isHistoryConnectionFailure(current) ? null : current,
+        );
+        return;
+      }
       if (
-        event.type.startsWith("turn.") &&
-        event.agent_id === agentId &&
-        event.sequence === sequence
+        event.type === "connection.restored" ||
+        (event.type.startsWith("turn.") &&
+          event.agent_id === agentId &&
+          event.sequence === sequence)
       )
-        void load(ordinal);
+        void load(ordinal, { refresh: true });
     });
   }, [agentId, load, open, ordinal, sequence]);
 
@@ -712,7 +801,7 @@ function TurnHistoryModal({
           <div className="flex items-center justify-between gap-3 py-2 px-3 border border-red-300/40 rounded-xs bg-red-500/15 text-red-100 text-xs">
             <span className="flex items-center gap-2 min-w-0 wrap-anywhere">
               <CircleAlert size={14} aria-hidden="true" />
-              {error}
+              {error.message}
             </span>
             <Button size="sm" onClick={() => void load(ordinal)}>
               <RefreshCw size={13} />
@@ -1192,22 +1281,66 @@ function HistoryTextPreview({
   const [text, setText] = useState(reference.value);
   const [nextOffset, setNextOffset] = useState(reference.next_offset);
   const [hasMore, setHasMore] = useState(reference.has_more);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<BackendError | null>(null);
+  const [loading, setLoading] = useState(false);
+  const loadGeneration = useRef(0);
+  const interruptedOffset = useRef<number | null>(null);
+  const pathKey = JSON.stringify(reference.path);
 
-  const loadMore = async () => {
-    try {
-      const result = await backend.agentHistoryText(agentId, sequence, {
-        ...reference,
-        offset: nextOffset,
-      });
-      setText((current) => current + result.value);
-      setNextOffset(result.next_offset);
-      setHasMore(result.has_more);
-      setError(null);
-    } catch (failure) {
-      setError(failure instanceof Error ? failure.message : String(failure));
-    }
-  };
+  const loadMore = useCallback(
+    async (offset: number) => {
+      const generation = ++loadGeneration.current;
+      interruptedOffset.current = offset;
+      setLoading(true);
+      try {
+        const result = await backend.agentHistoryText(agentId, sequence, {
+          ...reference,
+          offset,
+        });
+        if (generation !== loadGeneration.current) return;
+        interruptedOffset.current = null;
+        setText((current) => current + result.value);
+        setNextOffset(result.next_offset);
+        setHasMore(result.has_more);
+        setError(null);
+      } catch (failure) {
+        if (generation !== loadGeneration.current) return;
+        const problem = historyFailure(failure);
+        if (!isHistoryConnectionFailure(problem)) {
+          interruptedOffset.current = null;
+          setError(problem);
+        }
+      } finally {
+        if (generation === loadGeneration.current) setLoading(false);
+      }
+    },
+    [
+      agentId,
+      pathKey,
+      reference.source,
+      reference.request_ordinal,
+      reference.message_index,
+      sequence,
+    ],
+  );
+
+  useEffect(() => {
+    const stop = backend.onEvent((event) => {
+      if (event.type === "connection.closed") {
+        loadGeneration.current += 1;
+        setLoading(false);
+      }
+      if (
+        event.type === "connection.restored" &&
+        interruptedOffset.current !== null
+      )
+        void loadMore(interruptedOffset.current);
+    });
+    return () => {
+      loadGeneration.current += 1;
+      stop();
+    };
+  }, [loadMore]);
 
   return (
     <div className="flex flex-col gap-2 py-2 px-3 border border-line rounded-sm bg-surface">
@@ -1217,9 +1350,15 @@ function HistoryTextPreview({
       <pre className="m-0 max-h-64 overflow-auto whitespace-pre-wrap wrap-anywhere text-xs leading-body font-mono tracking-[0]">
         {text}
       </pre>
-      {error ? <p className="m-0 text-danger text-xs">{error}</p> : null}
+      {error ? (
+        <p className="m-0 text-danger text-xs">{error.message}</p>
+      ) : null}
       {hasMore ? (
-        <Button size="sm" onClick={() => void loadMore()}>
+        <Button
+          size="sm"
+          disabled={loading}
+          onClick={() => void loadMore(nextOffset)}
+        >
           Load more text
         </Button>
       ) : null}
@@ -1237,30 +1376,66 @@ function HistoryImagePreview({
   reference: HistoryBinary;
 }) {
   const [image, setImage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<BackendError | null>(null);
   const [zoom, setZoom] = useState(false);
-  const pathKey = reference.path.map(String).join("/");
+  const [loading, setLoading] = useState(false);
+  const loadGeneration = useRef(0);
+  const pathKey = JSON.stringify(reference.path);
+
+  const load = useCallback(async () => {
+    const generation = ++loadGeneration.current;
+    setLoading(true);
+    try {
+      const result = await backend.agentHistoryImage(
+        agentId,
+        sequence,
+        reference,
+      );
+      if (generation !== loadGeneration.current) return;
+      setImage(`data:${result.media_type};base64,${result.data}`);
+      setError(null);
+    } catch (failure) {
+      if (generation !== loadGeneration.current) return;
+      const problem = historyFailure(failure);
+      if (!isHistoryConnectionFailure(problem)) setError(problem);
+    } finally {
+      if (generation === loadGeneration.current) setLoading(false);
+    }
+  }, [
+    agentId,
+    pathKey,
+    reference.source,
+    reference.request_ordinal,
+    reference.message_index,
+    sequence,
+  ]);
 
   useEffect(() => {
-    let active = true;
-    void backend
-      .agentHistoryImage(agentId, sequence, reference)
-      .then((result) => {
-        if (active) setImage(`data:${result.media_type};base64,${result.data}`);
-      })
-      .catch((failure: unknown) => {
-        if (active)
-          setError(
-            failure instanceof Error ? failure.message : String(failure),
-          );
-      });
+    void load();
+    const stop = backend.onEvent((event) => {
+      if (event.type === "connection.closed") {
+        loadGeneration.current += 1;
+        setLoading(false);
+      }
+      if (event.type === "connection.restored") void load();
+    });
     return () => {
-      active = false;
+      loadGeneration.current += 1;
+      stop();
     };
-  }, [agentId, pathKey, reference, sequence]);
+  }, [load]);
 
   if (error) {
-    return <p className="text-danger text-xs">Could not load image: {error}</p>;
+    return (
+      <div className="flex items-center gap-3">
+        <p className="text-danger text-xs">
+          Could not load image: {error.message}
+        </p>
+        <Button size="sm" disabled={loading} onClick={() => void load()}>
+          Retry image
+        </Button>
+      </div>
+    );
   }
   if (!image) {
     return (

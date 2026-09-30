@@ -1,7 +1,15 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
-import { type ReactNode, useEffect, useId, useRef, useState } from "react";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+} from "react";
 import { Button, Field, IconButton, Input, toast } from "@/components/ui/index";
+import { registerToastHost } from "@/components/ui/toast-host";
 
 export function dialogFocusTarget<
   T extends { disabled?: boolean },
@@ -47,6 +55,9 @@ export function Modal({
   const opener = useRef<HTMLElement | null>(null);
   const content = useRef<HTMLDivElement>(null);
   const footerElement = useRef<HTMLDivElement>(null);
+  const toastHost = useCallback((node: HTMLDivElement | null) => {
+    if (node) return registerToastHost(node);
+  }, []);
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
@@ -97,6 +108,7 @@ export function Modal({
               {description}
             </Dialog.Description>
           ) : null}
+          <div ref={toastHost} className="empty:hidden shrink-0" />
           {children ? (
             <div className="min-h-0 flex-1 overflow-y-auto flex flex-col gap-4">
               {children}

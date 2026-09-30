@@ -860,6 +860,7 @@ export class Backend {
               "timeout",
               "Request timed out. Try reading again.",
               true,
+              method,
             )
           : unconfirmed(method);
         const pending = this.#pending.get(id);

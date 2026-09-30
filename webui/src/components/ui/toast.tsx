@@ -2,7 +2,9 @@ import * as ToastPrimitive from "@radix-ui/react-toast";
 import { clsx } from "clsx";
 import { CircleAlert, CircleCheck, Info, X } from "lucide-react";
 import { useSyncExternalStore } from "react";
+import { createPortal } from "react-dom";
 import { Button, IconButton } from "@/components/ui/index";
+import { readToastHost, subscribeToastHost } from "@/components/ui/toast-host";
 
 const toastTones = {
   success: "text-success",
@@ -170,15 +172,28 @@ function ToastView({ item }: { item: ToastItem }) {
 
 export function Toaster() {
   const current = useSyncExternalStore(subscribeToasts, readToasts, readToasts);
+  const host = useSyncExternalStore(
+    subscribeToastHost,
+    readToastHost,
+    () => null,
+  );
+  const viewport =
+    current.length > 0 || !host ? (
+      <ToastPrimitive.Viewport
+        className={
+          host
+            ? "flex flex-col gap-2 w-full m-0 p-0 list-none outline-none"
+            : "fixed right-6 bottom-6 z-(--layer-toast) flex flex-col gap-2 w-[min(360px,calc(100vw-48px))] m-0 p-0 list-none outline-none"
+        }
+        label="Notifications"
+      />
+    ) : null;
   return (
     <ToastPrimitive.Provider label="Notification" swipeDirection="right">
       {current.map((item) => (
         <ToastView key={`${item.id}:${item.revision}`} item={item} />
       ))}
-      <ToastPrimitive.Viewport
-        className="fixed right-6 bottom-6 z-(--layer-toast) flex flex-col gap-2 w-[min(360px,calc(100vw-48px))] m-0 p-0 list-none outline-none"
-        label="Notifications"
-      />
+      {host ? createPortal(viewport, host) : viewport}
     </ToastPrimitive.Provider>
   );
 }
