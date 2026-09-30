@@ -1,10 +1,8 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import {
-  directoryDraft,
   ExecutionForm,
   type ExecutionSettings,
-  executionChanged,
   executionUpdate,
 } from "@/features/settings/execution";
 
@@ -15,27 +13,13 @@ const initial: ExecutionSettings = {
 };
 
 describe("Execution settings", () => {
-  it("reads the draft of the writable directories", () => {
-    expect(directoryDraft(initial)).toBe("/work");
-    expect(directoryDraft({ ...initial, write_directories: [] })).toBe("");
-  });
-
-  it("marks a change of the draft or a kernel error", () => {
-    expect(executionChanged(initial, "/work")).toBe(false);
-    expect(executionChanged(initial, "/work\n/tmp")).toBe(true);
-    expect(
-      executionChanged(
-        { ...initial, error: "Execution environment is unavailable" },
-        "/work",
-      ),
-    ).toBe(true);
-  });
-
   it("saves the directories without App startup fields", () => {
-    expect(executionUpdate("/work\n/work\n/home/you/中文\n")).toEqual({
+    expect(
+      executionUpdate([" /work ", "/work", "/home/you/中文", " "]),
+    ).toEqual({
       write_directories: ["/work", "/home/you/中文"],
     });
-    expect(executionUpdate("")).toEqual({ write_directories: [] });
+    expect(executionUpdate([])).toEqual({ write_directories: [] });
   });
 
   it("edits the file policy without an environment choice", () => {
@@ -43,7 +27,10 @@ describe("Execution settings", () => {
       <ExecutionForm initial={initial} onSave={async () => initial} />,
     );
     expect(html).toContain("Writable directories");
-    expect(html).toMatch(/<textarea[^>]*>\/work<\/textarea>/);
+    expect(html).toContain("/work</span>");
+    expect(html).toContain("Edit /work");
+    expect(html).toContain("Delete /work");
+    expect(html).toContain("Add directory");
     expect(html).not.toContain("Execution environment");
     expect(html).not.toContain("Next start");
   });
@@ -51,7 +38,7 @@ describe("Execution settings", () => {
   it("shows an unavailable execution with its diagnostics", () => {
     const failed: ExecutionSettings = {
       ...initial,
-      write_directories: [],
+      write_directories: ["/missing"],
       error: "Execution environment is unavailable",
       unusable_write_directories: [
         { path: "/missing", reason: "invalid_directory" },
@@ -60,7 +47,7 @@ describe("Execution settings", () => {
     const html = renderToStaticMarkup(
       <ExecutionForm initial={failed} onSave={async () => failed} />,
     );
-    expect(html).toMatch(/<textarea[^>]*><\/textarea>/);
+    expect(html).toContain("/missing</span>");
     expect(html).toContain("Execution environment is unavailable");
     expect(html).toContain("/missing");
     expect(html).toContain("invalid_directory");
@@ -70,11 +57,14 @@ describe("Execution settings", () => {
     expect(html).toContain(">invalid_directory</span>");
   });
 
-  it("shows no fact list for a healthy execution", () => {
+  it("shows the complete path with wrapping", () => {
     const html = renderToStaticMarkup(
       <ExecutionForm initial={initial} onSave={async () => initial} />,
     );
-    expect(html).not.toMatch(/<ul\b/);
+    expect(html).toContain(
+      "whitespace-pre-wrap font-mono text-sm wrap-anywhere",
+    );
+    expect(html).toContain("border-line bg-surface");
     expect(html).not.toContain("Restart Huddol");
   });
 });
