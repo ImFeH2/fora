@@ -153,7 +153,9 @@ export function ExecutionForm({
     if (
       path &&
       !executionUpdate(
-        draftDirectories({ ...draft, adding: null }),
+        rows
+          .filter((row) => row.id !== draft.editing?.id)
+          .map((row) => row.path),
       ).write_directories.includes(path)
     )
       rows.push({ id: nextId.current++, path });

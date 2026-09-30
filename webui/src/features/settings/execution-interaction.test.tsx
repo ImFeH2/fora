@@ -213,6 +213,47 @@ it("keeps editing text while completing an addition", async () => {
   await save(["/work", "/third"]);
 });
 
+it.each(["/new", "/work"])(
+  "preserves completed addition %s when cancelling the original edit",
+  async (path) => {
+    await openPanel();
+    edit("/work", "/new");
+    add(` ${path} `);
+    fireEvent.keyDown(input("New directory path"), { key: "Enter" });
+    expect(document.activeElement).toBe(button("Add directory"));
+    expect(input().value).toBe("/new");
+    expect(button(`Edit ${path}`)).toBeTruthy();
+    fireEvent.keyDown(input(), { key: "Escape" });
+    expect(document.activeElement).toBe(
+      screen.getAllByRole("button", { name: "Edit /work" })[0],
+    );
+    expect(button("Save").disabled).toBe(path === "/work");
+    if (path === "/work") {
+      fireEvent.click(screen.getAllByRole("button", { name: "Edit /work" })[0]);
+      change("Edit directory path", "/changed");
+      await save(["/changed", "/other", "/work"]);
+    } else {
+      await save(["/work", "/other", "/new"]);
+    }
+  },
+);
+
+it.each(["/new", "/work"])(
+  "preserves completed addition %s when changing the original edit",
+  async (path) => {
+    await openPanel();
+    edit("/work", "/new");
+    add(path);
+    fireEvent.keyDown(input("New directory path"), { key: "Enter" });
+    expect(document.activeElement).toBe(button("Add directory"));
+    expect(button(`Edit ${path}`)).toBeTruthy();
+    change("Edit directory path", "/changed");
+    await save(["/changed", "/other", path]);
+    expect(button(`Edit ${path}`)).toBeTruthy();
+    expect(document.activeElement).toBe(button("Add directory"));
+  },
+);
+
 it("filters empty paths and duplicates and focuses the surviving item", async () => {
   await openPanel();
   edit("/other", " /work ");
