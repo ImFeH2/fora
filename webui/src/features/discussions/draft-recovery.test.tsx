@@ -211,11 +211,14 @@ it("completes upload cancellation after connection recovery", async () => {
     },
   });
   const connectionError = new BackendError(
-    "disconnected",
-    "Connection lost. Reconnect to continue.",
+    "unconfirmed",
+    "Upload cancellation result unknown",
     true,
+    "upload.cancel",
   );
   vi.spyOn(backend, "organization").mockResolvedValue(organization());
+  vi.spyOn(backend, "disconnected", "get").mockReturnValue(false);
+  vi.spyOn(backend, "reconnecting", "get").mockReturnValue(false);
   vi.spyOn(backend, "onEvent").mockImplementation((listener) => {
     listeners.add(listener);
     return () => listeners.delete(listener);
@@ -228,8 +231,19 @@ it("completes upload cancellation after connection recovery", async () => {
   mountComposer(3, send);
   await waitFor(() => expect(backend.cancelUploads).toHaveBeenCalledOnce());
   expect(screen.getByText("Cancelling upload")).toBeTruthy();
+  expect(screen.getByText(/Could not finish cancelling send/)).toBeTruthy();
   expect(screen.queryByRole("button", { name: "Retry send" })).toBeNull();
   expect(screen.queryByRole("button", { name: "Cancel upload" })).toBeNull();
+
+  act(() => {
+    for (const listener of listeners)
+      listener({ type: "connection.closed", error: connectionError });
+  });
+
+  await waitFor(() =>
+    expect(screen.queryByText(/Could not finish cancelling send/)).toBeNull(),
+  );
+  expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
 
   act(() => {
     for (const listener of listeners) listener({ type: "connection.restored" });
@@ -241,6 +255,89 @@ it("completes upload cancellation after connection recovery", async () => {
   expect(backend.cancelUploads).toHaveBeenCalledTimes(2);
   expect(send).not.toHaveBeenCalled();
   expect(input().value).toBe("Edited message");
+  expect(screen.getByText("recover.txt")).toBeTruthy();
+});
+
+it("keeps connection feedback global when cancellation fails after closure", async () => {
+  const file = new File(["content"], "closed-cancel.txt");
+  const upload = {
+    id: "closed-upload",
+    state: "receiving" as const,
+    expires_at: Date.now() / 1000 + 60,
+  };
+  storage.get.mockResolvedValue({
+    key: "test-organization:1:5:tab-id",
+    updatedAt: 0,
+    body: "Edited during cancellation",
+    bodyRevision: 1,
+    files: [{ id: "file", clientId: "client", file, upload }],
+    pending: {
+      id: "closed-attempt",
+      body: "Original message",
+      bodyRevision: 0,
+      files: [{ id: "file", clientId: "client", file, upload }],
+      phase: "uploading",
+      cancelRequested: true,
+    },
+  });
+  let rejectCancellation!: (error: BackendError) => void;
+  const cancellation = new Promise<
+    Awaited<ReturnType<typeof backend.cancelUploads>>
+  >((_resolve, reject) => {
+    rejectCancellation = reject;
+  });
+  const error = new BackendError(
+    "unconfirmed",
+    "Upload cancellation result unknown",
+    true,
+    "upload.cancel",
+  );
+  let disconnected = false;
+  vi.spyOn(backend, "disconnected", "get").mockImplementation(
+    () => disconnected,
+  );
+  vi.spyOn(backend, "organization").mockResolvedValue(organization());
+  vi.spyOn(backend, "onEvent").mockImplementation((listener) => {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  });
+  vi.spyOn(backend, "cancelUploads")
+    .mockReturnValueOnce(cancellation)
+    .mockResolvedValue({ cancelled: 1 });
+  const send = vi.fn().mockResolvedValue(true);
+
+  mountComposer(5, send);
+  await waitFor(() => expect(backend.cancelUploads).toHaveBeenCalledOnce());
+  await act(async () => {
+    disconnected = true;
+    for (const listener of listeners)
+      listener({ type: "connection.closed", error });
+    rejectCancellation(error);
+    await cancellation.catch(() => {});
+  });
+
+  expect(input().value).toBe("Edited during cancellation");
+  expect(screen.getByText("Cancelling upload")).toBeTruthy();
+  expect(screen.queryByText(/Could not finish cancelling send/)).toBeNull();
+  expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Retry send" })).toBeNull();
+  expect(
+    screen.getByRole("list", { name: "Draft attachments" }).textContent,
+  ).toContain("closed-cancel.txt");
+
+  act(() => {
+    disconnected = false;
+    for (const listener of listeners) listener({ type: "connection.restored" });
+  });
+  await waitFor(() =>
+    expect(screen.queryByText("Cancelling upload")).toBeNull(),
+  );
+  expect(backend.cancelUploads).toHaveBeenCalledTimes(2);
+  expect(input().value).toBe("Edited during cancellation");
+  expect(
+    screen.getByRole("list", { name: "Draft attachments" }).textContent,
+  ).toContain("closed-cancel.txt");
+  expect(send).not.toHaveBeenCalled();
 });
 
 it("offers a retry for an upload cleanup timeout on an open connection", async () => {

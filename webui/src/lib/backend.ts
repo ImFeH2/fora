@@ -630,6 +630,10 @@ export class Backend {
     return this.#closed !== null;
   }
 
+  get reconnecting(): boolean {
+    return this.#reconnecting !== null;
+  }
+
   onFailure(listener: (error: BackendError) => void): () => void {
     this.#failures.add(listener);
     if (this.#closed) listener(this.#closed);

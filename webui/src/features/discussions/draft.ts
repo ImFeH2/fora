@@ -115,6 +115,7 @@ export class DraftController {
   #writeNumber = 0;
   #retryCancellationAfterBusy = false;
   #cancellationRecovery: Promise<void> | null = null;
+  #cancellationFeedbackVisible = false;
 
   constructor(
     readonly discussionId: number,
@@ -307,14 +308,15 @@ export class DraftController {
   }
 
   #cancellationFailure(error: unknown): string | null {
-    if (
-      error instanceof BackendError &&
-      error.transport &&
-      (error.code !== "unconfirmed" ||
+    if (error instanceof BackendError && error.transport) {
+      if (backend.disconnected || backend.reconnecting) return null;
+      if (
+        error.code !== "unconfirmed" ||
         error.operation === null ||
-        !CANCELLATION_RETRY_OPERATIONS.has(error.operation))
-    )
-      return null;
+        !CANCELLATION_RETRY_OPERATIONS.has(error.operation)
+      )
+        return null;
+    }
     return `Could not finish cancelling send: ${error instanceof Error ? error.message : String(error)}`;
   }
 
@@ -345,7 +347,10 @@ export class DraftController {
         await this.#cancelled(pending);
       } catch (error) {
         const failure = this.#cancellationFailure(error);
-        if (failure) this.#notify({ error: failure });
+        if (failure) {
+          this.#cancellationFeedbackVisible = true;
+          this.#notify({ error: failure });
+        }
       } finally {
         this.#notify({ busy: false });
       }
@@ -359,6 +364,12 @@ export class DraftController {
       this.#scheduleCancellationRecovery();
     }
   }
+
+  connectionClosed = () => {
+    if (!this.#cancellationFeedbackVisible) return;
+    this.#cancellationFeedbackVisible = false;
+    this.#notify({ error: null });
+  };
 
   connectionRestored = () => this.#completeCancellation();
 
@@ -378,12 +389,14 @@ export class DraftController {
       if (ids.length) await backend.cancelUploads(ids);
     } catch (error) {
       const current = this.#view.draft.pending;
+      const failure = this.#cancellationFailure(error);
+      this.#cancellationFeedbackVisible = Boolean(failure);
       this.#notify({
         draft: {
           ...this.#view.draft,
           pending: current?.id === requested.id ? current : requested,
         },
-        error: this.#cancellationFailure(error),
+        error: failure,
       });
       throw error;
     }
@@ -411,6 +424,7 @@ export class DraftController {
       });
       throw new Error(`Could not finish cancelling send: ${reason}`);
     }
+    this.#cancellationFeedbackVisible = false;
     this.#notify({
       error: null,
       submissionResult: { id: requested.id, state: "cancelled" },
@@ -733,6 +747,10 @@ export function useDraft(discussion: number) {
       });
     };
     const off = backend.onEvent((event) => {
+      if (event.type === "connection.closed") {
+        current?.connectionClosed();
+        return;
+      }
       if (event.type !== "connection.restored") return;
       if (current) {
         void current.connectionRestored();
