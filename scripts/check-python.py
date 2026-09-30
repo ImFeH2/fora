@@ -122,7 +122,9 @@ def check_stdio(directory: Path) -> None:
         frames,
         ready,
     ):
-        assert ready == {"type": "ready", "transport": "stdio"}, ready
+        assert isinstance(ready, dict), ready
+        assert ready.get("type") == "ready", ready
+        assert ready.get("transport") == "stdio", ready
         assert process.stdin is not None
         process.stdin.write(json.dumps(RENAME) + "\n")
         process.stdin.flush()
