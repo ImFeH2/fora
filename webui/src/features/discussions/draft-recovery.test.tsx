@@ -25,6 +25,7 @@ let render: typeof import("@testing-library/react").render;
 let screen: typeof import("@testing-library/react").screen;
 let waitFor: typeof import("@testing-library/react").waitFor;
 let act: typeof import("@testing-library/react").act;
+let fireEvent: typeof import("@testing-library/react").fireEvent;
 let closeDom: () => void;
 let listeners: Set<(event: BackendEvent) => void>;
 
@@ -79,7 +80,7 @@ beforeAll(async () => {
       ) => callback({}),
     },
   });
-  ({ cleanup, render, screen, waitFor, act } = await import(
+  ({ cleanup, render, screen, waitFor, act, fireEvent } = await import(
     "@testing-library/react"
   ));
 }, 30000);
@@ -338,6 +339,80 @@ it("clears a timed-out upload cancellation when the connection closes", async ()
   expect(
     screen.getByRole("list", { name: "Draft attachments" }).textContent,
   ).toContain("cancel-timeout.txt");
+  expect(send).not.toHaveBeenCalled();
+});
+
+it("shows one local save error when cancelling an in-progress upload", async () => {
+  const file = new File(["content"], "local-upload.txt");
+  storage.get.mockResolvedValue({
+    key: "test-organization:1:9:tab-id",
+    updatedAt: 0,
+    body: "Edited during upload",
+    bodyRevision: 1,
+    files: [{ id: "file", clientId: "client", file }],
+    pending: null,
+  });
+  let failSave = false;
+  storage.put.mockImplementation(
+    async (_store: string, draft: { pending: unknown }) => {
+      if (failSave && !draft.pending) {
+        failSave = false;
+        throw new Error("Acceptance local save unavailable");
+      }
+    },
+  );
+  vi.spyOn(backend, "organization").mockResolvedValue(organization());
+  vi.spyOn(backend, "onEvent").mockImplementation((listener) => {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  });
+  vi.spyOn(backend, "createUpload").mockResolvedValue({
+    id: "local-upload-id",
+    state: "reserved",
+    expires_at: Date.now() / 1000 + 3600,
+  });
+  let stopUpload!: () => void;
+  vi.spyOn(backend, "uploadFile").mockImplementation(
+    (_id, _file, signal) =>
+      new Promise((_resolve, reject) => {
+        stopUpload = () => reject(signal.reason);
+      }),
+  );
+  vi.spyOn(backend, "cancelUploads").mockResolvedValue({ cancelled: 1 });
+  const send = vi.fn().mockResolvedValue(true);
+
+  mountComposer(9, send);
+  await waitFor(() => expect(input().value).toBe("Edited during upload"));
+  act(() => screen.getByRole("button", { name: "Send · Enter" }).click());
+  await waitFor(() => expect(stopUpload).toBeTypeOf("function"));
+  fireEvent.change(input(), {
+    target: { value: "Edited during upload again" },
+  });
+  await waitFor(() => expect(input().value).toBe("Edited during upload again"));
+  failSave = true;
+  await act(async () => {
+    screen.getByRole("button", { name: "Cancel upload" }).click();
+    stopUpload();
+  });
+  expect(failSave).toBe(false);
+  expect(screen.getByText("Cancelling upload")).toBeTruthy();
+
+  await waitFor(() =>
+    expect(screen.getByRole("alert").textContent).toBe(
+      "Could not finish cancelling send: Draft not saved: Acceptance local save unavailable",
+    ),
+  );
+  expect(screen.getByText("Cancelling upload")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+
+  act(() => screen.getByRole("button", { name: "Retry" }).click());
+  await waitFor(() =>
+    expect(screen.queryByText("Cancelling upload")).toBeNull(),
+  );
+  expect(input().value).toBe("Edited during upload again");
+  expect(
+    screen.getByRole("list", { name: "Draft attachments" }).textContent,
+  ).toContain("local-upload.txt");
   expect(send).not.toHaveBeenCalled();
 });
 
