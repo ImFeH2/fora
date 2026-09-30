@@ -115,7 +115,8 @@ export class DraftController {
   #writeNumber = 0;
   #retryCancellationAfterBusy = false;
   #cancellationRecovery: Promise<void> | null = null;
-  #cancellationFeedbackVisible = false;
+  #errorVersion = 0;
+  #cancellationTransportFeedback: number | null = null;
 
   constructor(
     readonly discussionId: number,
@@ -139,6 +140,7 @@ export class DraftController {
     };
   };
   #notify(update: Partial<DraftView>) {
+    if ("error" in update) this.#errorVersion += 1;
     this.#view = { ...this.#view, ...update };
     for (const listener of this.#listeners) listener();
   }
@@ -348,8 +350,11 @@ export class DraftController {
       } catch (error) {
         const failure = this.#cancellationFailure(error);
         if (failure) {
-          this.#cancellationFeedbackVisible = true;
           this.#notify({ error: failure });
+          this.#cancellationTransportFeedback =
+            error instanceof BackendError && error.transport
+              ? this.#errorVersion
+              : null;
         }
       } finally {
         this.#notify({ busy: false });
@@ -366,8 +371,8 @@ export class DraftController {
   }
 
   connectionClosed = () => {
-    if (!this.#cancellationFeedbackVisible) return;
-    this.#cancellationFeedbackVisible = false;
+    if (this.#cancellationTransportFeedback !== this.#errorVersion) return;
+    this.#cancellationTransportFeedback = null;
     this.#notify({ error: null });
   };
 
@@ -390,7 +395,6 @@ export class DraftController {
     } catch (error) {
       const current = this.#view.draft.pending;
       const failure = this.#cancellationFailure(error);
-      this.#cancellationFeedbackVisible = Boolean(failure);
       this.#notify({
         draft: {
           ...this.#view.draft,
@@ -398,6 +402,10 @@ export class DraftController {
         },
         error: failure,
       });
+      this.#cancellationTransportFeedback =
+        error instanceof BackendError && error.transport && failure
+          ? this.#errorVersion
+          : null;
       throw error;
     }
     const current = this.#view.draft;
@@ -424,7 +432,7 @@ export class DraftController {
       });
       throw new Error(`Could not finish cancelling send: ${reason}`);
     }
-    this.#cancellationFeedbackVisible = false;
+    this.#cancellationTransportFeedback = null;
     this.#notify({
       error: null,
       submissionResult: { id: requested.id, state: "cancelled" },

@@ -340,6 +340,132 @@ it("keeps connection feedback global when cancellation fails after closure", asy
   expect(send).not.toHaveBeenCalled();
 });
 
+it("keeps a local cancellation save failure after connection closure", async () => {
+  const file = new File(["content"], "local-cancel.txt");
+  const upload = {
+    id: "local-upload",
+    state: "receiving" as const,
+    expires_at: Date.now() / 1000 + 60,
+  };
+  storage.get.mockResolvedValue({
+    key: "test-organization:1:6:tab-id",
+    updatedAt: 0,
+    body: "Local draft",
+    bodyRevision: 1,
+    files: [{ id: "file", clientId: "client", file, upload }],
+    pending: {
+      id: "local-attempt",
+      body: "Local draft",
+      bodyRevision: 1,
+      files: [{ id: "file", clientId: "client", file, upload }],
+      phase: "uploading",
+      cancelRequested: true,
+    },
+  });
+  storage.put
+    .mockResolvedValueOnce(undefined)
+    .mockRejectedValueOnce(new Error("Local storage unavailable"));
+  vi.spyOn(backend, "organization").mockResolvedValue(organization());
+  vi.spyOn(backend, "onEvent").mockImplementation((listener) => {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  });
+  vi.spyOn(backend, "cancelUploads").mockResolvedValue({ cancelled: 1 });
+  const send = vi.fn().mockResolvedValue(true);
+
+  mountComposer(6, send);
+  await waitFor(() =>
+    expect(screen.getByRole("alert").textContent).toContain(
+      "Local storage unavailable",
+    ),
+  );
+  expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+
+  act(() => {
+    for (const listener of listeners)
+      listener({
+        type: "connection.closed",
+        error: new BackendError("disconnected", "Connection lost", true),
+      });
+  });
+
+  expect(screen.getByRole("alert").textContent).toContain(
+    "Local storage unavailable",
+  );
+  expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+  expect(input().value).toBe("Local draft");
+  expect(send).not.toHaveBeenCalled();
+});
+
+it("keeps a file validation error after replacing cancellation feedback", async () => {
+  const file = new File(["content"], "replace-cancel.txt");
+  const upload = {
+    id: "replace-upload",
+    state: "receiving" as const,
+    expires_at: Date.now() / 1000 + 60,
+  };
+  storage.get.mockResolvedValue({
+    key: "test-organization:1:7:tab-id",
+    updatedAt: 0,
+    body: "Edited message",
+    bodyRevision: 1,
+    files: [{ id: "file", clientId: "client", file, upload }],
+    pending: {
+      id: "replace-attempt",
+      body: "Original message",
+      bodyRevision: 0,
+      files: [{ id: "file", clientId: "client", file, upload }],
+      phase: "uploading",
+      cancelRequested: true,
+    },
+  });
+  vi.spyOn(backend, "organization").mockResolvedValue(organization());
+  vi.spyOn(backend, "disconnected", "get").mockReturnValue(false);
+  vi.spyOn(backend, "reconnecting", "get").mockReturnValue(false);
+  vi.spyOn(backend, "onEvent").mockImplementation((listener) => {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  });
+  vi.spyOn(backend, "cancelUploads").mockRejectedValue(
+    new BackendError(
+      "unconfirmed",
+      "Upload cancellation result unknown",
+      true,
+      "upload.cancel",
+    ),
+  );
+
+  mountComposer(7, vi.fn());
+  await waitFor(() =>
+    expect(screen.getByRole("alert").textContent).toContain(
+      "Upload cancellation result unknown",
+    ),
+  );
+  const fileInput = screen.getByLabelText(
+    "Choose attachments",
+  ) as HTMLInputElement;
+  Object.defineProperty(fileInput, "files", {
+    configurable: true,
+    value: [new File(["content"], "bad/name.txt")],
+  });
+  await act(async () => {
+    fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  expect(screen.getByRole("alert").textContent).toContain("Choose a filename");
+
+  act(() => {
+    for (const listener of listeners)
+      listener({
+        type: "connection.closed",
+        error: new BackendError("disconnected", "Connection lost", true),
+      });
+  });
+
+  expect(screen.getByRole("alert").textContent).toContain("Choose a filename");
+  expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+  expect(input().value).toBe("Edited message");
+});
+
 it("offers a retry for an upload cleanup timeout on an open connection", async () => {
   const file = new File(["content"], "retry-cancel.txt");
   const upload = {
