@@ -189,6 +189,42 @@ function history(ordinal = 1): AgentHistoryRead {
   };
 }
 
+function paginatedHistory(
+  windowCount: number,
+  requestCount: number,
+  windowsAfter = 0,
+  requestAfter = 0,
+): AgentHistoryRead {
+  const value = history(2);
+  value.run.request_count = requestCount;
+  value.windows = Array.from(
+    { length: Math.min(30, windowCount - windowsAfter) },
+    (_, index) => ({
+      number: windowsAfter + index + 1,
+      since_sequence: windowsAfter + index + 1,
+      reset_at: null,
+      reason: null,
+    }),
+  );
+  value.windows_has_more = windowsAfter + value.windows.length < windowCount;
+  value.windows_next_after = value.windows_has_more
+    ? (value.windows[value.windows.length - 1]?.number ?? null)
+    : null;
+  value.requests = Array.from(
+    { length: Math.min(30, requestCount - requestAfter) },
+    (_, index) => summary(requestAfter + index + 1),
+  );
+  value.requests_has_more = requestAfter + value.requests.length < requestCount;
+  value.requests_next_after = value.requests_has_more
+    ? (value.requests[value.requests.length - 1]?.ordinal ?? null)
+    : null;
+  if (!value.request) throw new Error("Missing request");
+  value.request.input = messages(["input-2"], 2);
+  value.request.response = messages(["response-2"], 2);
+  value.request.related = messages(["related-2"], 2);
+  return value;
+}
+
 let testing: typeof import("@testing-library/react");
 let userEvent: typeof import("@testing-library/user-event").default;
 let useApplication: typeof import("@/App").useApplication;
@@ -476,6 +512,210 @@ describe("History connection recovery", () => {
     expect(testing.screen.getByText("input-1")).toBeTruthy();
     expect(sockets).toHaveLength(1);
   });
+
+  it("retries an initial read failure and opens the saved request", async () => {
+    await openHistory();
+    await testing.act(async () =>
+      sockets[0].reply({
+        type: "response",
+        id: sockets[0].latest("agent.history.read").id,
+        error: { code: "invalid_history", message: "History data unavailable" },
+      }),
+    );
+    await testing.act(async () =>
+      testing.fireEvent.click(
+        testing.screen.getByRole("button", { name: "Retry" }),
+      ),
+    );
+    await respondHistory(history(2));
+    expect(testing.screen.getByText("input-2")).toBeTruthy();
+    expect(
+      testing.screen
+        .getByRole("tab", { name: /Request 2/ })
+        .getAttribute("aria-selected"),
+    ).toBe("true");
+    expect(testing.screen.queryByText("History data unavailable")).toBeNull();
+  });
+
+  it.each([
+    { recovery: "Retry", windowCount: 34, requestCount: 35 },
+    { recovery: "Retry", windowCount: 64, requestCount: 65 },
+    { recovery: "Reconnect", windowCount: 34, requestCount: 35 },
+    { recovery: "Reconnect", windowCount: 64, requestCount: 65 },
+  ])(
+    "preserves pagination and content after $recovery with $windowCount windows and $requestCount requests",
+    async ({ recovery, windowCount, requestCount }) => {
+      const dialog = await openHistory();
+      await respondHistory(paginatedHistory(windowCount, requestCount));
+      await testing.act(async () =>
+        testing.fireEvent.click(
+          testing.screen.getByRole("button", { name: "Load more windows" }),
+        ),
+      );
+      await respondHistory(paginatedHistory(windowCount, requestCount, 30));
+      await testing.act(async () =>
+        testing.fireEvent.click(
+          testing.screen.getByRole("button", { name: "Load more requests" }),
+        ),
+      );
+      await respondHistory(paginatedHistory(windowCount, requestCount, 0, 30));
+      const savedPanel = testing.screen
+        .getByText("Saved Turn messages")
+        .closest("section");
+      if (!savedPanel) throw new Error("Missing saved messages");
+      await testing.act(async () =>
+        testing.fireEvent.click(
+          testing.within(savedPanel).getByRole("button", {
+            name: "Load more messages",
+          }),
+        ),
+      );
+      const moreSaved = paginatedHistory(windowCount, requestCount);
+      moreSaved.messages = {
+        ...messages(["saved-tail"], 2),
+        offset: 1,
+        has_more: false,
+      };
+      await respondHistory(moreSaved);
+      for (const [title, source] of [
+        ["Model input", "input"],
+        ["Model response", "response"],
+        ["Associated tool results", "related"],
+      ] as const) {
+        const panel = testing.screen.getByText(title).closest("section");
+        if (!panel) throw new Error(`Missing ${title}`);
+        await testing.act(async () =>
+          testing.fireEvent.click(
+            testing.within(panel).getByRole("button", {
+              name: "Load more messages",
+            }),
+          ),
+        );
+        const more = paginatedHistory(windowCount, requestCount);
+        if (!more.request) throw new Error("Missing request");
+        more.request[source] = {
+          ...messages([`${source}-2-tail`], 2),
+          offset: 1,
+          has_more: false,
+        };
+        await respondHistory(more);
+      }
+      const scroll = dialog.querySelector('[class~="overflow-y-auto"]');
+      if (!scroll) throw new Error("Missing scroll region");
+      scroll.scrollTop = 300;
+      let delayed: Sent | undefined;
+      if (recovery === "Retry") {
+        vi.useFakeTimers();
+        await testing.act(async () =>
+          testing.fireEvent.click(
+            testing.screen.getByRole("tab", { name: /^Request 2pending$/ }),
+          ),
+        );
+        await testing.act(async () => vi.advanceTimersByTimeAsync(0));
+        delayed = sockets[0].latest("agent.history.read");
+        await testing.act(async () => vi.advanceTimersByTimeAsync(60_000));
+        expect(connection.disconnected).toBe(false);
+        expect(
+          testing.screen.getAllByText("Request timed out. Try reading again."),
+        ).toHaveLength(1);
+        await testing.act(async () =>
+          testing.fireEvent.click(
+            testing.screen.getByRole("button", { name: "Retry" }),
+          ),
+        );
+        await testing.act(async () => vi.advanceTimersByTimeAsync(0));
+      } else {
+        await disconnect();
+        await reconnect();
+      }
+      const socket = sockets[sockets.length - 1];
+      if (!socket) throw new Error("Missing socket");
+      expect(socket.latest("agent.history.read").params.ordinal).toBe(2);
+      await respondHistory(paginatedHistory(windowCount, requestCount));
+      expect(scroll.scrollTop).toBe(300);
+      expect(testing.screen.getByText("saved-tail")).toBeTruthy();
+      const windowPanel = testing.screen
+        .getByText("Context windows")
+        .closest("section");
+      if (!windowPanel) throw new Error("Missing window events");
+      expect(testing.within(windowPanel).getAllByRole("listitem")).toHaveLength(
+        Math.min(60, windowCount),
+      );
+      expect(testing.screen.getAllByRole("tab")).toHaveLength(
+        Math.min(60, requestCount),
+      );
+      for (const source of ["input", "response", "related"])
+        expect(testing.screen.getByText(`${source}-2-tail`)).toBeTruthy();
+      expect(
+        testing.screen
+          .getByRole("tab", { name: /^Request 2pending$/ })
+          .getAttribute("aria-selected"),
+      ).toBe("true");
+      expect(
+        testing.screen.getByText(`Window ${Math.min(60, windowCount)}`),
+      ).toBeTruthy();
+      expect(
+        testing.screen.getByRole("tab", {
+          name: `Request ${Math.min(60, requestCount)}pending`,
+        }),
+      ).toBeTruthy();
+      if (delayed) {
+        await testing.act(async () =>
+          socket.reply({
+            type: "response",
+            id: delayed.id,
+            result: history(1),
+          }),
+        );
+        expect(testing.screen.getByText("input-2-tail")).toBeTruthy();
+        expect(
+          testing.screen
+            .getByRole("tab", { name: /^Request 2pending$/ })
+            .getAttribute("aria-selected"),
+        ).toBe("true");
+      }
+      if (windowCount > 60) {
+        await testing.act(async () =>
+          testing.fireEvent.click(
+            testing.screen.getByRole("button", { name: "Load more windows" }),
+          ),
+        );
+        await testing.act(async () => Promise.resolve());
+        expect(socket.latest("agent.history.read").params.windows_after).toBe(
+          60,
+        );
+        await respondHistory(paginatedHistory(windowCount, requestCount, 60));
+        expect(testing.screen.getByText(`Window ${windowCount}`)).toBeTruthy();
+        await testing.act(async () =>
+          testing.fireEvent.click(
+            testing.screen.getByRole("button", { name: "Load more requests" }),
+          ),
+        );
+        await testing.act(async () => Promise.resolve());
+        expect(socket.latest("agent.history.read").params.request_after).toBe(
+          60,
+        );
+        await respondHistory(
+          paginatedHistory(windowCount, requestCount, 0, 60),
+        );
+        expect(
+          testing.screen.getByRole("tab", {
+            name: `Request ${requestCount}pending`,
+          }),
+        ).toBeTruthy();
+      }
+      expect(
+        testing.screen.queryByRole("button", { name: "Load more windows" }),
+      ).toBeNull();
+      expect(
+        testing.screen.queryByRole("button", { name: "Load more requests" }),
+      ).toBeNull();
+      expect(testing.screen.getByText("input-2-tail")).toBeTruthy();
+      expect(
+        testing.screen.queryByText("Request timed out. Try reading again."),
+      ).toBeNull();
+    },
+  );
 
   it("resumes interrupted long text and image reads without repeating the text prefix", async () => {
     await openHistory();

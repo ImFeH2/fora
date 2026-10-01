@@ -601,7 +601,6 @@ function TurnHistoryModal({
         offset?: number;
         requestAfter?: number;
         windowsAfter?: number;
-        refresh?: boolean;
       } = {},
     ) => {
       const generation = ++loadGeneration.current;
@@ -627,60 +626,54 @@ function TurnHistoryModal({
         }
         setRead((current) => {
           if (!current) return result;
+          const requests = mergeHistoryRequests(
+            current.requests,
+            result.requests,
+          );
+          const windows = mergeHistoryWindows(current.windows, result.windows);
+          const requestsHasMore = requests.length < result.run.request_count;
+          const windowsHasMore =
+            target === "windows" ||
+            result.windows.length >= current.windows.length
+              ? result.windows_has_more
+              : current.windows_has_more;
+          const request = result.request;
+          const previous = current.request;
           const merged = {
             ...result,
-            requests: mergeHistoryRequests(current.requests, result.requests),
-            windows: mergeHistoryWindows(current.windows, result.windows),
+            messages: mergeHistoryMessages(current.messages, result.messages),
+            request:
+              request &&
+              previous &&
+              request.summary.ordinal === previous.summary.ordinal
+                ? {
+                    ...request,
+                    input: mergeHistoryMessages(previous.input, request.input),
+                    related: mergeHistoryMessages(
+                      previous.related,
+                      request.related,
+                    ),
+                    response:
+                      previous.response && request.response
+                        ? mergeHistoryMessages(
+                            previous.response,
+                            request.response,
+                          )
+                        : request.response,
+                  }
+                : request,
+            requests,
+            requests_has_more: requestsHasMore,
+            requests_next_after: requestsHasMore
+              ? (requests[requests.length - 1]?.ordinal ?? null)
+              : null,
+            windows,
+            windows_has_more: windowsHasMore,
+            windows_next_after: windowsHasMore
+              ? (windows[windows.length - 1]?.number ?? null)
+              : null,
           };
-          if (!target) {
-            if (!options.refresh)
-              return {
-                ...merged,
-                messages: mergeHistoryMessages(
-                  current.messages,
-                  result.messages,
-                ),
-              };
-            const request = result.request;
-            const previous = current.request;
-            return {
-              ...merged,
-              requests_has_more:
-                merged.requests.length < result.run.request_count,
-              requests_next_after:
-                merged.requests[merged.requests.length - 1]?.ordinal ?? null,
-              windows_has_more:
-                current.windows.length > result.windows.length
-                  ? current.windows_has_more
-                  : result.windows_has_more,
-              windows_next_after:
-                merged.windows[merged.windows.length - 1]?.number ?? null,
-              messages: mergeHistoryMessages(current.messages, result.messages),
-              request:
-                request &&
-                previous &&
-                request.summary.ordinal === previous.summary.ordinal
-                  ? {
-                      ...request,
-                      input: mergeHistoryMessages(
-                        previous.input,
-                        request.input,
-                      ),
-                      related: mergeHistoryMessages(
-                        previous.related,
-                        request.related,
-                      ),
-                      response:
-                        previous.response && request.response
-                          ? mergeHistoryMessages(
-                              previous.response,
-                              request.response,
-                            )
-                          : request.response,
-                    }
-                  : request,
-            };
-          }
+          if (!target) return merged;
           if (target === "requests" || target === "windows") {
             return {
               ...merged,
@@ -700,11 +693,12 @@ function TurnHistoryModal({
               },
             };
           }
-          if (!current.request || !result.request) return merged;
+          if (!current.request || !result.request || !merged.request)
+            return merged;
           return {
             ...merged,
             request: {
-              ...result.request,
+              ...merged.request,
               input:
                 target === "input"
                   ? {
@@ -715,7 +709,7 @@ function TurnHistoryModal({
                         ...result.request.input.messages,
                       ],
                     }
-                  : result.request.input,
+                  : merged.request.input,
               response:
                 target === "response" &&
                 current.request.response &&
@@ -728,7 +722,7 @@ function TurnHistoryModal({
                         ...result.request.response.messages,
                       ],
                     }
-                  : result.request.response,
+                  : merged.request.response,
               related:
                 target === "related"
                   ? {
@@ -739,7 +733,7 @@ function TurnHistoryModal({
                         ...result.request.related.messages,
                       ],
                     }
-                  : result.request.related,
+                  : merged.request.related,
             },
           };
         });
@@ -779,7 +773,7 @@ function TurnHistoryModal({
           event.agent_id === agentId &&
           event.sequence === sequence)
       )
-        void load(ordinal, { refresh: true });
+        void load(ordinal);
     });
   }, [agentId, load, open, ordinal, sequence]);
 
