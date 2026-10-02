@@ -1,35 +1,35 @@
 [importlinter]
-root_package = huddol
+root_package = fora
 include_external_packages = true
 
 [importlinter:contract:layers]
 name = Layers run one way only
 type = layers
 layers =
-    huddol.adapters
-    huddol.runtime
-    huddol.tools
-    huddol.services
-    huddol.ports
-    huddol.core
+    fora.adapters
+    fora.runtime
+    fora.tools
+    fora.services
+    fora.ports
+    fora.core
 
 [importlinter:contract:services]
 name = Services do not know about each other
 type = independence
 modules =
-    huddol.services.workspace
-    huddol.services.library
-    huddol.services.history
+    fora.services.workspace
+    fora.services.library
+    fora.services.history
 
 [importlinter:contract:model-runtime]
 name = Only adapters know the model runtime
 type = forbidden
 source_modules =
-    huddol.core
-    huddol.ports
-    huddol.services
-    huddol.tools
-    huddol.runtime
+    fora.core
+    fora.ports
+    fora.services
+    fora.tools
+    fora.runtime
 forbidden_modules =
     pydantic_ai
 
@@ -37,10 +37,10 @@ forbidden_modules =
 name = Only adapters touch storage and the network
 type = forbidden
 source_modules =
-    huddol.core
-    huddol.services
-    huddol.tools
-    huddol.runtime
+    fora.core
+    fora.services
+    fora.tools
+    fora.runtime
 forbidden_modules =
     sqlite3
     httpx
@@ -50,10 +50,10 @@ forbidden_modules =
 name = Core is self contained
 type = forbidden
 source_modules =
-    huddol.core
+    fora.core
 forbidden_modules =
-    huddol.ports
-    huddol.services
-    huddol.tools
-    huddol.runtime
-    huddol.adapters
+    fora.ports
+    fora.services
+    fora.tools
+    fora.runtime
+    fora.adapters

@@ -12,9 +12,9 @@ from pathlib import Path
 import psutil
 import pytest
 
-from huddol.adapters.execution import platforms
-from huddol.adapters.execution.local import LocalExecution
-from huddol.core.errors import DomainError
+from fora.adapters.execution import platforms
+from fora.adapters.execution.local import LocalExecution
+from fora.core.errors import DomainError
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows execution")
 
@@ -139,7 +139,7 @@ def test_close_during_helper_startup(tmp_path, monkeypatch, joined):
     executed = tmp_path / "executed"
     source = (
         "import sys,time; from pathlib import Path; "
-        "from huddol.adapters.windows import join_job; "
+        "from fora.adapters.windows import join_job; "
         + ("join_job(sys.argv[2]); " if joined else "")
         + f"Path({str(marker)!r}).write_text('ready'); time.sleep(30)"
     )
@@ -171,7 +171,7 @@ def test_join_failure_never_runs_command(tmp_path):
         [
             *platforms.entrypoint(),
             "--windows-execution",
-            "Local\\Huddol-missing-job",
+            "Local\\Fora-missing-job",
             "-",
             "--",
             sys.executable,
@@ -215,15 +215,15 @@ def test_invalid_helper_entry_releases_job(tmp_path, monkeypatch, value):
 
 @pytest.mark.parametrize("enforce", [False, True])
 def test_helper_interpreter_identity_and_environment(tmp_path, monkeypatch, enforce):
-    import huddol
+    import fora
 
     original_environment = dict(os.environ)
     source = (
-        "import json,sys,huddol; "
-        "from huddol.adapters.execution.platforms import dispatch_helper; "
+        "import json,sys,fora; "
+        "from fora.adapters.execution.platforms import dispatch_helper; "
         "print(json.dumps({'executable':sys.executable,"
         "'base_executable':sys._base_executable,'prefix':sys.prefix,"
-        "'base_prefix':sys.base_prefix,'module':huddol.__file__,"
+        "'base_prefix':sys.base_prefix,'module':fora.__file__,"
         "'isolated':sys.flags.isolated}),flush=True); "
         "sys.exit(dispatch_helper(sys.argv[1:]))"
     )
@@ -247,7 +247,7 @@ def test_helper_interpreter_identity_and_environment(tmp_path, monkeypatch, enfo
             "base_executable": sys._base_executable,
             "prefix": sys.prefix,
             "base_prefix": sys.base_prefix,
-            "module": huddol.__file__,
+            "module": fora.__file__,
             "isolated": 1,
         }
         assert inherited == "False"
@@ -257,11 +257,11 @@ def test_helper_interpreter_identity_and_environment(tmp_path, monkeypatch, enfo
 
 
 def test_nested_job_inheritance(tmp_path):
-    from huddol.adapters.windows import WindowsJob
+    from fora.adapters.windows import WindowsJob
 
     outer = WindowsJob()
     source = (
-        "from huddol.adapters.execution.local import LocalExecution; "
+        "from fora.adapters.execution.local import LocalExecution; "
         "import sys; "
         "environment=LocalExecution(enforce=False); "
         f"result=environment.run([sys.executable,'-c','print(42)'],cwd={str(tmp_path)!r}); "
@@ -619,8 +619,8 @@ def test_all_records_receive_cleanup_with_one_environment_deadline(
 def test_scheduler_stop_closes_real_execution_manager(tmp_path):
     from unittest.mock import Mock
 
-    from huddol.adapters.execution.manager import ExecutionManager
-    from huddol.runtime.scheduler import Scheduler
+    from fora.adapters.execution.manager import ExecutionManager
+    from fora.runtime.scheduler import Scheduler
 
     manager = ExecutionManager(
         settings={"write_directories": [str(tmp_path)]}, enforce=True
@@ -683,7 +683,7 @@ def test_timeout_and_close_share_one_cleanup_attempt(tmp_path, monkeypatch):
 def test_partial_access_creation_and_revoke_failure_keep_remaining_ownership(
     tmp_path, monkeypatch
 ):
-    from huddol.adapters.sandbox import windows
+    from fora.adapters.sandbox import windows
 
     environment = LocalExecution([str(tmp_path)], enforce=True)
     original = windows._change_ace

@@ -2,8 +2,8 @@ from dataclasses import asdict, fields
 
 import pytest
 
-from huddol.core.errors import DomainError
-from huddol.core.parameters import (
+from fora.core.errors import DomainError
+from fora.core.parameters import (
     AgentParameters,
     agent_parameters,
     validate_parameters,

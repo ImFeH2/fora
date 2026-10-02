@@ -132,7 +132,7 @@ export class VoiceRecording {
   }
 
   async #capture(context: AudioContext, stream: MediaStream): Promise<void> {
-    const processor = new AudioWorkletNode(context, "huddol-voice", {
+    const processor = new AudioWorkletNode(context, "fora-voice", {
       numberOfInputs: 1,
       numberOfOutputs: 1,
       outputChannelCount: [1],

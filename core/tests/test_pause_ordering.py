@@ -5,8 +5,8 @@ from test_runtime import HELPER, HUMAN, MAIN, RecordingRunner, mention
 
 pytest_plugins = ("test_runtime",)
 
-from huddol.runtime.reminder import TurnOutcome
-from huddol.runtime.scheduler import Scheduler
+from fora.runtime.reminder import TurnOutcome
+from fora.runtime.scheduler import Scheduler
 
 
 def test_pause_committed_before_start_preserves_pending(world):
@@ -35,7 +35,7 @@ def test_pause_after_commit_before_thread_execution(world, monkeypatch, resume, 
     original_start = threading.Thread.start
 
     def controlled_start(thread):
-        if thread.name == f"huddol-agent-{MAIN}":
+        if thread.name == f"fora-agent-{MAIN}":
             entered.set()
             assert release.wait(10)
         original_start(thread)

@@ -50,7 +50,7 @@ pub fn run() {
             app.manage(Kernel(Mutex::new(child)));
             WebviewWindowBuilder::new(app, "main", WebviewUrl::App(url.into()))
                 .disable_drag_drop_handler()
-                .title("Huddol")
+                .title("Fora")
                 .build()?;
             Ok(())
         })
@@ -82,7 +82,7 @@ mod tests {
                 "repo/core",
                 "python",
                 "-m",
-                "huddol",
+                "fora",
                 "--webui-dir"
             ]
         );
@@ -96,9 +96,9 @@ mod tests {
     fn bundled_launcher_runs_the_packaged_kernel() {
         let launcher = launcher(false, Path::new("repo/core"), Path::new("resources"));
         let expected = if cfg!(windows) {
-            "core/huddol.exe"
+            "core/fora.exe"
         } else {
-            "core/huddol"
+            "core/fora"
         };
         assert_eq!(launcher.program, Path::new("resources").join(expected));
         assert!(launcher.args.is_empty());
@@ -108,7 +108,7 @@ mod tests {
     fn every_launcher_lets_the_system_pick_the_port() {
         for development in [true, false] {
             let launcher = launcher(development, Path::new("repo/core"), Path::new("resources"));
-            assert_eq!(launcher.env, [("HUDDOL_PORT".to_string(), "0".to_string())]);
+            assert_eq!(launcher.env, [("FORA_PORT".to_string(), "0".to_string())]);
         }
     }
 
@@ -167,10 +167,8 @@ mod tests {
     #[test]
     fn builds_an_encoded_error_url_on_failure() {
         assert_eq!(
-            window_url(Err(
-                "Failed to start Huddol: No such file (os error 2) &x=1"
-            )),
-            "index.html?error=Failed%20to%20start%20Huddol%3A%20No%20such%20file%20%28os%20error%202%29%20%26x%3D1"
+            window_url(Err("Failed to start Fora: No such file (os error 2) &x=1")),
+            "index.html?error=Failed%20to%20start%20Fora%3A%20No%20such%20file%20%28os%20error%202%29%20%26x%3D1"
         );
     }
 

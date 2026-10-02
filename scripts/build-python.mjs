@@ -4,7 +4,7 @@ import { root, run } from "./process.mjs";
 
 const packages = resolve(root, "dist", "python");
 const frontend = resolve(root, "webui", "dist");
-const static_ = resolve(root, "web", "huddol_web", "static");
+const static_ = resolve(root, "web", "fora_web", "static");
 
 run("pnpm", ["build:webui"]);
 

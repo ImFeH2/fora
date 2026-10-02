@@ -59,7 +59,7 @@ export function SidebarBrand() {
   return (
     <div className="flex items-center gap-3 pt-4 px-4 pb-3 min-w-0">
       <img src={brandIcon} alt="" className="size-7 flex-none" />
-      <span className="text-sm font-semibold truncate">Huddol</span>
+      <span className="text-sm font-semibold truncate">Fora</span>
     </div>
   );
 }

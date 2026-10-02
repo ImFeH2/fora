@@ -23,6 +23,6 @@ run("uv", [
   ...wheels,
 ]);
 run(
-  resolve(environment, scripts, `huddol-web${extension}`),
+  resolve(environment, scripts, `fora-web${extension}`),
   process.argv.slice(2),
 );

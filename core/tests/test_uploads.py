@@ -31,14 +31,14 @@ from pydantic_ai.messages import (
 )
 from websockets.sync.client import connect
 
-from huddol.adapters.files.uploads import DirectoryUploads, decode_image
-from huddol.adapters.jsonl.protocol import Dispatcher
-from huddol.adapters.model.runner import attachment_result
-from huddol.adapters.sqlite.agent import SqliteAgentStore
-from huddol.adapters.sqlite.store import SqliteStore
-from huddol.adapters.websocket.server import ControlOutbox, WebServer, resource
-from huddol.core.errors import DomainError
-from huddol.services.uploads import Uploads
+from fora.adapters.files.uploads import DirectoryUploads, decode_image
+from fora.adapters.jsonl.protocol import Dispatcher
+from fora.adapters.model.runner import attachment_result
+from fora.adapters.sqlite.agent import SqliteAgentStore
+from fora.adapters.sqlite.store import SqliteStore
+from fora.adapters.websocket.server import ControlOutbox, WebServer, resource
+from fora.core.errors import DomainError
+from fora.services.uploads import Uploads
 
 
 @pytest.mark.parametrize(
@@ -47,7 +47,7 @@ from huddol.services.uploads import Uploads
 def test_control_outbox_close_ownership(phase: str, monkeypatch) -> None:
     import weakref
 
-    from huddol.adapters.websocket import server
+    from fora.adapters.websocket import server
 
     entered = threading.Event()
     proceed = threading.Event()
@@ -119,7 +119,7 @@ def test_control_slow_connection_isolated(monkeypatch) -> None:
 
     from aiohttp import ClientSession, WSMsgType
 
-    from huddol.adapters.websocket import server as module
+    from fora.adapters.websocket import server as module
 
     references = []
     original = module.OutgoingFrame
@@ -253,7 +253,7 @@ def test_control_owner_cancellation(mode: str, monkeypatch) -> None:
 
     from aiohttp import ClientSession
 
-    from huddol.adapters.websocket import server as module
+    from fora.adapters.websocket import server as module
 
     started = threading.Event()
     sending = threading.Event()
@@ -404,7 +404,7 @@ def test_control_request_completion_sequence() -> None:
 
 
 def test_control_outbox_encoding_failure(monkeypatch) -> None:
-    from huddol.adapters.websocket import server
+    from fora.adapters.websocket import server
 
     def fail(payload):
         raise ValueError("encoding probe")
@@ -841,7 +841,7 @@ def test_http_websocket_diagnosis() -> None:
             ):
                 response = client.get(url, headers={"Origin": origin})
                 assert response.status_code == 401
-                assert "Access to Huddol requires authentication" in response.text
+                assert "Access to Fora requires authentication" in response.text
                 assert response.headers["Content-Type"] == "text/html; charset=utf-8"
                 assert response.headers["Cache-Control"] == "no-store"
                 assert response.headers["Access-Control-Allow-Origin"] == origin
@@ -1196,7 +1196,7 @@ def test_process_shutdown_releases_incomplete_upload(
                 assert time.monotonic() < deadline
                 time.sleep(0.01)
             if invalid_settings:
-                database = sqlite3.connect(data_directory / "huddol.sqlite3")
+                database = sqlite3.connect(data_directory / "fora.sqlite3")
                 try:
                     with database:
                         database.execute(
@@ -1205,7 +1205,7 @@ def test_process_shutdown_releases_incomplete_upload(
                             "DO UPDATE SET values_json = excluded.values_json",
                             ('{"token_limit":-1}',),
                         )
-                    log_path = data_directory / "logs" / "huddol.log"
+                    log_path = data_directory / "logs" / "fora.log"
                     deadline = time.monotonic() + 10
                     while (
                         "Scheduler stopped after a runtime failure"
@@ -1240,7 +1240,7 @@ def test_process_shutdown_releases_incomplete_upload(
             connection.close()
     assert not (data_directory / "uploads" / f"{upload['id']}.part").exists()
     if invalid_settings:
-        database = sqlite3.connect(data_directory / "huddol.sqlite3")
+        database = sqlite3.connect(data_directory / "fora.sqlite3")
         try:
             with database:
                 database.execute("DELETE FROM settings WHERE section = 'agent'")
@@ -1269,7 +1269,7 @@ def test_process_reports_port_binding_failure(tmp_path: Path) -> None:
         environment = {
             "PATH": os.environ["PATH"],
             "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
-            "HUDDOL_DATA_DIR": str(tmp_path / "organization"),
+            "FORA_DATA_DIR": str(tmp_path / "organization"),
             "TMPDIR": str(tmp_path),
             "TEMP": str(tmp_path),
             "TMP": str(tmp_path),
@@ -1278,7 +1278,7 @@ def test_process_reports_port_binding_failure(tmp_path: Path) -> None:
             if name in os.environ:
                 environment[name] = os.environ[name]
         result = subprocess.run(
-            [sys.executable, "-m", "huddol", "--port", str(occupied.getsockname()[1])],
+            [sys.executable, "-m", "fora", "--port", str(occupied.getsockname()[1])],
             env=environment,
             capture_output=True,
             timeout=30,

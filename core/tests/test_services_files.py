@@ -4,10 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from huddol.adapters.files.tree import DirectoryTree, content_hash
-from huddol.core.errors import DomainError
-from huddol.services.library import Library
-from huddol.services.workspace import Workspace
+from fora.adapters.files.tree import DirectoryTree, content_hash
+from fora.core.errors import DomainError
+from fora.services.library import Library
+from fora.services.workspace import Workspace
 
 
 @pytest.fixture

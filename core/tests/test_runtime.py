@@ -7,14 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from huddol.adapters.execution.manager import ExecutionManager
-from huddol.adapters.files.tree import DirectoryTree
-from huddol.adapters.files.uploads import decode_image
-from huddol.adapters.sqlite.agent import SqliteAgentStore
-from huddol.adapters.sqlite.store import SqliteStore
-from huddol.core.errors import DomainError
-from huddol.ports.agent import WindowState
-from huddol.runtime.reminder import (
+from fora.adapters.execution.manager import ExecutionManager
+from fora.adapters.files.tree import DirectoryTree
+from fora.adapters.files.uploads import decode_image
+from fora.adapters.sqlite.agent import SqliteAgentStore
+from fora.adapters.sqlite.store import SqliteStore
+from fora.core.errors import DomainError
+from fora.ports.agent import WindowState
+from fora.runtime.reminder import (
     PREPARATION_PROMPT,
     TurnOutcome,
     TurnRequest,
@@ -22,8 +22,8 @@ from huddol.runtime.reminder import (
     render_resident,
     reset_notice,
 )
-from huddol.runtime.scheduler import Scheduler
-from huddol.tools import AgentTools, Dependencies
+from fora.runtime.scheduler import Scheduler
+from fora.tools import AgentTools, Dependencies
 
 HUMAN = 1
 MAIN = 2
@@ -50,7 +50,7 @@ class RecordingRunner:
 
 @pytest.fixture
 def world(tmp_path: Path):
-    store = SqliteStore(tmp_path / "huddol.sqlite3")
+    store = SqliteStore(tmp_path / "fora.sqlite3")
     agent_store = SqliteAgentStore(store._db)
     store.create_member("human", "You")
     store.create_member("agent", "Main")
@@ -136,11 +136,11 @@ def test_model_discussion_list_defaults_to_twenty(world, monkeypatch) -> None:
     )
     from pydantic_ai.models.function import FunctionModel
 
-    from huddol.adapters.model.runner import PydanticModelRunner
+    from fora.adapters.model.runner import PydanticModelRunner
 
     for day in range(1, 26):
         monkeypatch.setattr(
-            "huddol.adapters.sqlite.store.now",
+            "fora.adapters.sqlite.store.now",
             lambda day=day: f"2026-01-{day:02}T00:00:00Z",
         )
         mention(world)
@@ -197,7 +197,7 @@ def test_model_can_manage_discussions_and_page_messages(world, monkeypatch) -> N
     )
     from pydantic_ai.models.function import FunctionModel
 
-    from huddol.adapters.model.runner import PydanticModelRunner
+    from fora.adapters.model.runner import PydanticModelRunner
 
     room = mention(world, "@Main review this")
     world.store.append_message(room, HUMAN, "needle")
@@ -321,7 +321,7 @@ def test_lowering_the_window_budget_schedules_preparation(world, monkeypatch) ->
     from pydantic_ai.models.function import FunctionModel
     from pydantic_ai.usage import RequestUsage
 
-    from huddol.adapters.model.runner import PydanticModelRunner
+    from fora.adapters.model.runner import PydanticModelRunner
 
     mention(world)
     world.settings.set_settings(
@@ -353,7 +353,7 @@ def test_lowering_the_window_budget_schedules_preparation(world, monkeypatch) ->
     saved = ModelMessagesTypeAdapter.validate_json(world.history.latest_messages(MAIN))
     assert len(saved) == 3
     assert saved[0].parts[0].content == scheduler.resident_block(MAIN)
-    assert saved[0].metadata["huddol"]["block"] == "resident"
+    assert saved[0].metadata["fora"]["block"] == "resident"
     assert saved[0].parts[0].content.endswith(reset_notice(world.history.window(MAIN)))
 
 
@@ -944,7 +944,7 @@ def test_resident_is_persisted_and_stays_unchanged_until_a_reset(
     )
     from pydantic_ai.models.function import FunctionModel
 
-    from huddol.adapters.model.runner import PydanticModelRunner
+    from fora.adapters.model.runner import PydanticModelRunner
 
     room = mention(world, "@Main keep the discussion text")
     received = []
@@ -1056,7 +1056,7 @@ def test_history_is_preserved_or_reset_without_rewriting_old_prompts(
     )
     from pydantic_ai.models.function import FunctionModel
 
-    from huddol.adapters.model.runner import PydanticModelRunner
+    from fora.adapters.model.runner import PydanticModelRunner
 
     mention(world)
     monkeypatch.setattr(models, "ALLOW_MODEL_REQUESTS", False)
@@ -1102,11 +1102,11 @@ def test_history_is_preserved_or_reset_without_rewriting_old_prompts(
         assert len(saved) == 3
         assert saved[0].parts[0].content == scheduler.resident_block(MAIN)
     else:
-        key = saved[0].metadata.pop("huddol")["cache_key"]
+        key = saved[0].metadata.pop("fora")["cache_key"]
         assert len(key) == 32
         assert saved[: len(prior)] == prior
         assert saved[-2].metadata == {
-            "huddol": {
+            "fora": {
                 "block": "durable",
                 "environment": scheduler.environment_facts(MAIN),
             }
@@ -1139,7 +1139,7 @@ def test_resident_carries_workspace_and_environment(world, tmp_path: Path) -> No
 def test_resident_creation_failure_preserves_window_and_other_agents(
     world, monkeypatch, error_kind, preparation
 ) -> None:
-    from huddol.core.errors import DomainError
+    from fora.core.errors import DomainError
 
     room = mention(world)
     world.settings.set_settings("agent", {"context_window_tokens": 100})
@@ -1255,7 +1255,7 @@ def test_second_model_call_failure_keeps_saved_response_and_completed_tool_retur
     )
     from pydantic_ai.models.function import FunctionModel
 
-    from huddol.adapters.model.runner import PydanticModelRunner
+    from fora.adapters.model.runner import PydanticModelRunner
 
     room = mention(world)
     monkeypatch.setattr(models, "ALLOW_MODEL_REQUESTS", False)
@@ -1335,7 +1335,7 @@ def test_sqlite_progress_failure_preserves_history_and_stops_execution(
     )
     from pydantic_ai.models.function import FunctionModel
 
-    from huddol.adapters.model.runner import PydanticModelRunner
+    from fora.adapters.model.runner import PydanticModelRunner
 
     monkeypatch.setattr(models, "ALLOW_MODEL_REQUESTS", False)
     world.settings.set_settings(
@@ -1350,7 +1350,7 @@ def test_sqlite_progress_failure_preserves_history_and_stops_execution(
                 ModelRequest(
                     parts=[UserPromptPart("resident")],
                     metadata={
-                        "huddol": {"block": "resident", "agents_instructions": snapshot}
+                        "fora": {"block": "resident", "agents_instructions": snapshot}
                     },
                 )
             ]
@@ -1422,7 +1422,7 @@ def test_sqlite_progress_failure_preserves_history_and_stops_execution(
     assert world.history.latest_messages(MAIN) == expected
     if expected != "[]":
         resident = ModelMessagesTypeAdapter.validate_json(expected)[0]
-        assert resident.metadata["huddol"]["agents_instructions"] == snapshot
+        assert resident.metadata["fora"]["agents_instructions"] == snapshot
     if prior:
         assert world.history.runs(MAIN)[1].messages_json == original
     assert world.history.pause_reason(MAIN) is None
@@ -1443,9 +1443,9 @@ def test_turn_model_snapshot_survives_history_saving_and_failure(
     from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
     from pydantic_ai.models.function import FunctionModel
 
-    from huddol.adapters.model.config import ModelCatalog
-    from huddol.adapters.model.prompt import SYSTEM_PROMPT
-    from huddol.adapters.model.runner import PydanticModelRunner
+    from fora.adapters.model.config import ModelCatalog
+    from fora.adapters.model.prompt import SYSTEM_PROMPT
+    from fora.adapters.model.runner import PydanticModelRunner
 
     monkeypatch.setattr(models, "ALLOW_MODEL_REQUESTS", False)
     first = ModelCatalog.model_validate(
@@ -1582,7 +1582,7 @@ def test_turn_model_snapshot_survives_history_saving_and_failure(
     assert history == (saved[-1] if saved else "[]")
     if saved:
         assert (
-            ModelMessagesTypeAdapter.validate_json(history)[0].metadata["huddol"][
+            ModelMessagesTypeAdapter.validate_json(history)[0].metadata["fora"][
                 "agents_instructions"
             ]
             == "window instructions\n "
@@ -1610,7 +1610,7 @@ def test_invalid_history_preserves_sqlite_records_and_window(
 ):
     from pydantic_ai import models
 
-    from huddol.adapters.model.runner import PydanticModelRunner
+    from fora.adapters.model.runner import PydanticModelRunner
 
     monkeypatch.setattr(models, "ALLOW_MODEL_REQUESTS", False)
     world.settings.set_settings(
@@ -1623,7 +1623,7 @@ def test_invalid_history_preserves_sqlite_records_and_window(
                 "kind": "request",
                 "parts": [{"part_kind": "user-prompt", "content": "resident"}],
                 "metadata": {
-                    "huddol": {"block": "resident", "agents_instructions": "snapshot"}
+                    "fora": {"block": "resident", "agents_instructions": "snapshot"}
                 },
             },
             {"kind": "unknown"},
@@ -1734,8 +1734,8 @@ def test_progress_finish_and_safety_failures_remain_diagnostic_and_stop_agent(
     from pydantic_ai.messages import ModelResponse, ToolCallPart
     from pydantic_ai.models.function import FunctionModel
 
-    from huddol.adapters.model.runner import PydanticModelRunner
-    from huddol.runtime.reminder import HistoryPersistenceError
+    from fora.adapters.model.runner import PydanticModelRunner
+    from fora.runtime.reminder import HistoryPersistenceError
 
     monkeypatch.setattr(models, "ALLOW_MODEL_REQUESTS", False)
     world.settings.set_settings(
@@ -1892,7 +1892,7 @@ def test_an_agent_can_reopen_its_own_acknowledgement(world, monkeypatch) -> None
     from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
     from pydantic_ai.models.function import FunctionModel
 
-    from huddol.adapters.model.runner import PydanticModelRunner
+    from fora.adapters.model.runner import PydanticModelRunner
 
     room = mention(world)
     actions = iter(("read", "ack", "revoke_ack"))
@@ -1971,7 +1971,7 @@ def test_previously_reminded_is_flagged_on_the_second_turn(world) -> None:
 
 def test_prior_window_content_stays_retrievable_through_history(world) -> None:
     mention(world)
-    from huddol.services.history import History
+    from fora.services.history import History
 
     early = json.dumps(
         [
@@ -2223,7 +2223,7 @@ def test_no_limit_configured_means_no_ceiling(world, values) -> None:
 @pytest.mark.parametrize("pending", [False, True])
 @pytest.mark.parametrize("method", ["start", "tick", "run_turn"])
 def test_invalid_parameters_prevent_scheduling(world, pending, method) -> None:
-    from huddol.core.errors import DomainError
+    from fora.core.errors import DomainError
 
     if pending:
         mention(world)
@@ -2337,7 +2337,7 @@ def test_scheduler_failure_logs_and_finishes_inflight_turns(
     import logging
     import threading
 
-    from huddol.__main__ import configure_logging
+    from fora.__main__ import configure_logging
 
     entered = threading.Event()
     release = threading.Event()
@@ -2365,7 +2365,7 @@ def test_scheduler_failure_logs_and_finishes_inflight_turns(
         assert not loop.is_alive()
         assert len(failures) == 1
         assert "max_concurrent_turns" in str(failures[0].exc_value)
-        log = (tmp_path / "logs" / "huddol.log").read_text()
+        log = (tmp_path / "logs" / "fora.log").read_text()
         assert "Scheduler stopped after a runtime failure" in log
         assert "Agent parameter max_concurrent_turns" in log
         room = world.store.create_discussion("waiting", [HUMAN, HELPER])
@@ -2427,8 +2427,8 @@ def test_agents_instructions_are_read_only_at_window_creation(
     from pydantic_ai.messages import ModelResponse, TextPart
     from pydantic_ai.models.function import FunctionModel
 
-    from huddol.adapters.model.prompt import SYSTEM_PROMPT
-    from huddol.adapters.model.runner import PydanticModelRunner
+    from fora.adapters.model.prompt import SYSTEM_PROMPT
+    from fora.adapters.model.runner import PydanticModelRunner
 
     global_path = tmp_path / "library" / "AGENTS.md"
     member_path = world.workspace_tree_for(MAIN).root / "AGENTS.md"
@@ -2512,8 +2512,8 @@ def test_process_interruption_before_response_recovers_saved_window_snapshot(
     from pydantic_ai.messages import ModelResponse, TextPart
     from pydantic_ai.models.function import FunctionModel
 
-    from huddol.adapters.model.prompt import SYSTEM_PROMPT
-    from huddol.adapters.model.runner import PydanticModelRunner
+    from fora.adapters.model.prompt import SYSTEM_PROMPT
+    from fora.adapters.model.runner import PydanticModelRunner
 
     world.settings.set_settings(
         "model",
@@ -2521,10 +2521,10 @@ def test_process_interruption_before_response_recovers_saved_window_snapshot(
     )
     child = textwrap.dedent("""
         import os, sys
-        from huddol.adapters.sqlite.store import SqliteStore
-        from huddol.adapters.sqlite.agent import SqliteAgentStore
-        from huddol.adapters.model.runner import PydanticModelRunner
-        from huddol.runtime.reminder import TurnRequest
+        from fora.adapters.sqlite.store import SqliteStore
+        from fora.adapters.sqlite.agent import SqliteAgentStore
+        from fora.adapters.model.runner import PydanticModelRunner
+        from fora.runtime.reminder import TurnRequest
         from pydantic_ai.models.function import FunctionModel
         store = SqliteStore(sys.argv[1])
         history = SqliteAgentStore(store._db)
@@ -2537,7 +2537,7 @@ def test_process_interruption_before_response_recovers_saved_window_snapshot(
         PydanticModelRunner(history, build_model=lambda config: FunctionModel(interrupt)).run(request, None)
     """)
     result = subprocess.run(
-        [sys.executable, "-c", child, str(tmp_path / "huddol.sqlite3")],
+        [sys.executable, "-c", child, str(tmp_path / "fora.sqlite3")],
         check=False,
         timeout=30,
         capture_output=True,
@@ -2567,8 +2567,8 @@ def test_agents_file_changed_during_tool_call_waits_for_next_window(
     from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
     from pydantic_ai.models.function import FunctionModel
 
-    from huddol.adapters.model.prompt import SYSTEM_PROMPT
-    from huddol.adapters.model.runner import PydanticModelRunner
+    from fora.adapters.model.prompt import SYSTEM_PROMPT
+    from fora.adapters.model.runner import PydanticModelRunner
 
     path = tmp_path / "library" / "AGENTS.md"
     content = f"before{newline} "

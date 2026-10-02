@@ -7,9 +7,9 @@ from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.usage import RunUsage, UsageLimits
 from test_sidecar_process import drive, response
 
-from huddol.adapters.sqlite.agent import SqliteAgentStore
-from huddol.adapters.sqlite.store import SqliteStore
-from huddol.core.parameters import AgentParameters, agent_parameters
+from fora.adapters.sqlite.agent import SqliteAgentStore
+from fora.adapters.sqlite.store import SqliteStore
+from fora.core.parameters import AgentParameters, agent_parameters
 
 
 @pytest.mark.parametrize("request_limit", [0, 1, 50, 75])
@@ -17,7 +17,7 @@ def test_request_limit_survives_settings_api_and_restart(
     tmp_path: Path, request_limit: int
 ) -> None:
     data = tmp_path / "data"
-    with closing(SqliteStore(data / "huddol.sqlite3")) as store:
+    with closing(SqliteStore(data / "fora.sqlite3")) as store:
         SqliteAgentStore(store._db).set_settings("agent", {"token_limit": 1000})
     frames, code, stderr = drive(
         data,
@@ -54,7 +54,7 @@ def test_invalid_request_limit_preserves_settings(
 ) -> None:
     data = tmp_path / "data"
     original = {"request_limit": 75, "token_limit": 1000}
-    with closing(SqliteStore(data / "huddol.sqlite3")) as store:
+    with closing(SqliteStore(data / "fora.sqlite3")) as store:
         SqliteAgentStore(store._db).set_settings("agent", original)
     frames, code, stderr = drive(
         data,
@@ -70,7 +70,7 @@ def test_invalid_request_limit_preserves_settings(
     assert code == 0, stderr
     assert response(frames, 1)["error"]["code"] == "invalid_parameter"
     assert response(frames, 2)["result"] == {**asdict(AgentParameters()), **original}
-    with closing(SqliteStore(data / "huddol.sqlite3")) as store:
+    with closing(SqliteStore(data / "fora.sqlite3")) as store:
         assert SqliteAgentStore(store._db).get_settings("agent") == original
 
 

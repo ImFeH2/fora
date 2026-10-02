@@ -18,10 +18,10 @@ from test_runtime import HELPER, HUMAN, MAIN, RecordingRunner, mention
 
 pytest_plugins = ("test_runtime",)
 
-from huddol.adapters.model.runner import PydanticModelRunner
-from huddol.core.errors import DomainError
-from huddol.runtime.reminder import TurnOutcome
-from huddol.runtime.scheduler import Scheduler
+from fora.adapters.model.runner import PydanticModelRunner
+from fora.core.errors import DomainError
+from fora.runtime.reminder import TurnOutcome
+from fora.runtime.scheduler import Scheduler
 
 
 @pytest.fixture

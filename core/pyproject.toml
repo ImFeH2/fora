@@ -1,5 +1,5 @@
 [project]
-name = "huddol"
+name = "fora"
 version = "0.0.8"
 description = "Run your own organization of agents."
 requires-python = ">=3.13"
@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.scripts]
-huddol = "huddol.__main__:main"
+fora = "fora.__main__:main"
 
 [dependency-groups]
 dev = [

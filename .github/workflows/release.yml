@@ -117,7 +117,7 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: ${{ github.ref_name }}
           releaseDraft: true
-          releaseAssetNamePattern: huddol-app-v[version]-${{ matrix.platform }}[ext]
+          releaseAssetNamePattern: fora-app-v[version]-${{ matrix.platform }}[ext]
 
   cli:
     name: CLI (${{ matrix.name }})
@@ -153,15 +153,15 @@ jobs:
           rustflags: ""
 
       - name: Build CLI
-        run: cargo build -p huddol-cli --bin huddol-cli --release --locked
+        run: cargo build -p fora-cli --bin fora-cli --release --locked
 
       - name: Prepare CLI
         env:
           CLI_EXTENSION: ${{ runner.os == 'Windows' && '.exe' || '' }}
         run: |
           mkdir -p release
-          cp "target/release/huddol-cli${CLI_EXTENSION}" \
-            "release/huddol-cli-${GITHUB_REF_NAME}-${{ matrix.platform }}${CLI_EXTENSION}"
+          cp "target/release/fora-cli${CLI_EXTENSION}" \
+            "release/fora-cli-${GITHUB_REF_NAME}-${{ matrix.platform }}${CLI_EXTENSION}"
 
       - name: Upload CLI
         env:

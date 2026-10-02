@@ -5,9 +5,9 @@ from typing import Any
 
 import pytest
 
-from huddol.adapters.model import probe
-from huddol.adapters.model.config import ModelConfig, thinking_settings
-from huddol.core.errors import DomainError
+from fora.adapters.model import probe
+from fora.adapters.model.config import ModelConfig, thinking_settings
+from fora.core.errors import DomainError
 
 STORED = {
     "api_type": "openai-chat",

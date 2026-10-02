@@ -6,16 +6,16 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from huddol.adapters.execution.editing import edit_file
-from huddol.adapters.execution.local import LocalExecution
-from huddol.adapters.sandbox.commands import (
+from fora.adapters.execution.editing import edit_file
+from fora.adapters.execution.local import LocalExecution
+from fora.adapters.sandbox.commands import (
     linux_command,
     macos_command,
     macos_profile,
     windows_command,
 )
-from huddol.adapters.sandbox.paths import bind_order, is_within, normalize_directories
-from huddol.core.errors import DomainError
+from fora.adapters.sandbox.paths import bind_order, is_within, normalize_directories
+from fora.core.errors import DomainError
 
 LINUX_ONLY = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="linux sandbox"
@@ -95,9 +95,9 @@ def test_windows_command_reenters_the_kernel_entrypoint() -> None:
     command = windows_command(
         "S-1-5-21-1-2-3",
         ["cmd", "/c", "echo"],
-        [sys.executable, "-I", "-m", "huddol"],
+        [sys.executable, "-I", "-m", "fora"],
     )
-    assert command[:4] == [sys.executable, "-I", "-m", "huddol"]
+    assert command[:4] == [sys.executable, "-I", "-m", "fora"]
     assert "--windows-write-sandbox" in command
     assert command[command.index("--windows-write-sandbox") + 1] == "S-1-5-21-1-2-3"
     assert command[-3:] == ["--", "cmd", "/c"] or command[-4:] == [
@@ -371,7 +371,7 @@ def test_edit_leaves_no_temporary_files(tmp_path: Path) -> None:
     target.write_text("a", encoding="utf-8")
     sandbox = LocalExecution([str(tmp_path)], enforce=False)
     sandbox.edit(str(target), [{"old_text": "a", "new_text": "b"}])
-    assert list(tmp_path.glob("*.huddol-tmp")) == []
+    assert list(tmp_path.glob("*.fora-tmp")) == []
 
 
 def test_run_rejects_malformed_argv(tmp_path: Path) -> None:
@@ -428,7 +428,7 @@ def test_sandboxed_run_allows_writes_inside_and_blocks_them_outside(
 
 
 def test_posix_paths_are_reported_as_foreign_not_merely_invalid() -> None:
-    from huddol.adapters.sandbox.paths import normalize_tolerantly
+    from fora.adapters.sandbox.paths import normalize_tolerantly
 
     result = normalize_tolerantly(["/workspace/app", "relative/thing"])
     reasons = {path: reason for path, reason in result.skipped}
@@ -440,7 +440,7 @@ def test_posix_paths_are_reported_as_foreign_not_merely_invalid() -> None:
 
 
 def test_tolerant_mode_keeps_the_usable_directories(tmp_path: Path) -> None:
-    from huddol.adapters.sandbox.paths import normalize_tolerantly
+    from fora.adapters.sandbox.paths import normalize_tolerantly
 
     usable = tmp_path / "workspace"
     usable.mkdir()

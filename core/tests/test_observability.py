@@ -8,13 +8,13 @@ import pytest
 from opentelemetry.sdk.trace import Span
 from test_runner import request
 
-from huddol.adapters.model.observability import (
+from fora.adapters.model.observability import (
     ObservabilityConfig,
     TurnTrace,
     active_trace,
     current_trace,
 )
-from huddol.runtime.reminder import Reminder, ReminderItem
+from fora.runtime.reminder import Reminder, ReminderItem
 
 
 def turn():
@@ -111,11 +111,11 @@ def test_preparation_trace_has_identity_without_reminders() -> None:
 def test_trace_attributes_match_the_langfuse_schema() -> None:
     attributes = TurnTrace.of(turn()).attributes()
     assert attributes["langfuse.trace.name"] == "Agent turn"
-    assert attributes["langfuse.trace.tags"] == ["huddol", "agent"]
+    assert attributes["langfuse.trace.tags"] == ["fora", "agent"]
     assert attributes["langfuse.trace.metadata.agent_id"] == 13
     assert attributes["langfuse.trace.metadata.discussion_ids"] == [3, 5]
     assert attributes["langfuse.trace.metadata.message_count"] == 3
-    assert attributes["langfuse.session.id"] == "huddol-agent-13"
+    assert attributes["langfuse.session.id"] == "fora-agent-13"
 
 
 def test_trace_scope_is_restored_after_use() -> None:
@@ -128,7 +128,7 @@ def test_trace_scope_is_restored_after_use() -> None:
 
 def test_span_processor_only_decorates_model_spans() -> None:
     pytest.importorskip("opentelemetry.sdk")
-    from huddol.adapters.model.langfuse import TurnAttributeProcessor
+    from fora.adapters.model.langfuse import TurnAttributeProcessor
 
     class FakeScope:
         def __init__(self, name: str) -> None:
@@ -155,7 +155,7 @@ def test_span_processor_only_decorates_model_spans() -> None:
 
 def test_spans_are_not_decorated_outside_a_turn() -> None:
     pytest.importorskip("opentelemetry.sdk")
-    from huddol.adapters.model.langfuse import TurnAttributeProcessor
+    from fora.adapters.model.langfuse import TurnAttributeProcessor
 
     class FakeSpan:
         def __init__(self) -> None:

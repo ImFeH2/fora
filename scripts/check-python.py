@@ -35,7 +35,7 @@ def kernel(module: str, directory: Path, *arguments: str):
     environment = {
         name: value
         for name, value in os.environ.items()
-        if not name.startswith("HUDDOL_")
+        if not name.startswith("FORA_")
     }
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as errors:
         process = subprocess.Popen(
@@ -99,7 +99,7 @@ def assert_answered(frames: list[dict[str, Any]]) -> None:
 
 def check_commands() -> None:
     scripts = Path(sys.executable).parent
-    for name in ("huddol", "huddol-web"):
+    for name in ("fora", "fora-web"):
         executable = scripts / f"{name}.exe"
         path = executable if executable.exists() else scripts / name
         completed = subprocess.run(
@@ -111,13 +111,13 @@ def check_commands() -> None:
         )
         assert completed.returncode == 0, completed.stderr
         assert "--data-dir" in completed.stdout
-    installed = version("huddol")
-    assert version("huddol-web") == installed
-    assert f"huddol=={installed}" in (requires("huddol-web") or [])
+    installed = version("fora")
+    assert version("fora-web") == installed
+    assert f"fora=={installed}" in (requires("fora-web") or [])
 
 
 def check_stdio(directory: Path) -> None:
-    with kernel("huddol", directory, "--transport", "stdio") as (
+    with kernel("fora", directory, "--transport", "stdio") as (
         process,
         frames,
         ready,
@@ -132,7 +132,7 @@ def check_stdio(directory: Path) -> None:
 
 
 def check_core(directory: Path) -> None:
-    with kernel("huddol", directory) as (_process, _frames, ready):
+    with kernel("fora", directory) as (_process, _frames, ready):
         assert ready["type"] == "ready", ready
         with connect(
             f"ws://127.0.0.1:{ready['port']}/ws?token={ready['token']}",
@@ -145,7 +145,7 @@ def check_core(directory: Path) -> None:
 
 
 def check_web(directory: Path) -> None:
-    with kernel("huddol_web", directory) as (_process, _frames, ready):
+    with kernel("fora_web", directory) as (_process, _frames, ready):
         assert ready["type"] == "ready", ready
         base = f"http://127.0.0.1:{ready['port']}"
         with urlopen(f"{base}/", timeout=TIMEOUT) as response:
@@ -173,7 +173,7 @@ def main() -> int:
     directory = Path(sys.argv[1]).resolve()
     check(directory)
     sys.stdout.write(
-        "Installed huddol and huddol-web passed commands, stdio, WebSocket, "
+        "Installed fora and fora-web passed commands, stdio, WebSocket, "
         "events, and frontend assets.\n"
     )
     return 0

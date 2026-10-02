@@ -65,6 +65,6 @@ describe("Execution settings", () => {
       "whitespace-pre-wrap font-mono text-sm wrap-anywhere",
     );
     expect(html).toContain("border-line bg-surface");
-    expect(html).not.toContain("Restart Huddol");
+    expect(html).not.toContain("Restart Fora");
   });
 });

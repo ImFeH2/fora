@@ -10,16 +10,16 @@ from pathlib import Path
 
 import pytest
 
-from huddol.adapters.execution.local import LocalExecution
-from huddol.adapters.execution.manager import ExecutionManager
-from huddol.adapters.execution.platforms import WindowsBackend, entrypoint
-from huddol.core.errors import DomainError
+from fora.adapters.execution.local import LocalExecution
+from fora.adapters.execution.manager import ExecutionManager
+from fora.adapters.execution.platforms import WindowsBackend, entrypoint
+from fora.core.errors import DomainError
 
 
 @pytest.fixture(autouse=True)
 def isolated_business_data(tmp_path: Path, monkeypatch):
     directory = tmp_path / "unexpected-business-startup"
-    monkeypatch.setenv("HUDDOL_DATA_DIR", str(directory))
+    monkeypatch.setenv("FORA_DATA_DIR", str(directory))
     yield
     assert not directory.exists()
 
@@ -104,7 +104,7 @@ def test_read_file_rejects_fifo_without_waiting(tmp_path: Path) -> None:
 def test_read_file_rejects_fifo_after_stat_with_a_controlled_replacement(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    from huddol.adapters.execution import reading
+    from fora.adapters.execution import reading
 
     source = tmp_path / "source.bin"
     source.write_bytes(b"source")
@@ -148,7 +148,7 @@ def test_read_file_rejects_fifo_after_stat_with_a_controlled_replacement(
 def test_read_file_returns_at_most_max_plus_one_when_content_grows(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    from huddol.adapters.execution import reading
+    from fora.adapters.execution import reading
 
     target = tmp_path / "growing.bin"
     target.write_bytes(b"a")
@@ -266,7 +266,7 @@ def test_failed_persistence_does_not_switch_execution_or_directories(
 def test_execution_helpers_ignore_other_business_modules_on_pythonpath(
     tmp_path: Path, monkeypatch
 ) -> None:
-    package = tmp_path / "other" / "huddol"
+    package = tmp_path / "other" / "fora"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("", encoding="utf-8")
     marker = tmp_path / "wrong-business-entry"
@@ -511,7 +511,7 @@ def test_normal_completion_release_failure_can_retry(tmp_path, monkeypatch):
     from concurrent.futures import Future
     from unittest.mock import Mock
 
-    from huddol.adapters.execution.platforms import (
+    from fora.adapters.execution.platforms import (
         ExecutionCleanupError,
         ExecutionRecord,
     )
@@ -553,7 +553,7 @@ def test_normal_completion_release_failure_can_retry(tmp_path, monkeypatch):
 
 
 def test_cleanup_error_subgroups_preserve_completion_evidence():
-    from huddol.adapters.execution.platforms import ExecutionCleanupError
+    from fora.adapters.execution.platforms import ExecutionCleanupError
 
     error = ExecutionCleanupError(
         "cleanup", [OSError("denied"), ValueError("bad")], True

@@ -20,7 +20,7 @@ import pytest
 from websockets.exceptions import InvalidStatus
 from websockets.sync.client import ClientConnection, connect
 
-from huddol.core.parameters import AgentParameters
+from fora.core.parameters import AgentParameters
 
 TIMEOUT = 90
 SOURCE = str(Path(__file__).resolve().parents[1] / "src")
@@ -42,9 +42,9 @@ class Kernel:
         self._stdin = stdin
         self._arguments = list(arguments)
         self._env = {
-            "HUDDOL_DATA_DIR": str(data_directory),
-            "HUDDOL_PORT": "0",
-            "HUDDOL_WEBUI_DIR": str(webui_directory or data_directory / "no-webui"),
+            "FORA_DATA_DIR": str(data_directory),
+            "FORA_PORT": "0",
+            "FORA_WEBUI_DIR": str(webui_directory or data_directory / "no-webui"),
             "PATH": os.environ["PATH"]
             if os.name == "nt"
             else "/usr/bin:/bin:/usr/local/bin",
@@ -70,7 +70,7 @@ class Kernel:
 
     def __enter__(self) -> Self:
         self._process = subprocess.Popen(
-            [sys.executable, "-m", "huddol", *self._arguments],
+            [sys.executable, "-m", "fora", *self._arguments],
             stdin=self._stdin,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -162,7 +162,7 @@ class Kernel:
 
     def run_second_instance(self) -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
-            [sys.executable, "-m", "huddol", *self._arguments],
+            [sys.executable, "-m", "fora", *self._arguments],
             cwd=self._cwd or Path.cwd(),
             env=self._env,
             capture_output=True,
@@ -236,7 +236,7 @@ def events(frames: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
 def dist(tmp_path: Path) -> Iterator[Path]:
     directory = tmp_path / "dist"
     (directory / "assets").mkdir(parents=True)
-    (directory / "index.html").write_text("<!doctype html><title>Huddol</title>")
+    (directory / "index.html").write_text("<!doctype html><title>Fora</title>")
     (directory / "assets" / "app.js").write_text("console.log(1)")
     yield directory
 
@@ -276,21 +276,21 @@ def test_frames_use_utf8_independently_of_stdio_defaults(
 def test_discussion_list_limits_are_optional_for_the_desktop(
     tmp_path: Path, monkeypatch
 ) -> None:
-    from huddol.adapters.sqlite.store import SqliteStore
+    from fora.adapters.sqlite.store import SqliteStore
 
     data = tmp_path / "data"
-    store = SqliteStore(data / "huddol.sqlite3")
+    store = SqliteStore(data / "fora.sqlite3")
     human = store.create_member("human", "You")
     agent = store.create_member("agent", "Main")
     for day in range(1, 26):
         monkeypatch.setattr(
-            "huddol.adapters.sqlite.store.now",
+            "fora.adapters.sqlite.store.now",
             lambda day=day: f"2026-01-{day:02}T00:00:00Z",
         )
         room = store.create_discussion(f"Room {day}", [human.id, agent.id])
         store.append_message(room.id, agent.id, "@You needle")
     monkeypatch.setattr(
-        "huddol.adapters.sqlite.store.now", lambda: "2026-01-31T00:00:00Z"
+        "fora.adapters.sqlite.store.now", lambda: "2026-01-31T00:00:00Z"
     )
     store.append_message(1, agent.id, "@You needle again")
     store.close()
@@ -315,10 +315,10 @@ def test_discussion_list_limits_are_optional_for_the_desktop(
 
 
 def test_discussion_management_and_pagination_survive_the_pipe(tmp_path: Path) -> None:
-    from huddol.adapters.sqlite.store import SqliteStore
+    from fora.adapters.sqlite.store import SqliteStore
 
     data = tmp_path / "data"
-    store = SqliteStore(data / "huddol.sqlite3")
+    store = SqliteStore(data / "fora.sqlite3")
     store.create_member("human", "You")
     for name in ("Main", "Other"):
         member = store.create_member("agent", name)
@@ -472,11 +472,11 @@ def test_agent_settings_and_window_survive_the_pipe_and_restart(tmp_path: Path) 
 def test_invalid_agent_settings_do_not_change_stored_values(
     tmp_path: Path, values, code
 ) -> None:
-    from huddol.adapters.sqlite.agent import SqliteAgentStore
-    from huddol.adapters.sqlite.store import SqliteStore
+    from fora.adapters.sqlite.agent import SqliteAgentStore
+    from fora.adapters.sqlite.store import SqliteStore
 
     data = tmp_path / "data"
-    store = SqliteStore(data / "huddol.sqlite3")
+    store = SqliteStore(data / "fora.sqlite3")
     original = {"context_window_tokens": 64000}
     SqliteAgentStore(store._db).set_settings("agent", original)
     store.close()
@@ -495,7 +495,7 @@ def test_invalid_agent_settings_do_not_change_stored_values(
     assert response(frames, 1)["error"]["code"] == code
     assert response(frames, 2)["result"] == {**asdict(AgentParameters()), **original}
     assert events(frames, "settings.updated") == []
-    store = SqliteStore(data / "huddol.sqlite3")
+    store = SqliteStore(data / "fora.sqlite3")
     try:
         assert SqliteAgentStore(store._db).get_settings("agent") == original
     finally:
@@ -505,11 +505,11 @@ def test_invalid_agent_settings_do_not_change_stored_values(
 def test_idle_threshold_changes_over_the_pipe_and_survives_restart(
     tmp_path: Path,
 ) -> None:
-    from huddol.adapters.sqlite.agent import SqliteAgentStore
-    from huddol.adapters.sqlite.store import SqliteStore
+    from fora.adapters.sqlite.agent import SqliteAgentStore
+    from fora.adapters.sqlite.store import SqliteStore
 
     data = tmp_path / "data"
-    store = SqliteStore(data / "huddol.sqlite3")
+    store = SqliteStore(data / "fora.sqlite3")
     try:
         store.create_member("human", "You")
         agent_id = store.create_member("agent", "Main").id
@@ -557,11 +557,11 @@ def test_idle_threshold_changes_over_the_pipe_and_survives_restart(
 def test_incomplete_model_configuration_is_migrated_over_the_pipe(
     tmp_path: Path,
 ) -> None:
-    from huddol.adapters.sqlite.agent import SqliteAgentStore
-    from huddol.adapters.sqlite.store import SqliteStore
+    from fora.adapters.sqlite.agent import SqliteAgentStore
+    from fora.adapters.sqlite.store import SqliteStore
 
     data = tmp_path / "data"
-    store = SqliteStore(data / "huddol.sqlite3")
+    store = SqliteStore(data / "fora.sqlite3")
     original = {
         "base_url": "https://example.invalid",
         "api_key": "retained-test-key",
@@ -590,7 +590,7 @@ def test_incomplete_model_configuration_is_migrated_over_the_pipe(
     assert "compaction_threshold" not in response(frames, 1)["result"]
     assert "compaction_threshold" not in response(frames, 2)["result"]
     assert "retained-test-key" not in json.dumps(frames) + stderr
-    store = SqliteStore(data / "huddol.sqlite3")
+    store = SqliteStore(data / "fora.sqlite3")
     try:
         migrated = SqliteAgentStore(store._db).get_settings("model")
         assert migrated["version"] == 2
@@ -710,10 +710,10 @@ def local_model():
 
 
 def configure_local_model(data: Path, config: dict[str, str]) -> None:
-    from huddol.adapters.sqlite.agent import SqliteAgentStore
-    from huddol.adapters.sqlite.store import SqliteStore
+    from fora.adapters.sqlite.agent import SqliteAgentStore
+    from fora.adapters.sqlite.store import SqliteStore
 
-    store = SqliteStore(data / "huddol.sqlite3")
+    store = SqliteStore(data / "fora.sqlite3")
     try:
         SqliteAgentStore(store._db).set_settings("model", config)
     finally:
@@ -812,10 +812,10 @@ def test_runtime_info_changes_after_restart(tmp_path: Path) -> None:
 
 
 def test_port_and_token_can_be_pinned_by_the_environment(tmp_path: Path) -> None:
-    with Kernel(tmp_path / "data", env={"HUDDOL_PORT": "0"}) as probe:
+    with Kernel(tmp_path / "data", env={"FORA_PORT": "0"}) as probe:
         port = probe.port
         assert probe.shutdown() == 0
-    env = {"HUDDOL_PORT": str(port), "HUDDOL_TOKEN": "pinned-token"}
+    env = {"FORA_PORT": str(port), "FORA_TOKEN": "pinned-token"}
     with Kernel(tmp_path / "data", env=env) as kernel:
         assert kernel.port == port
         assert kernel.token == "pinned-token"
@@ -829,7 +829,7 @@ def test_port_and_token_can_be_pinned_by_the_environment(tmp_path: Path) -> None
 def test_the_data_directory_variable_is_honoured(tmp_path: Path) -> None:
     target = tmp_path / "somewhere" / "else"
     with Kernel(target) as kernel:
-        assert (target / "huddol.sqlite3").is_file()
+        assert (target / "fora.sqlite3").is_file()
         assert kernel.shutdown() == 0, kernel.stderr
 
 
@@ -868,7 +868,7 @@ def test_closing_stdin_shuts_the_kernel_down(tmp_path: Path) -> None:
     with Kernel(data) as kernel:
         assert kernel.shutdown(close_only=True) == 0, kernel.stderr
     assert not (data / "run.json").exists()
-    assert (data / "logs" / "huddol.log").is_file()
+    assert (data / "logs" / "fora.log").is_file()
     assert "Shutting down (eof)" in kernel.stderr
 
 
@@ -919,7 +919,7 @@ def test_a_second_instance_on_the_same_data_directory_refuses_to_start(
         assert second.returncode == 2
         assert second.stdout == b""
         assert second.stderr.decode("utf-8").splitlines() == [
-            f"Huddol is already running on port {kernel.port} for {data}"
+            f"Fora is already running on port {kernel.port} for {data}"
         ]
         assert run_file.read_bytes() == before
         with kernel.connect() as connection:
@@ -949,8 +949,8 @@ def test_wrong_or_missing_tokens_get_401_without_an_upgrade(tmp_path: Path) -> N
             )
             assert status == 401
             assert content_type == "text/html; charset=utf-8"
-            assert b"Access to Huddol requires authentication" in body
-            assert b"access link provided when Huddol starts" in body
+            assert b"Access to Fora requires authentication" in body
+            assert b"access link provided when Fora starts" in body
             assert b'class="access-notice"' in body
             assert b"MIT License" not in body
             assert b"cnippet-dev" not in body
@@ -1004,7 +1004,7 @@ def test_authentication_diagnosis_and_fixed_application_origins(tmp_path: Path) 
                         assert body == b""
         assert kernel.shutdown() == 0, kernel.stderr
         assert kernel.token not in kernel.stderr
-        assert kernel.token not in (tmp_path / "data/logs/huddol.log").read_text()
+        assert kernel.token not in (tmp_path / "data/logs/fora.log").read_text()
 
 
 def test_responses_stay_on_their_own_connection(tmp_path: Path) -> None:
@@ -1059,7 +1059,7 @@ def test_the_frontend_is_served_when_it_is_built(tmp_path: Path, dist: Path) -> 
         assert content_type.startswith("text/javascript")
         assert kernel.http("/assets/missing.js")[0] == 404
         assert kernel.http("/assets/")[0] == 200
-        assert kernel.http("/../huddol.spec")[0] == 404
+        assert kernel.http("/../fora.spec")[0] == 404
         assert kernel.shutdown() == 0, kernel.stderr
 
 
@@ -1148,11 +1148,11 @@ def test_a_full_conversation_survives_the_real_pipe(tmp_path: Path) -> None:
 
 
 def test_acknowledgement_ownership_survives_the_real_pipe(tmp_path: Path) -> None:
-    from huddol.adapters.sqlite.store import SqliteStore
+    from fora.adapters.sqlite.store import SqliteStore
 
     data = tmp_path / "data"
     data.mkdir()
-    store = SqliteStore(data / "huddol.sqlite3")
+    store = SqliteStore(data / "fora.sqlite3")
     try:
         store.create_member("human", "You")
         store.create_member("agent", "Helper")
@@ -1192,7 +1192,7 @@ def test_acknowledgement_ownership_survives_the_real_pipe(tmp_path: Path) -> Non
     assert response(frames, 5)["result"]["acknowledged"] == [1]
     assert response(frames, 7)["error"]["code"] == "not_a_member"
     assert len(events(frames, "mention.revoked")) == 1
-    store = SqliteStore(data / "huddol.sqlite3")
+    store = SqliteStore(data / "fora.sqlite3")
     try:
         assert store.acknowledged(1, 2) == (1,)
         assert store.acknowledged(1, 1) == (1,)
@@ -1201,7 +1201,7 @@ def test_acknowledgement_ownership_survives_the_real_pipe(tmp_path: Path) -> Non
 
 
 def test_membership_changes_preserve_history_and_pending(tmp_path: Path) -> None:
-    from huddol.adapters.sqlite.store import SqliteStore
+    from fora.adapters.sqlite.store import SqliteStore
 
     data = tmp_path / "data"
     setup = [
@@ -1242,7 +1242,7 @@ def test_membership_changes_preserve_history_and_pending(tmp_path: Path) -> None
             assert response(frames, 2)["error"]["code"] == "not_a_member"
             assert response(frames, 3)["result"] == []
         assert len(events(frames, "discussion.updated")) == 1
-        store = SqliteStore(data / "huddol.sqlite3")
+        store = SqliteStore(data / "fora.sqlite3")
         try:
             assert store.message_count(1) == 1
             assert [item.message_id for item in store.pending(2)] == (
@@ -1329,7 +1329,7 @@ def test_unusable_write_directories_are_reported_not_fatal(tmp_path: Path) -> No
     )
     import sqlite3
 
-    connection = sqlite3.connect(data / "huddol.sqlite3")
+    connection = sqlite3.connect(data / "fora.sqlite3")
     connection.execute(
         "UPDATE settings SET values_json = ? WHERE section = 'execution'",
         (json.dumps({"write_directories": ["relative/bad"]}),),
@@ -1355,7 +1355,7 @@ def test_interrupted_turns_are_marked_on_the_next_start(tmp_path: Path) -> None:
     )
     import sqlite3
 
-    connection = sqlite3.connect(data / "huddol.sqlite3")
+    connection = sqlite3.connect(data / "fora.sqlite3")
     connection.execute(
         "INSERT INTO agent_runs (agent_id, sequence, run_id, status, started_at,"
         " messages_json) VALUES (2, 1, 'r1', 'running', '2026-01-01T00:00:00Z', '[]')"
@@ -1366,7 +1366,7 @@ def test_interrupted_turns_are_marked_on_the_next_start(tmp_path: Path) -> None:
     _frames, code, stderr = drive(data, [])
     assert code == 0, stderr
 
-    connection = sqlite3.connect(data / "huddol.sqlite3")
+    connection = sqlite3.connect(data / "fora.sqlite3")
     status = connection.execute(
         "SELECT status FROM agent_runs WHERE agent_id = 2"
     ).fetchone()[0]
@@ -1377,12 +1377,12 @@ def test_interrupted_turns_are_marked_on_the_next_start(tmp_path: Path) -> None:
 def test_startup_recovers_running_history_and_lifecycle_state(
     tmp_path: Path,
 ) -> None:
-    from huddol.adapters.sqlite.agent import SqliteAgentStore
-    from huddol.adapters.sqlite.store import SqliteStore
-    from huddol.ports.agent import AgentLifecycle
+    from fora.adapters.sqlite.agent import SqliteAgentStore
+    from fora.adapters.sqlite.store import SqliteStore
+    from fora.ports.agent import AgentLifecycle
 
     data = tmp_path / "data"
-    store = SqliteStore(data / "huddol.sqlite3")
+    store = SqliteStore(data / "fora.sqlite3")
     try:
         history = SqliteAgentStore(store._db)
         store.create_member("human", "You")
@@ -1410,7 +1410,7 @@ def test_startup_recovers_running_history_and_lifecycle_state(
             }
         assert kernel.shutdown() == 0, kernel.stderr
 
-    with closing(sqlite3.connect(data / "huddol.sqlite3")) as connection:
+    with closing(sqlite3.connect(data / "fora.sqlite3")) as connection:
         assert connection.execute(
             "SELECT status, messages_json FROM agent_runs WHERE agent_id = 2"
         ).fetchone() == ("interrupted", partial)
@@ -1436,7 +1436,7 @@ def test_startup_recovers_running_history_and_lifecycle_state(
 
 def wait_for_persisted_turn(data: Path, agent_id: int, sequence: int) -> None:
     deadline = time.monotonic() + TIMEOUT
-    with closing(sqlite3.connect(data / "huddol.sqlite3")) as connection:
+    with closing(sqlite3.connect(data / "fora.sqlite3")) as connection:
         while time.monotonic() < deadline:
             row = connection.execute(
                 "SELECT status FROM agent_runs WHERE agent_id = ? AND sequence = ?",
@@ -1452,12 +1452,12 @@ def wait_for_persisted_turn(data: Path, agent_id: int, sequence: int) -> None:
 def test_restart_preserves_completed_count_and_reminder_identity(
     tmp_path: Path, local_model
 ) -> None:
-    from huddol.adapters.sqlite.agent import SqliteAgentStore
-    from huddol.adapters.sqlite.store import SqliteStore
-    from huddol.runtime.reminder import build_reminder
+    from fora.adapters.sqlite.agent import SqliteAgentStore
+    from fora.adapters.sqlite.store import SqliteStore
+    from fora.runtime.reminder import build_reminder
 
     data = tmp_path / "data"
-    with closing(SqliteStore(data / "huddol.sqlite3")) as store:
+    with closing(SqliteStore(data / "fora.sqlite3")) as store:
         history = SqliteAgentStore(store._db)
         history.set_settings("model", local_model)
         store.create_member("human", "You")
@@ -1482,7 +1482,7 @@ def test_restart_preserves_completed_count_and_reminder_identity(
                 assert len(detail["runs"]) == 3
             assert kernel.shutdown() == 0, kernel.stderr
 
-    with closing(SqliteStore(data / "huddol.sqlite3")) as store:
+    with closing(SqliteStore(data / "fora.sqlite3")) as store:
         history = SqliteAgentStore(store._db)
         assert [(run.sequence, run.status) for run in history.runs(2)] == [
             (3, "completed"),
@@ -1506,11 +1506,11 @@ def test_startup_continues_an_interrupted_turn_without_new_mentions(
     tmp_path: Path,
     local_model,
 ) -> None:
-    from huddol.adapters.sqlite.agent import SqliteAgentStore
-    from huddol.adapters.sqlite.store import SqliteStore
+    from fora.adapters.sqlite.agent import SqliteAgentStore
+    from fora.adapters.sqlite.store import SqliteStore
 
     data = tmp_path / "data"
-    store = SqliteStore(data / "huddol.sqlite3")
+    store = SqliteStore(data / "fora.sqlite3")
     try:
         history = SqliteAgentStore(store._db)
         history.set_settings("model", local_model)
@@ -1533,7 +1533,7 @@ def test_startup_continues_an_interrupted_turn_without_new_mentions(
         time.sleep(1)
         assert kernel.shutdown() == 0, kernel.stderr
 
-    store = SqliteStore(data / "huddol.sqlite3")
+    store = SqliteStore(data / "fora.sqlite3")
     try:
         history = SqliteAgentStore(store._db)
         runs = history.runs(2)
@@ -1559,12 +1559,12 @@ def test_startup_continues_an_interrupted_turn_without_new_mentions(
 def test_a_restart_starts_only_agents_with_unhandled_mentions(
     tmp_path: Path, local_model
 ) -> None:
-    from huddol.adapters.sqlite.agent import SqliteAgentStore
-    from huddol.adapters.sqlite.store import SqliteStore
+    from fora.adapters.sqlite.agent import SqliteAgentStore
+    from fora.adapters.sqlite.store import SqliteStore
 
     data = tmp_path / "data"
     data.mkdir()
-    store = SqliteStore(data / "huddol.sqlite3")
+    store = SqliteStore(data / "fora.sqlite3")
     agent_store = SqliteAgentStore(store._db)
     try:
         store.create_member("human", "You")
@@ -1595,7 +1595,7 @@ def test_a_restart_starts_only_agents_with_unhandled_mentions(
     with Kernel(data) as kernel:
         wait_for_persisted_turn(data, 2, 3)
         time.sleep(1)
-        with closing(sqlite3.connect(data / "huddol.sqlite3")) as connection:
+        with closing(sqlite3.connect(data / "fora.sqlite3")) as connection:
             runs = connection.execute(
                 "SELECT agent_id, COUNT(*) FROM agent_runs GROUP BY agent_id"
                 " ORDER BY agent_id"
@@ -1687,8 +1687,8 @@ def test_secrets_never_come_back_over_the_pipe(tmp_path: Path, section: str) -> 
 
 
 def test_observability_settings_preserve_keys_across_restarts(tmp_path: Path) -> None:
-    from huddol.adapters.sqlite.agent import SqliteAgentStore
-    from huddol.adapters.sqlite.store import SqliteStore
+    from fora.adapters.sqlite.agent import SqliteAgentStore
+    from fora.adapters.sqlite.store import SqliteStore
 
     data = tmp_path / "data"
     credentials = {"public_key": "test-public", "secret_key": "test-secret"}
@@ -1743,7 +1743,7 @@ def test_observability_settings_preserve_keys_across_restarts(tmp_path: Path) ->
     }
     rendered = json.dumps([frames, restarted]) + stderr + restart_stderr
     assert all(key not in rendered for key in credentials.values())
-    store = SqliteStore(data / "huddol.sqlite3")
+    store = SqliteStore(data / "fora.sqlite3")
     try:
         values = SqliteAgentStore(store._db).get_settings("observability")
         assert values is not None
@@ -1755,11 +1755,11 @@ def test_observability_settings_preserve_keys_across_restarts(tmp_path: Path) ->
 def test_unknown_mode_does_not_initialize_business_data(tmp_path: Path) -> None:
     directory = tmp_path / "must-not-exist"
     completed = subprocess.run(
-        [sys.executable, "-m", "huddol", "--unknown-mode"],
+        [sys.executable, "-m", "fora", "--unknown-mode"],
         cwd=tmp_path,
         env={
             **os.environ,
-            "HUDDOL_DATA_DIR": str(directory),
+            "FORA_DATA_DIR": str(directory),
             "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
         },
         capture_output=True,
@@ -1773,11 +1773,11 @@ def test_unknown_mode_does_not_initialize_business_data(tmp_path: Path) -> None:
 def test_settings_outside_the_execution_contract_keep_the_organization_available(
     tmp_path: Path,
 ) -> None:
-    from huddol.adapters.sqlite.agent import SqliteAgentStore
-    from huddol.adapters.sqlite.store import SqliteStore
+    from fora.adapters.sqlite.agent import SqliteAgentStore
+    from fora.adapters.sqlite.store import SqliteStore
 
     data = tmp_path / "data"
-    store = SqliteStore(data / "huddol.sqlite3")
+    store = SqliteStore(data / "fora.sqlite3")
     store.create_member("human", "Existing organization")
     SqliteAgentStore(store._db).set_settings(
         "execution", {"directories": {"native": []}}
@@ -1882,9 +1882,9 @@ def test_the_packaging_smoke_sequence_holds(tmp_path: Path) -> None:
         assert kernel.ready["type"] == "ready"
         with kernel.connect() as connection:
             pong = Client(connection).call(
-                {"id": 1, "method": "ping", "params": {"token": "huddol-smoke"}}
+                {"id": 1, "method": "ping", "params": {"token": "fora-smoke"}}
             )
-        assert pong["result"]["pong"] == "huddol-smoke"
+        assert pong["result"]["pong"] == "fora-smoke"
         assert kernel.shutdown() == 0, kernel.stderr
 
 

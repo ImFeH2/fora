@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Huddol",
+  "productName": "Fora",
   "version": "package.json",
-  "identifier": "im.feh2.huddol",
+  "identifier": "im.feh2.fora",
   "build": {
     "beforeDevCommand": "pnpm --dir ../webui dev",
     "devUrl": "http://localhost:1420",

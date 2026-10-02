@@ -24,13 +24,13 @@ run(
     dist,
     "--workpath",
     work,
-    resolve(core, "huddol.spec"),
+    resolve(core, "fora.spec"),
   ],
   { cwd: core },
 );
 
 rmSync(bundled, { force: true, recursive: true });
-cpSync(resolve(dist, "huddol"), bundled, { recursive: true });
+cpSync(resolve(dist, "fora"), bundled, { recursive: true });
 
-const executable = resolve(bundled, `huddol${extension}`);
+const executable = resolve(bundled, `fora${extension}`);
 process.stdout.write(`${executable}\n`);

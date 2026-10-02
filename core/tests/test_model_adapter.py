@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from huddol.adapters.model.config import (
+from fora.adapters.model.config import (
     AgentModelConfig,
     ApiType,
     ModelCatalog,
@@ -12,8 +12,8 @@ from huddol.adapters.model.config import (
     thinking_options,
     thinking_settings,
 )
-from huddol.adapters.model.prompt import SYSTEM_PROMPT
-from huddol.core.errors import DomainError
+from fora.adapters.model.prompt import SYSTEM_PROMPT
+from fora.core.errors import DomainError
 
 
 def catalog_fixture() -> ModelCatalog:
@@ -421,7 +421,7 @@ def test_build_model_returns_a_google_model_for_google() -> None:
     from pydantic_ai.models.google import GoogleModel
     from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
 
-    from huddol.adapters.model.runner import build_model
+    from fora.adapters.model.runner import build_model
 
     def built(api_type: ApiType):
         return build_model(
@@ -707,7 +707,7 @@ def test_build_model_serializes_thinking_on_the_wire(
     from pydantic_ai.providers.google import GoogleProvider
     from pydantic_ai.providers.openai import OpenAIProvider
 
-    from huddol.adapters.model import runner
+    from fora.adapters.model import runner
 
     requests = []
 
@@ -881,7 +881,7 @@ def test_build_model_serializes_explicit_budget_without_effort_or_level(
     from pydantic_ai.providers.anthropic import AnthropicProvider
     from pydantic_ai.providers.google import GoogleProvider
 
-    from huddol.adapters.model import runner
+    from fora.adapters.model import runner
 
     requests = []
 
@@ -987,8 +987,8 @@ def test_system_prompt_documents_file_creation_arguments() -> None:
 def test_tool_errors_are_reported_as_retryable_guidance() -> None:
     from pydantic_ai import ModelRetry
 
-    from huddol.adapters.model.runner import _guard, _required
-    from huddol.core.errors import DomainError
+    from fora.adapters.model.runner import _guard, _required
+    from fora.core.errors import DomainError
 
     with pytest.raises(ModelRetry) as missing:
         _required(None, "discussion_id", "ack")
@@ -1007,7 +1007,7 @@ def test_every_tool_named_in_the_prompt_is_actually_registered() -> None:
 
     from test_runner import FakeSettings
 
-    from huddol.adapters.model.runner import PydanticModelRunner
+    from fora.adapters.model.runner import PydanticModelRunner
 
     registered = set(PydanticModelRunner(FakeSettings())._agent._function_toolset.tools)
 
@@ -1031,7 +1031,7 @@ def test_every_tool_named_in_the_prompt_is_actually_registered() -> None:
 def test_the_full_tool_surface_matches_the_specification() -> None:
     from test_runner import FakeSettings
 
-    from huddol.adapters.model.runner import PydanticModelRunner
+    from fora.adapters.model.runner import PydanticModelRunner
 
     assert set(PydanticModelRunner(FakeSettings())._agent._function_toolset.tools) == {
         "discussion",
@@ -1048,7 +1048,7 @@ def test_the_full_tool_surface_matches_the_specification() -> None:
 def test_organization_schema_exposes_the_shared_agent_model_config() -> None:
     from test_runner import FakeSettings
 
-    from huddol.adapters.model.runner import PydanticModelRunner
+    from fora.adapters.model.runner import PydanticModelRunner
 
     tool = PydanticModelRunner(FakeSettings())._agent._function_toolset.tools[
         "organization"

@@ -8,19 +8,19 @@ from pathlib import Path
 
 import pytest
 
-from huddol.adapters.model.config import ModelCatalog
-from huddol.adapters.sqlite.agent import SqliteAgentStore
-from huddol.adapters.sqlite.store import SqliteStore
-from huddol.core.errors import DomainError
-from huddol.ports.agent import RunSummary, WindowState
-from huddol.services.history import History
+from fora.adapters.model.config import ModelCatalog
+from fora.adapters.sqlite.agent import SqliteAgentStore
+from fora.adapters.sqlite.store import SqliteStore
+from fora.core.errors import DomainError
+from fora.ports.agent import RunSummary, WindowState
+from fora.services.history import History
 
 AGENT = 13
 
 
 @pytest.fixture
 def agent_store(tmp_path: Path) -> SqliteAgentStore:
-    base = SqliteStore(tmp_path / "huddol.sqlite3")
+    base = SqliteStore(tmp_path / "fora.sqlite3")
     yield SqliteAgentStore(base._db)
     base.close()
 
@@ -223,7 +223,7 @@ def test_history_pagination_and_model_fields_are_bounded(
 
 
 def test_reminder_snapshot_survives_upgrade_restart_and_window_reset(tmp_path) -> None:
-    path = tmp_path / "huddol.sqlite3"
+    path = tmp_path / "fora.sqlite3"
     base = SqliteStore(path)
     store = SqliteAgentStore(base._db)
     legacy = store.start_run(AGENT)
@@ -256,7 +256,7 @@ def test_reminder_snapshot_survives_upgrade_restart_and_window_reset(tmp_path) -
 
 
 def test_a_new_session_reminds_the_same_keys_again(tmp_path) -> None:
-    path = tmp_path / "huddol.sqlite3"
+    path = tmp_path / "fora.sqlite3"
     base = SqliteStore(path)
     store = SqliteAgentStore(base._db)
     run = store.start_run(AGENT, reminded=[(1, 1)])
@@ -283,7 +283,7 @@ def test_a_new_session_reminds_the_same_keys_again(tmp_path) -> None:
 
 
 def test_safety_pause_and_resume_boundary_survive_reopening(tmp_path) -> None:
-    path = tmp_path / "huddol.sqlite3"
+    path = tmp_path / "fora.sqlite3"
     base = SqliteStore(path)
     store = SqliteAgentStore(base._db)
     run = store.start_run(AGENT, reminded=[(1, 1)])
@@ -499,7 +499,7 @@ def test_settings_round_trip_without_a_directory_table(
 def test_invalid_settings_preserve_stored_data_across_restarts(
     tmp_path, section, raw
 ) -> None:
-    path = tmp_path / "huddol.sqlite3"
+    path = tmp_path / "fora.sqlite3"
     base = SqliteStore(path)
     try:
         SqliteAgentStore(base._db)

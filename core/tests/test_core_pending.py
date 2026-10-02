@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from huddol.core.discussion import Discussion
-from huddol.core.mention import Mention
-from huddol.core.pending import Ack, ack_keys, pending_for
+from fora.core.discussion import Discussion
+from fora.core.mention import Mention
+from fora.core.pending import Ack, ack_keys, pending_for
 
 AGENT = 13
 OTHER = 36

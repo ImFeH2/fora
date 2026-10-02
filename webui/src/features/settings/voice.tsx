@@ -172,7 +172,7 @@ export function VoicePanel() {
             />
           </Field>
           <p className="text-sm text-fg-muted">
-            Audio is sent through Huddol to{" "}
+            Audio is sent through Fora to{" "}
             {values?.address ?? "the configured service"} for transcription.
           </p>
           <Button type="submit" variant="primary" disabled={!dirty}>

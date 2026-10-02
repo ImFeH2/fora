@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from huddol.__main__ import load_token
-from huddol.adapters.host import read_private, write_private
+from fora.__main__ import load_token
+from fora.adapters.host import read_private, write_private
 
 WINDOWS = pytest.mark.skipif(sys.platform != "win32", reason="Windows ACL")
 
@@ -59,7 +59,7 @@ def test_private_file_creation_and_replacement(tmp_path):
 
 @WINDOWS
 def test_private_acl_survives_broad_parent_and_replacement(tmp_path):
-    from huddol.adapters.windows import current_user_sid
+    from fora.adapters.windows import current_user_sid
 
     sid = current_user_sid()
     powershell(
@@ -118,7 +118,7 @@ def test_private_acl_survives_broad_parent_and_replacement(tmp_path):
 @WINDOWS
 @pytest.mark.parametrize("rule", ["D:NO_ACCESS_CONTROL", "D:P(A;;FA;;;WD)"])
 def test_unsafe_existing_token_is_rejected_without_modification(tmp_path, rule):
-    from huddol.adapters.windows import current_user_sid
+    from fora.adapters.windows import current_user_sid
 
     path = tmp_path / "token"
     path.write_text("test-token-value", encoding="utf-8")
@@ -137,7 +137,7 @@ def test_unsafe_existing_token_is_rejected_without_modification(tmp_path, rule):
 def test_replace_failure_preserves_original_and_removes_temporary(
     tmp_path, monkeypatch
 ):
-    from huddol.adapters import windows_files
+    from fora.adapters import windows_files
 
     path = tmp_path / "private"
     write_private(path, "original-test-value")
@@ -154,10 +154,10 @@ def test_replace_failure_preserves_original_and_removes_temporary(
 
 @WINDOWS
 def test_creation_failure_does_not_remove_existing_file(tmp_path, monkeypatch):
-    from huddol.adapters import windows_files
+    from fora.adapters import windows_files
 
     path = tmp_path / "private"
-    occupied = tmp_path / ".private.fixed.huddol-tmp"
+    occupied = tmp_path / ".private.fixed.fora-tmp"
     occupied.write_text("existing-test-value", encoding="utf-8")
     monkeypatch.setattr(windows_files.secrets, "token_hex", lambda count: "fixed")
     with pytest.raises(FileExistsError):
@@ -174,7 +174,7 @@ def test_private_token_can_be_reloaded(tmp_path):
 
 @WINDOWS
 def test_restricted_subject_cannot_modify_private_file(tmp_path):
-    from huddol.adapters.execution.local import LocalExecution
+    from fora.adapters.execution.local import LocalExecution
 
     path = tmp_path / "private"
     write_private(path, "test-private-content")
@@ -197,7 +197,7 @@ def test_restricted_subject_cannot_modify_private_file(tmp_path):
 
 @WINDOWS
 def test_read_validation_and_reading_keep_the_same_file(tmp_path, monkeypatch):
-    from huddol.adapters import windows_files
+    from fora.adapters import windows_files
 
     path = tmp_path / "private"
     replacement = tmp_path / "replacement"

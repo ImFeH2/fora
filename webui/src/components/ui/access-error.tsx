@@ -29,16 +29,16 @@ export function AccessError({
     "invalid_connection",
   ].includes(error.code);
   const title = loadingData
-    ? "Could not load Huddol"
+    ? "Could not load Fora"
     : authentication
-      ? "Access to Huddol requires authentication"
+      ? "Access to Fora requires authentication"
       : startup
-        ? "Unable to start Huddol"
+        ? "Unable to start Fora"
         : error.code === "protocol_error"
-          ? "Huddol sent an invalid response"
+          ? "Fora sent an invalid response"
           : preparation
             ? "Unable to prepare the connection"
-            : "Could not connect to Huddol";
+            : "Could not connect to Fora";
 
   return (
     <main className="flex h-dvh w-full overflow-auto bg-surface p-6">
@@ -57,12 +57,12 @@ export function AccessError({
             <p className="whitespace-pre-wrap">{error.message}</p>
             {authentication ? (
               <p>
-                Open Huddol from the application, or use the access link
-                provided when Huddol starts. That link includes the credentials
-                needed to connect.
+                Open Fora from the application, or use the access link provided
+                when Fora starts. That link includes the credentials needed to
+                connect.
               </p>
             ) : startup ? (
-              <p>Close this window and start Huddol again.</p>
+              <p>Close this window and start Fora again.</p>
             ) : reconnect ? (
               <div className="flex flex-wrap items-center gap-2 pt-1">
                 <Button onClick={reconnect} disabled={waiting}>

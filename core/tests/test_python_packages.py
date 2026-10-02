@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from huddol.runtime_info import RuntimeInfo
+from fora.runtime_info import RuntimeInfo
 
 
 @pytest.fixture
@@ -32,7 +32,7 @@ def stdio_check(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     def check(ready: Any) -> None:
         @contextmanager
         def kernel(module: str, directory: Path, *arguments: str):
-            assert module == "huddol"
+            assert module == "fora"
             assert directory == tmp_path
             assert arguments == ("--transport", "stdio")
             yield process, frames, ready

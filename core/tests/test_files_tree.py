@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from huddol.adapters.files.tree import DirectoryTree, content_hash
-from huddol.core.errors import DomainError
-from huddol.ports.files import ConflictError
+from fora.adapters.files.tree import DirectoryTree, content_hash
+from fora.core.errors import DomainError
+from fora.ports.files import ConflictError
 
 
 @pytest.fixture

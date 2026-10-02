@@ -43,18 +43,18 @@ from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.usage import RequestUsage
 
-from huddol.adapters.model.config import ModelConfig, thinking_settings
-from huddol.adapters.model.observability import ObservabilityConfig
-from huddol.adapters.model.prompt import SYSTEM_PROMPT
-from huddol.adapters.model.runner import (
+from fora.adapters.model.config import ModelConfig, thinking_settings
+from fora.adapters.model.observability import ObservabilityConfig
+from fora.adapters.model.prompt import SYSTEM_PROMPT
+from fora.adapters.model.runner import (
     UNAVAILABLE,
     LiveModel,
     PydanticModelRunner,
     is_context_exceeded,
 )
-from huddol.core.attachment import ImageData, ViewedImage
-from huddol.core.errors import DomainError
-from huddol.runtime.reminder import (
+from fora.core.attachment import ImageData, ViewedImage
+from fora.core.errors import DomainError
+from fora.runtime.reminder import (
     HistoryPersistenceError,
     Reminder,
     ReminderItem,
@@ -156,23 +156,21 @@ def assert_settlement(message, calls) -> None:
 
 
 def cache_key(messages) -> str:
-    key = messages[0].metadata["huddol"]["cache_key"]
+    key = messages[0].metadata["fora"]["cache_key"]
     assert re.fullmatch(r"[0-9a-f]{32}", key)
     return key
 
 
 def without_cache_key(messages) -> list:
     first = messages[0]
-    huddol = {
+    fora = {
         name: value
-        for name, value in first.metadata["huddol"].items()
+        for name, value in first.metadata["fora"].items()
         if name != "cache_key"
     }
-    metadata = {
-        name: value for name, value in first.metadata.items() if name != "huddol"
-    }
-    if huddol:
-        metadata["huddol"] = huddol
+    metadata = {name: value for name, value in first.metadata.items() if name != "fora"}
+    if fora:
+        metadata["fora"] = fora
     return [replace(first, metadata=metadata or None), *messages[1:]]
 
 
@@ -363,7 +361,7 @@ def test_each_response_persists_the_complete_history_without_ephemeral(
     assert "without a confirmed result" not in persisted[-1]
     assert second[-1] == responses[1]
     assert second[-2].metadata == {
-        "huddol": {"block": "durable", "environment": "environment B"}
+        "fora": {"block": "durable", "environment": "environment B"}
     }
     assert second[-3].parts == [
         ToolReturnPart(
@@ -375,7 +373,7 @@ def test_each_response_persists_the_complete_history_without_ephemeral(
     ]
     assert first[0].parts[0].content == original.resident
     assert first[0].metadata == {
-        "huddol": {
+        "fora": {
             "block": "resident",
             "agents_instructions": None,
             "environment": "environment A",
@@ -731,7 +729,7 @@ def test_resident_is_inserted_only_for_empty_history(settings) -> None:
     assert len(messages) == 3
     assert messages[0].parts[0].content == original.resident
     assert messages[0].metadata == {
-        "huddol": {
+        "fora": {
             "block": "resident",
             "agents_instructions": None,
             "environment": "environment A",
@@ -753,7 +751,7 @@ def test_history_is_never_trimmed_by_its_byte_length(settings) -> None:
     history = [
         ModelRequest(
             parts=[UserPromptPart("旧记忆😀" * 20)],
-            metadata={"huddol": {"block": "resident", "environment": "environment A"}},
+            metadata={"fora": {"block": "resident", "environment": "environment A"}},
         ),
         ModelResponse(parts=[TextPart("Old response")]),
     ]
@@ -804,7 +802,7 @@ def test_durable_changes_are_persisted_once_and_survive_runner_restarts(
     assert (outcome.error is not None) == fail
     saved = ModelMessagesTypeAdapter.validate_json(outcome.messages_json)
     assert saved[0].metadata == {
-        "huddol": {
+        "fora": {
             "block": "resident",
             "agents_instructions": None,
             "environment": initial or "",
@@ -815,7 +813,7 @@ def test_durable_changes_are_persisted_once_and_survive_runner_restarts(
         message
         for message in saved
         if message.metadata
-        and message.metadata.get("huddol", {}).get("block") == "durable"
+        and message.metadata.get("fora", {}).get("block") == "durable"
     ]
     assert len(durable) == 1
     assert (
@@ -823,7 +821,7 @@ def test_durable_changes_are_persisted_once_and_survive_runner_restarts(
         == "The execution environment changed.\nenvironment B"
     )
     assert durable[0].metadata == {
-        "huddol": {"block": "durable", "environment": "environment B"}
+        "fora": {"block": "durable", "environment": "environment B"}
     }
     assert [
         sum(
@@ -1282,7 +1280,7 @@ def test_a_window_without_a_cache_key_receives_one_on_its_next_turn(
     outcome = runner.run(replace(request(), history_json=raw), None)
     saved = ModelMessagesTypeAdapter.validate_json(outcome.messages_json)
     key = cache_key(saved)
-    assert saved[0].metadata == {"huddol": {"cache_key": key}}
+    assert saved[0].metadata == {"fora": {"cache_key": key}}
     assert without_cache_key(saved)[:2] == history
     again = runner.run(replace(request(), history_json=outcome.messages_json), None)
     assert cache_key(ModelMessagesTypeAdapter.validate_json(again.messages_json)) == key
@@ -1546,7 +1544,7 @@ def test_view_image_returns_native_binary_content_and_preserves_history(settings
 def test_search_failures_continue_past_retry_budget(
     settings, monkeypatch, caplog, kind
 ):
-    from huddol.adapters.model import runner as module
+    from fora.adapters.model import runner as module
 
     executions = []
     received = []
@@ -1672,7 +1670,7 @@ def test_execution_domain_failures_do_not_replay_writes(settings, code):
 def test_failed_and_successful_batch_calls_pair_and_keep_context(
     settings, monkeypatch, caplog, parallel
 ):
-    from huddol.adapters.model import runner as module
+    from fora.adapters.model import runner as module
 
     entered = []
     received = []
@@ -1744,7 +1742,7 @@ def test_failed_and_successful_batch_calls_pair_and_keep_context(
     ],
 )
 def test_tool_boundary_preserves_control_flow(error, asynchronous):
-    from huddol.adapters.model.runner import _tool_boundary
+    from fora.adapters.model.runner import _tool_boundary
 
     def sync_function(value: int) -> int:
         raise error
@@ -1800,7 +1798,7 @@ def test_tool_validation_still_returns_correctable_feedback(settings):
 def test_non_tool_faults_are_not_tool_failures(settings, monkeypatch, stage):
     from pydantic_ai.toolsets.function import FunctionToolset
 
-    from huddol.adapters.model import runner as module
+    from fora.adapters.model import runner as module
 
     executions = []
 
@@ -1924,7 +1922,7 @@ def test_real_search_registration_handles_client_error(settings, monkeypatch):
 def test_tool_context_does_not_leak_between_concurrent_turns(settings, caplog):
     from concurrent.futures import ThreadPoolExecutor
 
-    from huddol.adapters.model import runner as module
+    from fora.adapters.model import runner as module
 
     barrier = threading.Barrier(2)
     seen = []
@@ -1971,7 +1969,7 @@ def test_tool_context_does_not_leak_between_concurrent_turns(settings, caplog):
 
 
 def test_runner_does_not_convert_tool_cancellation_to_failure(settings):
-    from huddol.adapters.model import runner as module
+    from fora.adapters.model import runner as module
 
     class Tools:
         def list_members(self):
@@ -1993,7 +1991,7 @@ def test_initial_snapshot_persistence_failure_prevents_model_creation(settings):
 
     def fail(raw):
         snapshot = ModelMessagesTypeAdapter.validate_json(raw)[0]
-        assert snapshot.metadata["huddol"]["agents_instructions"] == "raw\n "
+        assert snapshot.metadata["fora"]["agents_instructions"] == "raw\n "
         raise OSError("snapshot disk unavailable")
 
     runner = PydanticModelRunner(
@@ -2368,7 +2366,7 @@ def test_responses_conversion_uses_copies_and_preserves_ephemeral_and_settings(
 def test_old_or_null_window_snapshot_never_uses_new_turn_value(settings, metadata):
     seen = []
     history = [
-        ModelRequest(parts=[UserPromptPart("resident")], metadata={"huddol": metadata})
+        ModelRequest(parts=[UserPromptPart("resident")], metadata={"fora": metadata})
     ]
 
     def respond(messages, info):
@@ -2404,7 +2402,7 @@ def test_first_model_request_failure_preserves_snapshot(settings):
     )
     assert outcome.error == "RuntimeError: first request failed"
     resident = ModelMessagesTypeAdapter.validate_json(outcome.messages_json)[0]
-    assert resident.metadata["huddol"]["agents_instructions"] == "raw\n "
+    assert resident.metadata["fora"]["agents_instructions"] == "raw\n "
     assert resident == ModelMessagesTypeAdapter.validate_json(persisted[0])[0]
 
 

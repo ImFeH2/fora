@@ -40,6 +40,6 @@ describe("Langfuse settings", () => {
     expect(enabledId).toBeDefined();
     expect(html).toContain(`for="${enabledId}"`);
     expect(html).not.toContain('role="alert"');
-    expect(html).not.toContain("Restart Huddol");
+    expect(html).not.toContain("Restart Fora");
   });
 });

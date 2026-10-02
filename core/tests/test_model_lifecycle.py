@@ -7,11 +7,11 @@ from pathlib import Path
 import pytest
 from pydantic_ai.models import override_allow_model_requests
 
-from huddol.adapters.model.config import API_TYPES
-from huddol.adapters.model.runner import PydanticModelRunner, build_model
-from huddol.adapters.sqlite.agent import SqliteAgentStore
-from huddol.adapters.sqlite.store import SqliteStore
-from huddol.runtime.reminder import TurnRequest
+from fora.adapters.model.config import API_TYPES
+from fora.adapters.model.runner import PydanticModelRunner, build_model
+from fora.adapters.sqlite.agent import SqliteAgentStore
+from fora.adapters.sqlite.store import SqliteStore
+from fora.runtime.reminder import TurnRequest
 
 
 @pytest.mark.parametrize("api_type", API_TYPES)
@@ -19,7 +19,7 @@ from huddol.runtime.reminder import TurnRequest
 def test_turn_clients_are_isolated_and_closed_on_failure(
     tmp_path: Path, api_type: str, concurrent: bool
 ) -> None:
-    base = SqliteStore(tmp_path / "huddol.sqlite3")
+    base = SqliteStore(tmp_path / "fora.sqlite3")
     settings = SqliteAgentStore(base._db)
     settings.set_settings(
         "model",

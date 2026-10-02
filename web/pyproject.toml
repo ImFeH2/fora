@@ -1,13 +1,13 @@
 [project]
-name = "huddol-web"
+name = "fora-web"
 version = "0.0.8"
-description = "Browser interface for Huddol."
+description = "Browser interface for Fora."
 requires-python = ">=3.13"
 authors = [{ name = "ImFeH2", email = "i@feh2.im" }]
-dependencies = ["huddol==0.0.8"]
+dependencies = ["fora==0.0.8"]
 
 [project.scripts]
-huddol-web = "huddol_web.__main__:run"
+fora-web = "fora_web.__main__:run"
 
 [build-system]
 requires = ["uv_build>=0.11.16,<0.12.0"]

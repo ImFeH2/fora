@@ -458,8 +458,8 @@ export default function App() {
   } else if (!loaded) {
     body = (
       <div className="flex flex-col items-center justify-center gap-3 h-screen bg-surface">
-        <Spinner label="Starting Huddol" />
-        <p className="text-fg-muted">Starting Huddol…</p>
+        <Spinner label="Starting Fora" />
+        <p className="text-fg-muted">Starting Fora…</p>
       </div>
     );
   } else {

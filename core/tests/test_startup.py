@@ -12,8 +12,8 @@ from test_sidecar_process import Client, Kernel, wait_for_persisted_turn
 
 pytest_plugins = ("test_sidecar_process",)
 
-from huddol.adapters.sqlite.agent import SqliteAgentStore
-from huddol.adapters.sqlite.store import SqliteStore
+from fora.adapters.sqlite.agent import SqliteAgentStore
+from fora.adapters.sqlite.store import SqliteStore
 
 
 def free_port() -> int:
@@ -24,13 +24,13 @@ def free_port() -> int:
 
 def frontend(directory: Path) -> Path:
     (directory / "assets").mkdir(parents=True)
-    (directory / "index.html").write_text("<!doctype html><title>Huddol</title>")
+    (directory / "index.html").write_text("<!doctype html><title>Fora</title>")
     return directory
 
 
 def stored_setting(directory: Path, section: str, raw: str) -> None:
     directory.mkdir(parents=True, exist_ok=True)
-    store = SqliteStore(directory / "huddol.sqlite3")
+    store = SqliteStore(directory / "fora.sqlite3")
     try:
         SqliteAgentStore(store._db)
         with store._db:
@@ -60,7 +60,7 @@ def test_invalid_settings_fail_before_ready(tmp_path, raw, transport) -> None:
     assert b"private-value" not in result.stderr
     assert not (directory / "run.json").exists()
     assert not (directory / "token").exists()
-    with closing(sqlite3.connect(directory / "huddol.sqlite3")) as connection:
+    with closing(sqlite3.connect(directory / "fora.sqlite3")) as connection:
         assert connection.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0] == 0
         assert (
             connection.execute(
@@ -79,9 +79,9 @@ def test_startup_failure_releases_created_resources(
 ) -> None:
     import logging
 
-    import huddol.__main__ as entry
-    from huddol.adapters.execution.manager import ExecutionManager
-    from huddol.core.errors import DomainError
+    import fora.__main__ as entry
+    from fora.adapters.execution.manager import ExecutionManager
+    from fora.core.errors import DomainError
 
     directory = tmp_path / "data"
     stored_setting(directory, section, raw)
@@ -126,7 +126,7 @@ def test_backup_repair_and_restart_preserve_safety_state(
 ) -> None:
     directory = tmp_path / "data"
     stored_setting(directory, "agent", raw)
-    store = SqliteStore(directory / "huddol.sqlite3")
+    store = SqliteStore(directory / "fora.sqlite3")
     try:
         history = SqliteAgentStore(store._db)
         history.set_settings("model", local_model)
@@ -139,7 +139,7 @@ def test_backup_repair_and_restart_preserve_safety_state(
         store.set_agent_state(paused.id, "paused")
     finally:
         store.close()
-    with closing(sqlite3.connect(directory / "huddol.sqlite3")) as source:
+    with closing(sqlite3.connect(directory / "fora.sqlite3")) as source:
         with closing(sqlite3.connect(tmp_path / "backup.sqlite3")) as backup:
             source.backup(backup)
         with source:
@@ -166,7 +166,7 @@ def test_backup_repair_and_restart_preserve_safety_state(
             ).fetchone()[0]
             == raw
         )
-    store = SqliteStore(directory / "huddol.sqlite3")
+    store = SqliteStore(directory / "fora.sqlite3")
     try:
         history = SqliteAgentStore(store._db)
         assert len(history.runs(ready.id)) == 3
@@ -187,14 +187,14 @@ def test_scheduler_failure_keeps_http_and_settings_diagnostics(tmp_path, raw) ->
         webui_directory=frontend(tmp_path / "webui"),
     ) as kernel:
         with (
-            closing(sqlite3.connect(directory / "huddol.sqlite3")) as connection,
+            closing(sqlite3.connect(directory / "fora.sqlite3")) as connection,
             connection,
         ):
             connection.execute(
                 "INSERT INTO settings (section, values_json) VALUES ('agent', ?)",
                 (raw,),
             )
-        log_path = directory / "logs" / "huddol.log"
+        log_path = directory / "logs" / "fora.log"
         deadline = time.monotonic() + 10
         while "Scheduler stopped after a runtime failure" not in log_path.read_text():
             assert time.monotonic() < deadline
@@ -219,11 +219,11 @@ def test_scheduler_failure_keeps_http_and_settings_diagnostics(tmp_path, raw) ->
 def test_database_initialization_failure_closes_connection_before_ready(
     tmp_path, monkeypatch, capsys, stage
 ) -> None:
-    import huddol.__main__ as entry
+    import fora.__main__ as entry
 
     directory = tmp_path / "data"
     directory.mkdir()
-    path = directory / "huddol.sqlite3"
+    path = directory / "fora.sqlite3"
     base = SqliteStore(path)
     history = SqliteAgentStore(base._db)
     run = history.start_run(7)
@@ -310,7 +310,7 @@ def test_database_initialization_failure_closes_connection_before_ready(
         connections[0].execute("SELECT 1")
     assert capsys.readouterr().out == ""
     assert not (directory / "run.json").exists()
-    assert "Listening" not in (directory / "logs" / "huddol.log").read_text()
+    assert "Listening" not in (directory / "logs" / "fora.log").read_text()
     monkeypatch.setattr(sqlite3, "connect", connect)
     with closing(connect(path)) as connection:
         indexes = connection.execute(
@@ -344,9 +344,9 @@ def test_explicit_options_override_the_environment(tmp_path: Path) -> None:
     with Kernel(
         from_environment,
         env={
-            "HUDDOL_PORT": "0",
-            "HUDDOL_TOKEN": "from-environment",
-            "HUDDOL_WEBUI_DIR": str(tmp_path / "environment-webui"),
+            "FORA_PORT": "0",
+            "FORA_TOKEN": "from-environment",
+            "FORA_WEBUI_DIR": str(tmp_path / "environment-webui"),
         },
         arguments=[
             "--data-dir",
@@ -359,7 +359,7 @@ def test_explicit_options_override_the_environment(tmp_path: Path) -> None:
     ) as kernel:
         assert kernel.ready["port"] == port
         assert kernel.ready["token"] == "explicit"
-        assert (explicit / "huddol.sqlite3").is_file()
+        assert (explicit / "fora.sqlite3").is_file()
         assert not from_environment.exists()
         assert kernel.shutdown() == 0, kernel.stderr
 
@@ -368,20 +368,20 @@ def test_the_webui_directory_option_replaces_the_environment(tmp_path: Path) -> 
     served = frontend(tmp_path / "served")
     with Kernel(
         tmp_path / "data",
-        env={"HUDDOL_WEBUI_DIR": str(tmp_path / "ignored")},
+        env={"FORA_WEBUI_DIR": str(tmp_path / "ignored")},
         arguments=["--webui-dir", str(served)],
     ) as kernel:
         status, content_type, body = kernel.http("/")
         assert status == 200
         assert content_type == "text/html; charset=utf-8"
-        assert b"Huddol" in body
+        assert b"Fora" in body
         assert kernel.shutdown() == 0, kernel.stderr
 
 
 def test_core_without_a_frontend_serves_only_the_websocket_endpoint(
     tmp_path: Path,
 ) -> None:
-    with Kernel(tmp_path / "data", env={"HUDDOL_WEBUI_DIR": ""}) as kernel:
+    with Kernel(tmp_path / "data", env={"FORA_WEBUI_DIR": ""}) as kernel:
         assert kernel.http("/")[0] == 404
         assert kernel.http("/assets/app.js")[0] == 404
         assert kernel.http("/ws")[0] == 401
@@ -444,7 +444,7 @@ def test_the_default_transport_is_websocket(
     tmp_path: Path, arguments: list[str]
 ) -> None:
     with Kernel(
-        tmp_path / "data", env={"HUDDOL_WEBUI_DIR": ""}, arguments=arguments
+        tmp_path / "data", env={"FORA_WEBUI_DIR": ""}, arguments=arguments
     ) as kernel:
         assert kernel.ready["type"] == "ready"
         assert "port" in kernel.ready

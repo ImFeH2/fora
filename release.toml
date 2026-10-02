@@ -9,7 +9,7 @@ pre-release-replacements = [
   { file = "../webui/package.json", search = '"version": "[^"]+"', replace = '"version": "{{version}}"', exactly = 1 },
   { file = "../core/pyproject.toml", search = '(?m)^version = "[^"]+"', replace = 'version = "{{version}}"', exactly = 1 },
   { file = "../web/pyproject.toml", search = '(?m)^version = "[^"]+"', replace = 'version = "{{version}}"', exactly = 1 },
-  { file = "../web/pyproject.toml", search = 'huddol==[^"]+', replace = "huddol=={{version}}", exactly = 1 },
+  { file = "../web/pyproject.toml", search = 'fora==[^"]+', replace = "fora=={{version}}", exactly = 1 },
 ]
 
 tag-name = "v{{version}}"

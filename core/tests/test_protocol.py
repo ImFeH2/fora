@@ -26,25 +26,25 @@ from pydantic_ai.messages import (
 )
 from websockets.sync.client import connect
 
-from huddol.adapters.execution.manager import ExecutionManager
-from huddol.adapters.files.tree import DirectoryTree
-from huddol.adapters.files.uploads import DirectoryUploads, decode_image
-from huddol.adapters.jsonl.api import HUMAN_ID, Api
-from huddol.adapters.jsonl.protocol import Dispatcher, parse, wait_for_shutdown
-from huddol.adapters.model.config import ModelCatalog
-from huddol.adapters.model.runner import PydanticModelRunner
-from huddol.adapters.sqlite.agent import SqliteAgentStore
-from huddol.adapters.sqlite.store import SqliteStore
-from huddol.adapters.voice.config import VoiceConfig
-from huddol.adapters.voice.endpoint import VoiceEndpoint
-from huddol.adapters.voice.remote import RemoteRecording
-from huddol.adapters.websocket.server import WebServer
-from huddol.core.errors import DomainError
-from huddol.core.parameters import AgentParameters
-from huddol.runtime.scheduler import Scheduler
-from huddol.services.uploads import Uploads
-from huddol.tools import Dependencies
-from huddol.tools.authorize import Authorizer
+from fora.adapters.execution.manager import ExecutionManager
+from fora.adapters.files.tree import DirectoryTree
+from fora.adapters.files.uploads import DirectoryUploads, decode_image
+from fora.adapters.jsonl.api import HUMAN_ID, Api
+from fora.adapters.jsonl.protocol import Dispatcher, parse, wait_for_shutdown
+from fora.adapters.model.config import ModelCatalog
+from fora.adapters.model.runner import PydanticModelRunner
+from fora.adapters.sqlite.agent import SqliteAgentStore
+from fora.adapters.sqlite.store import SqliteStore
+from fora.adapters.voice.config import VoiceConfig
+from fora.adapters.voice.endpoint import VoiceEndpoint
+from fora.adapters.voice.remote import RemoteRecording
+from fora.adapters.websocket.server import WebServer
+from fora.core.errors import DomainError
+from fora.core.parameters import AgentParameters
+from fora.runtime.scheduler import Scheduler
+from fora.services.uploads import Uploads
+from fora.tools import Dependencies
+from fora.tools.authorize import Authorizer
 
 
 class Capture:
@@ -77,7 +77,7 @@ class Probe:
 
 @pytest.fixture
 def server(tmp_path: Path):
-    store = SqliteStore(tmp_path / "huddol.sqlite3")
+    store = SqliteStore(tmp_path / "fora.sqlite3")
     agent_store = SqliteAgentStore(store._db)
     store.create_member("human", "You")
 
@@ -1920,7 +1920,7 @@ class RealtimeClient:
 def test_remote_recording_streams_pcm_and_waits_for_commit_and_transcript(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from huddol.adapters.voice import remote
+    from fora.adapters.voice import remote
 
     client = RealtimeClient()
     monkeypatch.setattr(remote.aiohttp, "ClientSession", lambda **kwargs: client)
@@ -1973,7 +1973,7 @@ def test_remote_recording_streams_pcm_and_waits_for_commit_and_transcript(
 def test_webserver_stop_closes_remote_recording_resources(
     monkeypatch: pytest.MonkeyPatch, phase: str
 ) -> None:
-    from huddol.adapters.voice import remote
+    from fora.adapters.voice import remote
 
     clients: list[RealtimeClient] = []
     client_created = threading.Event()
@@ -2044,7 +2044,7 @@ def test_webserver_stop_closes_remote_recording_resources(
 def test_server_stop_closes_every_active_remote_recording(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from huddol.adapters.voice import remote
+    from fora.adapters.voice import remote
 
     clients: list[RealtimeClient] = []
     client_created = threading.Event()
@@ -2117,7 +2117,7 @@ def test_server_stop_closes_every_active_remote_recording(
 def test_remote_failure_allows_a_new_recording_on_the_same_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from huddol.adapters.voice import remote
+    from fora.adapters.voice import remote
 
     clients: list[RealtimeClient] = []
     client_created = threading.Event()
@@ -2208,7 +2208,7 @@ def test_remote_failure_allows_a_new_recording_on_the_same_connection(
 def test_remote_recording_cancel_closes_upstream_and_discards_late_events(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from huddol.adapters.voice import remote
+    from fora.adapters.voice import remote
 
     client = RealtimeClient()
     monkeypatch.setattr(remote.aiohttp, "ClientSession", lambda **kwargs: client)

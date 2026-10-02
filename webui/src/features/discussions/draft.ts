@@ -29,7 +29,7 @@ interface DraftDatabase extends DBSchema {
   drafts: { key: string; value: Draft };
 }
 const database = () =>
-  openDB<DraftDatabase>("huddol-drafts", 1, {
+  openDB<DraftDatabase>("fora-drafts", 1, {
     upgrade(db) {
       db.createObjectStore("drafts", { keyPath: "key" });
     },
@@ -42,21 +42,21 @@ function tabId() {
     const claim = (id: string) => {
       void navigator.locks
         .request(
-          `huddol-draft-tab:${id}`,
+          `fora-draft-tab:${id}`,
           { ifAvailable: true },
           async (lock) => {
             if (!lock) {
               claim(crypto.randomUUID());
               return;
             }
-            sessionStorage.setItem("huddol.draft-tab", id);
+            sessionStorage.setItem("fora.draft-tab", id);
             resolve(id);
             await new Promise<void>(() => {});
           },
         )
         .catch(reject);
     };
-    claim(sessionStorage.getItem("huddol.draft-tab") ?? crypto.randomUUID());
+    claim(sessionStorage.getItem("fora.draft-tab") ?? crypto.randomUUID());
   });
   return tab;
 }
@@ -679,7 +679,7 @@ function controllerFor(discussion: number) {
           .sort((a, b) => b.updatedAt - a.updatedAt);
         for (const candidate of candidates) {
           stored = await navigator.locks.request(
-            `huddol-draft-tab:${candidate.key.slice(prefix.length)}`,
+            `fora-draft-tab:${candidate.key.slice(prefix.length)}`,
             { ifAvailable: true },
             async (lock) => {
               if (!lock) return undefined;

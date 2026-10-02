@@ -54,7 +54,7 @@ describe("SidebarBrand", () => {
       icon.match(/<img\b[^>]*src="([^"]*)"/)?.[1],
     );
     expect(html).toMatch(/<img\b[^>]*alt=""/);
-    expect(html).toMatch(/<span\b[^>]*>Huddol<\/span>/);
+    expect(html).toMatch(/<span\b[^>]*>Fora<\/span>/);
     expect(html).not.toMatch(/Members?|running/);
     expect(html).not.toMatch(/<(?:button|a)\b|tabindex=|aria-label=/);
   });

@@ -1,3 +1,3 @@
 fn main() {
-    println!("Huddol CLI");
+    println!("Fora CLI");
 }

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from huddol.core.turn import idle_streak, is_productive
+from fora.core.turn import idle_streak, is_productive
 
 
 def test_only_send_edit_and_run_count_as_output() -> None:

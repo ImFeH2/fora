@@ -19,7 +19,7 @@ pub struct Launcher {
 }
 
 pub fn launcher(development: bool, project: &Path, resources: &Path) -> Launcher {
-    let env = vec![("HUDDOL_PORT".to_string(), "0".to_string())];
+    let env = vec![("FORA_PORT".to_string(), "0".to_string())];
     if development {
         let parent = project.parent().expect("the core project has a parent");
         Launcher {
@@ -30,7 +30,7 @@ pub fn launcher(development: bool, project: &Path, resources: &Path) -> Launcher
                 project.to_string_lossy().into_owned(),
                 "python".into(),
                 "-m".into(),
-                "huddol".into(),
+                "fora".into(),
                 "--webui-dir".into(),
                 parent.join("webui/dist").to_string_lossy().into_owned(),
             ],
@@ -39,9 +39,9 @@ pub fn launcher(development: bool, project: &Path, resources: &Path) -> Launcher
     } else {
         Launcher {
             program: resources.join(if cfg!(windows) {
-                "core/huddol.exe"
+                "core/fora.exe"
             } else {
-                "core/huddol"
+                "core/fora"
             }),
             args: Vec::new(),
             env,
@@ -90,7 +90,7 @@ pub(crate) fn spawn_kernel(launcher: Launcher) -> Result<(Child, Ready), String>
     }
     let mut child = command
         .spawn()
-        .map_err(|error| format!("Failed to start Huddol: {error}"))?;
+        .map_err(|error| format!("Failed to start Fora: {error}"))?;
     let stdout = child.stdout.take().expect("stdout is piped");
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
@@ -100,8 +100,8 @@ pub(crate) fn spawn_kernel(launcher: Launcher) -> Result<(Child, Ready), String>
     });
     let ready = match receiver.recv_timeout(READY_TIMEOUT) {
         Ok(Some(line)) => parse_ready(&line),
-        Ok(None) => Err("Huddol exited before it was ready".to_string()),
-        Err(_) => Err("Huddol did not start within 30 seconds".to_string()),
+        Ok(None) => Err("Fora exited before it was ready".to_string()),
+        Err(_) => Err("Fora did not start within 30 seconds".to_string()),
     };
     match ready {
         Ok(ready) => Ok((child, ready)),

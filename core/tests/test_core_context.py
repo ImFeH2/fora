@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from huddol.core.context import advance_watermark, context_window
-from huddol.core.discussion import Message
+from fora.core.context import advance_watermark, context_window
+from fora.core.discussion import Message
 
 AGENT = 13
 ALICE = 1

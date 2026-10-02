@@ -419,7 +419,7 @@ const DIAGNOSIS_TIMEOUT = 5_000;
 export async function diagnoseConnection(url: string): Promise<BackendError> {
   const failure = new BackendError(
     "connection_failed",
-    "Check that Huddol is running, then reconnect.",
+    "Check that Fora is running, then reconnect.",
     true,
   );
   const endpoint = new URL(url);
@@ -502,7 +502,7 @@ export function withoutConnectionParams(href: string): string {
   return url.toString();
 }
 
-const STORAGE_KEY = "huddol.connection";
+const STORAGE_KEY = "fora.connection";
 
 function recall(): string | null {
   try {
@@ -510,7 +510,7 @@ function recall(): string | null {
   } catch {
     throw new BackendError(
       "storage_read_failed",
-      "Could not read browser session storage. Allow session storage, then reopen Huddol from its original launch entry.",
+      "Could not read browser session storage. Allow session storage, then reopen Fora from its original launch entry.",
       true,
     );
   }
@@ -522,7 +522,7 @@ function remember(url: string): void {
   } catch {
     throw new BackendError(
       "storage_write_failed",
-      "Could not save the connection in browser session storage. Allow session storage, then reopen Huddol from its original launch entry.",
+      "Could not save the connection in browser session storage. Allow session storage, then reopen Fora from its original launch entry.",
       true,
     );
   }
@@ -541,7 +541,7 @@ function pageConnection(): Connection {
     } catch {
       throw new BackendError(
         "url_cleanup_failed",
-        "Could not clear connection parameters from the address. Close this page and reopen Huddol from its original launch entry.",
+        "Could not clear connection parameters from the address. Close this page and reopen Fora from its original launch entry.",
         true,
       );
     }
@@ -553,7 +553,7 @@ function pageConnection(): Connection {
   } catch {
     throw new BackendError(
       "invalid_connection",
-      "The connection address is invalid. Reopen Huddol from its original launch entry.",
+      "The connection address is invalid. Reopen Fora from its original launch entry.",
       true,
     );
   }
@@ -678,7 +678,7 @@ export class Backend {
           this.#disconnect(
             new BackendError(
               "protocol_error",
-              "Huddol received an invalid WebSocket message. Reopen Huddol to reconnect. Check pending operations before trying them again.",
+              "Fora received an invalid WebSocket message. Reopen Fora to reconnect. Check pending operations before trying them again.",
               true,
             ),
           );
@@ -746,7 +746,7 @@ export class Backend {
           ? error
           : new BackendError(
               "connection_failed",
-              "Could not open the connection. Reopen the Huddol link.",
+              "Could not open the connection. Reopen the Fora link.",
               true,
             ),
       );

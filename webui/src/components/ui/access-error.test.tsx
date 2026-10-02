@@ -48,11 +48,11 @@ afterAll(() => {
 
 describe("AccessError", () => {
   it.each([
-    ["authentication_missing", "Access to Huddol requires authentication"],
-    ["authentication_failed", "Access to Huddol requires authentication"],
-    ["startup_failed", "Unable to start Huddol"],
-    ["connection_failed", "Could not connect to Huddol"],
-    ["protocol_error", "Huddol sent an invalid response"],
+    ["authentication_missing", "Access to Fora requires authentication"],
+    ["authentication_failed", "Access to Fora requires authentication"],
+    ["startup_failed", "Unable to start Fora"],
+    ["connection_failed", "Could not connect to Fora"],
+    ["protocol_error", "Fora sent an invalid response"],
     ["invalid_connection", "Unable to prepare the connection"],
   ] as const)(
     "renders the %s message with linked alert text",
@@ -131,7 +131,7 @@ describe("AccessError", () => {
       }),
     );
     expect(
-      testing.screen.getByText("Close this window and start Huddol again."),
+      testing.screen.getByText("Close this window and start Fora again."),
     ).toBeTruthy();
     expect(testing.screen.queryByRole("button")).toBeNull();
   });

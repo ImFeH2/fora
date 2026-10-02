@@ -9,15 +9,15 @@ from test_runtime import HELPER, HUMAN, MAIN, RecordingRunner, mention
 
 pytest_plugins = ("test_runtime",)
 
-from huddol.adapters.sqlite.agent import SqliteAgentStore
-from huddol.adapters.sqlite.store import (
+from fora.adapters.sqlite.agent import SqliteAgentStore
+from fora.adapters.sqlite.store import (
     PENDING_REVISION_SCHEMA,
     SCHEMA,
     LockedConnection,
     SqliteStore,
 )
-from huddol.runtime.reminder import TurnOutcome
-from huddol.runtime.scheduler import Scheduler
+from fora.runtime.reminder import TurnOutcome
+from fora.runtime.scheduler import Scheduler
 
 
 def completed(request, tools):

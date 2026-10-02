@@ -5,11 +5,11 @@ from test_runtime import HUMAN, MAIN, RecordingRunner, mention
 
 pytest_plugins = ("test_runtime",)
 
-from huddol.adapters.sqlite.agent import SqliteAgentStore
-from huddol.core.errors import DomainError
-from huddol.runtime.reminder import TurnOutcome
-from huddol.runtime.scheduler import Scheduler
-from huddol.tools.authorize import Actor
+from fora.adapters.sqlite.agent import SqliteAgentStore
+from fora.core.errors import DomainError
+from fora.runtime.reminder import TurnOutcome
+from fora.runtime.scheduler import Scheduler
+from fora.tools.authorize import Actor
 
 
 def outcome(calls=0, error=None):
@@ -106,7 +106,7 @@ def test_actual_tool_calls_include_retry_results_and_do_not_leak_between_turns(
     from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
     from pydantic_ai.models.function import FunctionModel
 
-    from huddol.adapters.model.runner import PydanticModelRunner
+    from fora.adapters.model.runner import PydanticModelRunner
 
     room = mention(world)
     world.settings.set_settings("agent", {"no_tool_turns_before_pause": 1})

@@ -10,17 +10,17 @@ from pydantic_ai import ModelMessagesTypeAdapter
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import FunctionModel
 
-from huddol.adapters.execution.manager import ExecutionManager
-from huddol.adapters.files.tree import DirectoryTree
-from huddol.adapters.files.uploads import decode_image
-from huddol.adapters.model.runner import PydanticModelRunner
-from huddol.adapters.sqlite.agent import SqliteAgentStore
-from huddol.adapters.sqlite.store import SqliteStore
-from huddol.core.errors import DomainError
-from huddol.ports.execution import EditResult, RunResult
-from huddol.runtime.reminder import Reminder, ReminderItem, TurnRequest
-from huddol.tools import AgentTools, Dependencies, TurnBinding
-from huddol.tools.authorize import Actor, Authorizer
+from fora.adapters.execution.manager import ExecutionManager
+from fora.adapters.files.tree import DirectoryTree
+from fora.adapters.files.uploads import decode_image
+from fora.adapters.model.runner import PydanticModelRunner
+from fora.adapters.sqlite.agent import SqliteAgentStore
+from fora.adapters.sqlite.store import SqliteStore
+from fora.core.errors import DomainError
+from fora.ports.execution import EditResult, RunResult
+from fora.runtime.reminder import Reminder, ReminderItem, TurnRequest
+from fora.tools import AgentTools, Dependencies, TurnBinding
+from fora.tools.authorize import Actor, Authorizer
 
 HUMAN = 1
 MAIN = 2
@@ -29,7 +29,7 @@ OTHER = 3
 
 @pytest.fixture
 def world(tmp_path: Path):
-    store = SqliteStore(tmp_path / "huddol.sqlite3")
+    store = SqliteStore(tmp_path / "fora.sqlite3")
     agent_store = SqliteAgentStore(store._db)
     store.create_member("human", "You")
     store.create_member("agent", "Main")
@@ -413,7 +413,7 @@ def test_discussion_list_orders_last_message_and_limits_after_filtering(
     rooms = []
 
     def send(room, stamp):
-        monkeypatch.setattr("huddol.adapters.sqlite.store.now", lambda: stamp)
+        monkeypatch.setattr("fora.adapters.sqlite.store.now", lambda: stamp)
         world.store.append_message(room, HUMAN, "@You @Main needle")
 
     for day in range(1, 26):
@@ -427,7 +427,7 @@ def test_discussion_list_orders_last_message_and_limits_after_filtering(
     human.archive_discussion(archived)
     hidden = world.store.create_discussion("Hidden", [OTHER])
     monkeypatch.setattr(
-        "huddol.adapters.sqlite.store.now", lambda: "2026-01-31T00:00:00Z"
+        "fora.adapters.sqlite.store.now", lambda: "2026-01-31T00:00:00Z"
     )
     world.store.append_message(hidden.id, OTHER, "needle")
     actor = tools_for(world, actor_id)
@@ -1185,7 +1185,7 @@ def test_tools_outside_a_turn_record_nothing(world) -> None:
 
 
 def test_an_acknowledging_turn_is_not_counted_as_productive(world) -> None:
-    from huddol.core.turn import is_productive
+    from fora.core.turn import is_productive
 
     author = tools_for(world, OTHER)
     discussion = author.create_discussion("Work", [MAIN])["id"]
@@ -1754,8 +1754,8 @@ def test_attachment_tools_check_membership_and_preserve_original(
 
     from PIL import Image
 
-    from huddol.adapters.files.uploads import DirectoryUploads
-    from huddol.services.uploads import Uploads
+    from fora.adapters.files.uploads import DirectoryUploads
+    from fora.services.uploads import Uploads
 
     world.uploads = Uploads(world.store, DirectoryUploads(tmp_path / "uploads"))
     human = tools_for(world, HUMAN)
@@ -1842,10 +1842,10 @@ def test_runner_persists_attachment_results_on_success_and_failure(
     from pydantic_ai.models.function import FunctionModel
     from test_runner import FakeSettings, model_values, request
 
-    from huddol.adapters.files.uploads import DirectoryUploads
-    from huddol.adapters.model.runner import PydanticModelRunner
-    from huddol.runtime.reminder import HistoryPersistenceError
-    from huddol.services.uploads import Uploads
+    from fora.adapters.files.uploads import DirectoryUploads
+    from fora.adapters.model.runner import PydanticModelRunner
+    from fora.runtime.reminder import HistoryPersistenceError
+    from fora.services.uploads import Uploads
 
     monkeypatch.setattr(models, "ALLOW_MODEL_REQUESTS", False)
     world.uploads = Uploads(world.store, DirectoryUploads(tmp_path / "uploads"))
@@ -1955,7 +1955,7 @@ def test_runner_persists_attachment_results_on_success_and_failure(
         messages_json=outcome.messages_json,
         error=outcome.error,
     )
-    restored = SqliteStore(tmp_path / "huddol.sqlite3")
+    restored = SqliteStore(tmp_path / "fora.sqlite3")
     try:
         raw = SqliteAgentStore(restored._db).latest_messages(MAIN)
         parts = image_parts(ModelMessagesTypeAdapter.validate_json(raw))

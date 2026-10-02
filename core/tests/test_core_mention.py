@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from huddol.core.errors import DomainError
-from huddol.core.member import Member, name_key, normalize_name, validate_name
-from huddol.core.mention import build_mentions, find_mention_ids
+from fora.core.errors import DomainError
+from fora.core.member import Member, name_key, normalize_name, validate_name
+from fora.core.mention import build_mentions, find_mention_ids
 
 HUMAN = Member(1, "human", "You")
 MAIN = Member(13, "agent", "Main")

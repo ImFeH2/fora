@@ -8,16 +8,16 @@ from pathlib import Path
 
 import pytest
 
-from huddol.adapters.sqlite.store import SqliteStore
-from huddol.core.discussion import MessageMention
-from huddol.core.mention import Mention
-from huddol.core.pending import Ack, ack_keys, pending_for
-from huddol.ports.store import OrganizationStore
+from fora.adapters.sqlite.store import SqliteStore
+from fora.core.discussion import MessageMention
+from fora.core.mention import Mention
+from fora.core.pending import Ack, ack_keys, pending_for
+from fora.ports.store import OrganizationStore
 
 
 @pytest.fixture
 def store(tmp_path: Path) -> SqliteStore:
-    created = SqliteStore(tmp_path / "huddol.sqlite3")
+    created = SqliteStore(tmp_path / "fora.sqlite3")
     yield created
     created.close()
 

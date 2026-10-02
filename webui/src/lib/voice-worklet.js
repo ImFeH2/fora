@@ -42,4 +42,4 @@ class VoiceProcessor extends AudioWorkletProcessor {
   }
 }
 
-registerProcessor("huddol-voice", VoiceProcessor);
+registerProcessor("fora-voice", VoiceProcessor);

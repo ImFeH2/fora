@@ -1,5 +1,5 @@
 [package]
-name = "huddol-app"
+name = "fora-app"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -13,7 +13,7 @@ pre-release-hook = ["node", "../scripts/release-hook.mjs"]
 
 [lib]
 crate-type = ["rlib"]
-name = "huddol_app_lib"
+name = "fora_app_lib"
 
 [dependencies]
 serde_json = "1"

@@ -15,15 +15,15 @@ from unittest.mock import Mock
 
 import pytest
 
-from huddol.adapters import file_writes
-from huddol.adapters.execution import editing
-from huddol.adapters.execution.local import LocalExecution
-from huddol.adapters.files import tree as tree_module
-from huddol.adapters.files.tree import DirectoryTree, content_hash
-from huddol.core.errors import DomainError
-from huddol.ports.files import ConflictError
-from huddol.services.library import Library
-from huddol.services.workspace import Workspace
+from fora.adapters import file_writes
+from fora.adapters.execution import editing
+from fora.adapters.execution.local import LocalExecution
+from fora.adapters.files import tree as tree_module
+from fora.adapters.files.tree import DirectoryTree, content_hash
+from fora.core.errors import DomainError
+from fora.ports.files import ConflictError
+from fora.services.library import Library
+from fora.services.workspace import Workspace
 
 
 def _create_from_process(path: str, content: str, barrier, results) -> None:
@@ -183,7 +183,7 @@ def test_edit_create_thread_race_has_one_winner(tmp_path):
         results = list(pool.map(create, ["first", "second"]))
     assert sorted(results) == ["already_exists", "created"]
     assert target.read_text(encoding="utf-8") in {"first", "second"}
-    assert not list(tmp_path.glob(".huddol-create-*"))
+    assert not list(tmp_path.glob(".fora-create-*"))
 
 
 def test_edit_create_process_race_has_one_winner(tmp_path):
@@ -207,7 +207,7 @@ def test_edit_create_process_race_has_one_winner(tmp_path):
             assert process.exitcode == 0
         assert sorted(outcomes) == ["already_exists", "created"]
         assert target.read_text(encoding="utf-8") in {"first", "second"}
-        assert not list(tmp_path.glob(".huddol-create-*"))
+        assert not list(tmp_path.glob(".fora-create-*"))
     finally:
         for process in processes:
             if process.is_alive():
@@ -261,7 +261,7 @@ def test_edit_create_cleanup_failure_reports_published_file(tmp_path, monkeypatc
     failure = PermissionError("temporary cleanup failed")
 
     def unlink(path, *args, **kwargs):
-        if path.name.startswith(".huddol-create-"):
+        if path.name.startswith(".fora-create-"):
             raise failure
         return original_unlink(path, *args, **kwargs)
 
@@ -276,8 +276,8 @@ def test_edit_create_cleanup_failure_reports_published_file(tmp_path, monkeypatc
             )
     assert error.value.code == "write_published"
     assert target.read_text(encoding="utf-8") == "complete"
-    assert len(list(tmp_path.glob(".huddol-create-*"))) == 1
-    for temporary in tmp_path.glob(".huddol-create-*"):
+    assert len(list(tmp_path.glob(".fora-create-*"))) == 1
+    for temporary in tmp_path.glob(".fora-create-*"):
         original_unlink(temporary)
 
 
