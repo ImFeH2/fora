@@ -738,12 +738,17 @@ def test_resident_is_inserted_only_for_empty_history(settings) -> None:
     }
     assert messages[1].parts[0].content == original.reminder.render()
     second = runner.run(
-        replace(original, history_json=first.messages_json, resident="changed"), None
+        replace(
+            original,
+            history_json=first.messages_json,
+            resident="UPDATED_RESIDENT_FOR_EXISTING_WINDOW",
+        ),
+        None,
     )
     saved = ModelMessagesTypeAdapter.validate_json(second.messages_json)
     assert len(saved) == 5
     assert saved[:3] == messages
-    assert "changed" not in second.messages_json
+    assert "UPDATED_RESIDENT_FOR_EXISTING_WINDOW" not in second.messages_json
 
 
 def test_history_is_never_trimmed_by_its_byte_length(settings) -> None:

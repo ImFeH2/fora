@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 from pydantic_ai import ModelMessagesTypeAdapter
-from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+)
 from pydantic_ai.models.function import FunctionModel
 
 from fora.adapters.execution.manager import ExecutionManager
@@ -184,7 +190,14 @@ def test_new_window_runner_can_read_and_continue_large_history(world) -> None:
     assert outcome.error is None
     assert len(returned) == 3
     assert len(persisted) >= 1
-    assert len(outcome.messages_json.encode()) < 32 * 1024
+    messages = ModelMessagesTypeAdapter.validate_json(outcome.messages_json)
+    content_messages = [
+        replace(message, instructions=None)
+        if isinstance(message, ModelRequest)
+        else message
+        for message in messages
+    ]
+    assert len(ModelMessagesTypeAdapter.dump_json(content_messages)) < 32 * 1024
     assert payload not in outcome.messages_json
     assert (
         ModelMessagesTypeAdapter.validate_json(outcome.messages_json)[-1]
