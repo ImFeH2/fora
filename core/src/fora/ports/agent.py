@@ -43,6 +43,7 @@ class WindowEvent:
     since_sequence: int
     reset_at: str | None
     reason: str | None
+    overflow_context: str | None = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +127,7 @@ class WindowState:
     since_sequence: int
     reset_at: str | None
     reason: str | None
+    overflow_context: str | None = None
 
 
 @dataclass(frozen=True)
@@ -190,7 +192,9 @@ class HistoryStore(Protocol):
 
     def window(self, agent_id: int) -> WindowState: ...
 
-    def reset_window(self, agent_id: int, reason: str) -> WindowState: ...
+    def reset_window(
+        self, agent_id: int, reason: str, overflow_context: str | None = None
+    ) -> WindowState: ...
 
     def window_events(
         self,

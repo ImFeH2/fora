@@ -15,6 +15,7 @@ from fora.adapters.model.config import (
 )
 from fora.adapters.sqlite.store import LockedConnection, first
 from fora.core.errors import DomainError
+from fora.core.turn import OVERFLOW_CONTEXT_BYTES
 from fora.ports.agent import (
     AgentHistoryRun,
     AgentLifecycle,
@@ -55,7 +56,8 @@ CREATE TABLE IF NOT EXISTS agent_windows (
     number INTEGER NOT NULL,
     since_sequence INTEGER NOT NULL,
     reset_at TEXT,
-    reason TEXT
+    reason TEXT,
+    overflow_context TEXT
 );
 CREATE TABLE IF NOT EXISTS agent_window_events (
     agent_id INTEGER NOT NULL,
@@ -63,6 +65,7 @@ CREATE TABLE IF NOT EXISTS agent_window_events (
     since_sequence INTEGER NOT NULL,
     reset_at TEXT,
     reason TEXT,
+    overflow_context TEXT,
     PRIMARY KEY (agent_id, number)
 );
 CREATE TABLE IF NOT EXISTS agent_sessions (
@@ -157,6 +160,15 @@ class SqliteAgentStore:
             "model_length": "INTEGER NOT NULL DEFAULT 0",
         }
         with self._db:
+            for table in ("agent_windows", "agent_window_events"):
+                columns = {
+                    row["name"]
+                    for row in self._db.execute(f"PRAGMA table_info({table})")
+                }
+                if "overflow_context" not in columns:
+                    self._db.execute(
+                        f"ALTER TABLE {table} ADD COLUMN overflow_context TEXT"
+                    )
             for name, definition in request_migrations.items():
                 if name not in request_columns:
                     self._db.execute(
@@ -164,8 +176,8 @@ class SqliteAgentStore:
                     )
             self._db.execute(
                 "INSERT OR IGNORE INTO agent_window_events "
-                "(agent_id, number, since_sequence, reset_at, reason) "
-                "SELECT agent_id, number, since_sequence, reset_at, reason "
+                "(agent_id, number, since_sequence, reset_at, reason, overflow_context) "
+                "SELECT agent_id, number, since_sequence, reset_at, reason, overflow_context "
                 "FROM agent_windows"
             )
         self.update_settings(
@@ -909,7 +921,7 @@ class SqliteAgentStore:
     def window(self, agent_id: int) -> WindowState:
         row = first(
             self._db.execute(
-                "SELECT number, since_sequence, reset_at, reason FROM agent_windows"
+                "SELECT number, since_sequence, reset_at, reason, overflow_context FROM agent_windows"
                 " WHERE agent_id = ?",
                 (agent_id,),
             )
@@ -921,9 +933,19 @@ class SqliteAgentStore:
             int(row["since_sequence"]),
             row["reset_at"],
             row["reason"],
+            row["overflow_context"],
         )
 
-    def reset_window(self, agent_id: int, reason: str) -> WindowState:
+    def reset_window(
+        self, agent_id: int, reason: str, overflow_context: str | None = None
+    ) -> WindowState:
+        if reason != "overflow":
+            overflow_context = None
+        if (
+            overflow_context is not None
+            and len(overflow_context.encode("utf-8")) > OVERFLOW_CONTEXT_BYTES
+        ):
+            raise ValueError("Overflow context exceeds its UTF-8 byte budget")
         current = self.window(agent_id)
         number = current.number + 1
         since_sequence_row = first(
@@ -939,18 +961,19 @@ class SqliteAgentStore:
         with self._db:
             self._db.execute(
                 "INSERT INTO agent_window_events"
-                " (agent_id, number, since_sequence, reset_at, reason)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (agent_id, number, since_sequence, reset_at, reason),
+                " (agent_id, number, since_sequence, reset_at, reason, overflow_context)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (agent_id, number, since_sequence, reset_at, reason, overflow_context),
             )
             self._db.execute(
-                "INSERT INTO agent_windows (agent_id, number, since_sequence, reset_at, reason)"
-                " VALUES (?, ?, ?, ?, ?) ON CONFLICT (agent_id) DO UPDATE SET"
+                "INSERT INTO agent_windows (agent_id, number, since_sequence, reset_at, reason, overflow_context)"
+                " VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (agent_id) DO UPDATE SET"
                 " number = excluded.number, since_sequence = excluded.since_sequence,"
-                " reset_at = excluded.reset_at, reason = excluded.reason",
-                (agent_id, number, since_sequence, reset_at, reason),
+                " reset_at = excluded.reset_at, reason = excluded.reason,"
+                " overflow_context = excluded.overflow_context",
+                (agent_id, number, since_sequence, reset_at, reason, overflow_context),
             )
-        return WindowState(number, since_sequence, reset_at, reason)
+        return WindowState(number, since_sequence, reset_at, reason, overflow_context)
 
     def window_events(
         self,
@@ -964,7 +987,7 @@ class SqliteAgentStore:
             (agent_id,) if after is None else (agent_id, after)
         )
         rows = self._db.execute(
-            "SELECT number, since_sequence, reset_at, reason FROM agent_window_events"
+            "SELECT number, since_sequence, reset_at, reason, overflow_context FROM agent_window_events"
             f" WHERE agent_id = ?{clause} ORDER BY number LIMIT ?",
             (*parameters, limit),
         )
@@ -974,6 +997,7 @@ class SqliteAgentStore:
                 since_sequence=int(row["since_sequence"]),
                 reset_at=row["reset_at"],
                 reason=row["reason"],
+                overflow_context=row["overflow_context"],
             )
             for row in rows
         )

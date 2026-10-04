@@ -31,6 +31,7 @@ from pydantic_ai.messages import (
     RetryPromptPart,
     SystemPromptPart,
     TextPart,
+    ThinkingPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -50,6 +51,7 @@ from fora.adapters.model.runner import (
     UNAVAILABLE,
     LiveModel,
     PydanticModelRunner,
+    _overflow_context,
     is_context_exceeded,
 )
 from fora.core.attachment import ImageData, ViewedImage
@@ -1051,6 +1053,179 @@ def test_last_input_tokens_excludes_old_history_and_is_not_a_turn_total(
     assert (outcome.error is not None) == fail
     assert "tool-return" in outcome.messages_json
     assert "Old response" in outcome.messages_json
+
+
+@pytest.mark.parametrize("responses", [1, 2])
+def test_overflow_diagnostics_follow_sdk_response_and_part_order(settings, responses):
+    calls = 0
+
+    class Tools:
+        def list_members(self):
+            return ["TOOL_RESULT_MARKER"]
+
+        def model_catalog(self):
+            return {"models": ["OTHER_RESULT_MARKER"]}
+
+    raw = '{ "action": "list_models" }'
+
+    def respond(messages, info):
+        nonlocal calls
+        calls += 1
+        if calls > responses:
+            raise ModelHTTPError(
+                400,
+                "fake",
+                {
+                    "error": {
+                        "code": "context_length_exceeded",
+                        "message": "FINAL_ERROR_MARKER",
+                    }
+                },
+            )
+        return ModelResponse(
+            parts=[
+                ThinkingPart("THINKING_MARKER"),
+                ToolCallPart(
+                    "organization", {"action": "list_members"}, f"first-{calls}"
+                ),
+                ToolCallPart("organization", raw, f"last-{calls}"),
+            ],
+            usage=RequestUsage(input_tokens=230001),
+        )
+
+    outcome = PydanticModelRunner(
+        settings, build_model=lambda config: FunctionModel(respond)
+    ).run(replace(request(), sequence=7), Tools())
+    context = outcome.overflow_context
+    assert outcome.context_exceeded
+    assert f"Tool call id: last-{responses}" in context
+    assert "part position: 2" in context
+    assert "source: interrupted Turn" in context
+    assert "Failed Turn sequence: 7" in context
+    assert "Failed model request ordinal: not recorded" in context
+    assert "Tool model request ordinal: not recorded" in context
+    assert f"Arguments (SDK data):\n{raw}\nFinal error:" in context
+    assert "FINAL_ERROR_MARKER" in context
+    assert "THINKING_MARKER" not in context
+    assert "TOOL_RESULT_MARKER" not in context
+    assert "OTHER_RESULT_MARKER" not in context
+    assert "THINKING_MARKER" in outcome.messages_json
+    assert "TOOL_RESULT_MARKER" in outcome.messages_json
+    assert len(context.encode("utf-8")) <= 4096
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        None,
+        {},
+        {"action": "read", "query": "中文🙂"},
+        '{ "action": "read" }',
+        '{"action":',
+    ],
+)
+def test_overflow_diagnostics_preserve_inherited_sdk_arguments(settings, arguments):
+    history = [
+        ModelRequest(
+            parts=[UserPromptPart("old")],
+            metadata={"fora": {"cache_key": "inherited-cache-key"}},
+        ),
+        ModelResponse(parts=[ToolCallPart("discussion", arguments, "inherited-call")]),
+        ModelRequest(
+            parts=[ToolReturnPart("discussion", "TOOL_RESULT_MARKER", "inherited-call")]
+        ),
+        ModelResponse(parts=[TextPart("old final")]),
+    ]
+    raw = ModelMessagesTypeAdapter.dump_json(history).decode()
+
+    def respond(messages, info):
+        raise ModelHTTPError(
+            502, "fake", "Your input exceeds the context window of this model"
+        )
+
+    outcome = PydanticModelRunner(
+        settings, build_model=lambda config: FunctionModel(respond)
+    ).run(replace(request(), history_json=raw, reminder=None, sequence=3), None)
+    context = outcome.overflow_context
+    expected = (
+        arguments
+        if isinstance(arguments, str)
+        else json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+    )
+    assert outcome.context_exceeded
+    assert "source: inherited history" in context
+    assert "Tool call id: inherited-call" in context
+    assert f"Arguments (SDK data):\n{expected}\nFinal error:" in context
+    assert "TOOL_RESULT_MARKER" not in context
+    assert "TOOL_RESULT_MARKER" in outcome.messages_json
+    assert (
+        ModelMessagesTypeAdapter.validate_json(outcome.messages_json)[: len(history)]
+        == history
+    )
+
+
+@pytest.mark.parametrize("character", ["x", "中", "🙂"])
+@pytest.mark.parametrize("extra", [0, 1, 2, 3])
+def test_overflow_field_and_total_utf8_budgets(character, extra):
+    name = character * (128 // len(character.encode("utf-8")) + extra)
+    arguments = character * (2048 // len(character.encode("utf-8")) + extra)
+    error = character * (1024 // len(character.encode("utf-8")) + extra)
+    call = ToolCallPart(name, arguments, "id" * 300)
+    response = ModelResponse(parts=[ThinkingPart("THINKING_MARKER"), call])
+    messages = [
+        response,
+        ModelRequest(
+            parts=[ToolReturnPart(name, "TOOL_RESULT_MARKER", call.tool_call_id)]
+        ),
+    ]
+    before = ModelMessagesTypeAdapter.dump_json(messages)
+    context = _overflow_context(9, messages, 0, error, None, (response, None))
+    prefix, _, fields = context.partition("\nTool name:\n")
+    saved_name, _, fields = fields.partition("\nArguments (SDK data):\n")
+    saved_arguments, _, saved_error = fields.partition("\nFinal error:\n")
+    assert len(prefix.encode("utf-8")) <= 512
+    for original, saved, budget in (
+        (name, saved_name, 128),
+        (arguments, saved_arguments, 2048),
+        (error, saved_error, 1024),
+    ):
+        assert len(saved.encode("utf-8")) <= budget
+        assert saved.encode("utf-8").decode("utf-8") == saved
+        if len(original.encode("utf-8")) > budget:
+            assert saved.endswith("[truncated fragment]")
+            assert original.startswith(saved.removesuffix("\n[truncated fragment]"))
+        else:
+            assert saved == original
+    assert len(context.encode("utf-8")) <= 4096
+    assert "THINKING_MARKER" not in context
+    assert "TOOL_RESULT_MARKER" not in context
+    assert saved_error
+    assert ModelMessagesTypeAdapter.dump_json(messages) == before
+
+
+@pytest.mark.parametrize("thinking", [False, True])
+def test_overflow_without_calls_reports_missing_tool_data(settings, thinking):
+    calls = 0
+
+    def respond(messages, info):
+        nonlocal calls
+        calls += 1
+        if thinking and calls == 1:
+            return ModelResponse(parts=[ThinkingPart("THINKING_MARKER")])
+        raise ModelHTTPError(
+            400, "fake", {"error": {"code": "context_length_exceeded"}}
+        )
+
+    outcome = PydanticModelRunner(
+        settings, build_model=lambda config: FunctionModel(respond)
+    ).run(request(), None)
+    assert outcome.context_exceeded
+    assert "Latest recorded tool call: not recorded" in outcome.overflow_context
+    assert "Tool name:\nnot recorded" in outcome.overflow_context
+    assert "Arguments (SDK data):\nnot recorded" in outcome.overflow_context
+    assert "Final error:\nModelHTTPError" in outcome.overflow_context
+    assert "THINKING_MARKER" not in outcome.overflow_context
+    assert ("THINKING_MARKER" in outcome.messages_json) == thinking
 
 
 def test_turn_http_error_evidence_through_agent_run(

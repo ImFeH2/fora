@@ -715,6 +715,7 @@ class Scheduler:
         error: str | None = None
         usage_json: str | None = None
         context_exceeded = False
+        overflow_context = None
         messages = persisted_history
         run_failure: Exception | None = None
         try:
@@ -739,6 +740,7 @@ class Scheduler:
             )
             usage_json = outcome.usage_json
             context_exceeded = outcome.context_exceeded
+            overflow_context = outcome.overflow_context
             messages = outcome.messages_json
             if outcome.error:
                 status = "failed"
@@ -807,17 +809,21 @@ class Scheduler:
                         ):
                             self.history.pause_for_safety(agent_id, "no_tool_calls")
                         reason = None
-                        if status == "completed" and reminder is None:
-                            reason = "prepared"
-                        elif (
-                            reminder is not None
+                        if (
+                            status == "failed"
                             and context_exceeded
                             and run.sequence
                             != self.history.window(agent_id).since_sequence
                         ):
                             reason = "overflow"
+                        elif status == "completed" and reminder is None:
+                            reason = "prepared"
                         if reason is not None:
-                            window = self.history.reset_window(agent_id, reason)
+                            window = self.history.reset_window(
+                                agent_id,
+                                reason,
+                                overflow_context if reason == "overflow" else None,
+                            )
                         lifecycle = self.history.lifecycle(agent_id)
                         requested = (
                             lifecycle.pause_requested

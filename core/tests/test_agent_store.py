@@ -154,6 +154,87 @@ def test_window_events_and_run_window_numbers_survive_restart(
     restored.close()
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+def test_overflow_context_upgrade_restart_and_prepared_reset(tmp_path, legacy):
+    path = tmp_path / "overflow.sqlite3"
+    base = SqliteStore(path)
+    store = SqliteAgentStore(base._db)
+    first = store.start_run(AGENT, reminded=[(1, 1)])
+    original = '[{"original":"中文🙂"}]'
+    store.finish_run(
+        AGENT,
+        first.sequence,
+        status="failed",
+        messages_json=original,
+        usage_json='{"last_input_tokens":230001}',
+        error="original error",
+    )
+    context = "Failed Turn sequence: 1\nTool name: discussion\nArguments: 中文🙂\nFinal error: too long"
+    overflow = store.reset_window(AGENT, "overflow", context)
+    store.reset_window(AGENT + 1, "overflow", "another Agent")
+    if legacy:
+        for table in ("agent_windows", "agent_window_events"):
+            base._db.execute(f"ALTER TABLE {table} DROP COLUMN overflow_context")
+    first_record = store.runs(AGENT)[0]
+    base.close()
+    for _ in range(2):
+        base = SqliteStore(path)
+        store = SqliteAgentStore(base._db)
+        state = store.window(AGENT)
+        assert state.number == overflow.number
+        assert state.since_sequence == overflow.since_sequence
+        assert state.reset_at == overflow.reset_at
+        assert state.overflow_context == (None if legacy else context)
+        assert store.window_events(AGENT)[-1].overflow_context == state.overflow_context
+        assert store.runs(AGENT)[0] == first_record
+        assert store.latest_messages(AGENT) == "[]"
+        for table in ("agent_windows", "agent_window_events"):
+            assert [
+                row["name"] for row in base._db.execute(f"PRAGMA table_info({table})")
+            ].count("overflow_context") == 1
+        base.close()
+    base = SqliteStore(path)
+    store = SqliteAgentStore(base._db)
+    try:
+        state = store.reset_window(AGENT, "overflow", context)
+        assert store.window(AGENT + 1).overflow_context == (
+            None if legacy else "another Agent"
+        )
+        store.reset_window(AGENT, "prepared", "ignored data")
+        assert store.window(AGENT).overflow_context is None
+        assert store.window_events(AGENT)[-1].overflow_context is None
+        assert store.window_events(AGENT)[-2].overflow_context == context
+        assert store.window_events(AGENT)[-2].reset_at == state.reset_at
+        assert store.runs(AGENT)[0] == first_record
+        assert store.last_reminder(AGENT) == frozenset({(1, 1)})
+    finally:
+        base.close()
+
+
+def test_overflow_context_byte_budget_fails_before_window_changes(agent_store):
+    accepted = "🙂" * 1024
+    state = agent_store.reset_window(AGENT, "overflow", accepted)
+    assert state.overflow_context == accepted
+    events = agent_store.window_events(AGENT)
+    with pytest.raises(ValueError, match="UTF-8 byte budget"):
+        agent_store.reset_window(AGENT, "overflow", accepted + "x")
+    assert agent_store.window(AGENT) == state
+    assert agent_store.window_events(AGENT) == events
+
+
+@pytest.mark.parametrize("table", ["agent_window_events", "agent_windows"])
+def test_overflow_context_and_window_roll_back_together(agent_store, table):
+    previous = agent_store.reset_window(AGENT, "overflow", "previous context")
+    events = agent_store.window_events(AGENT)
+    agent_store._db.execute(
+        f"CREATE TEMP TRIGGER reject_context BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT, 'context save failed'); END"
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="context save failed"):
+        agent_store.reset_window(AGENT, "overflow", "new context")
+    assert agent_store.window(AGENT) == previous
+    assert agent_store.window_events(AGENT) == events
+
+
 def test_model_request_message_blobs_are_deduplicated_across_requests(
     agent_store: SqliteAgentStore,
 ) -> None:

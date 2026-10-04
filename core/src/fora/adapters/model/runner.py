@@ -85,6 +85,7 @@ from fora.adapters.model.prompt import SYSTEM_PROMPT
 from fora.core.attachment import ViewedAttachment, ViewedImage
 from fora.core.errors import DomainError
 from fora.core.parameters import agent_parameters
+from fora.core.turn import OVERFLOW_CONTEXT_BYTES, bounded_text
 from fora.ports.agent import ModelRequestHandle, ModelRequestRecorder, SettingsStore
 from fora.runtime.reminder import (
     HistoryPersistenceError,
@@ -128,6 +129,71 @@ def is_context_exceeded(error: BaseException) -> bool:
             r"\b(?:your )?(?:input|prompt) exceeds (?:the )?(?:model )?(?:context window|maximum context length)\b",
             r"\b(?:the )?(?:context window|maximum context length) (?:was )?(?:exceeded|reached)\b",
         )
+    )
+
+
+def _overflow_context(
+    sequence: int,
+    messages: Sequence[ModelMessage],
+    history_length: int,
+    error: str,
+    failed_request: ModelRequestHandle | None,
+    tool_response: tuple[ModelResponse, ModelRequestHandle | None] | None,
+) -> str:
+    latest = next(
+        (
+            (message_index, part_index, message, part)
+            for message_index in range(len(messages) - 1, -1, -1)
+            if isinstance(message := messages[message_index], ModelResponse)
+            for part_index in range(len(message.parts) - 1, -1, -1)
+            if isinstance(part := message.parts[part_index], ToolCallPart)
+        ),
+        None,
+    )
+    identity = [
+        f"Failed Turn sequence: {sequence}",
+        "Failed model request ordinal: "
+        + (
+            str(failed_request.ordinal)
+            if failed_request is not None
+            else "not recorded"
+        ),
+    ]
+    name = "not recorded"
+    arguments = "not recorded"
+    if latest is None:
+        identity.append("Latest recorded tool call: not recorded")
+    else:
+        message_index, part_index, message, call = latest
+        inherited = message_index < history_length
+        source = "inherited history" if inherited else "interrupted Turn"
+        handle = (
+            tool_response[1]
+            if tool_response is not None
+            and (tool_response[0] is message or tool_response[0] == message)
+            else None
+        )
+        identity.extend(
+            [
+                f"Latest recorded tool call source: {source}",
+                "Tool model request ordinal: "
+                + (str(handle.ordinal) if handle is not None else "not recorded"),
+                f"History message position: {message_index}; part position: {part_index} (zero-based)",
+                f"Tool call id: {bounded_text(call.tool_call_id, 128)}",
+            ]
+        )
+        name = bounded_text(call.tool_name, 128)
+        arguments = bounded_text(
+            call.args
+            if isinstance(call.args, str)
+            else json.dumps(call.args, ensure_ascii=False, separators=(",", ":")),
+            2048,
+        )
+    return bounded_text(
+        bounded_text("\n".join(identity), 512)
+        + f"\nTool name:\n{name}\nArguments (SDK data):\n{arguments}"
+        + f"\nFinal error:\n{bounded_text(error, 1024)}",
+        OVERFLOW_CONTEXT_BYTES,
     )
 
 
@@ -206,7 +272,7 @@ def _tool_errors() -> Iterator[None]:
         yield
     except (ModelRetry, ToolFailed, SkipToolExecution, CallDeferred, ApprovalRequired):
         raise
-    except Exception as error:  # noqa: BLE001
+    except Exception as error:
         agent_id, sequence, call = _tool_call.get()
         error_id = uuid.uuid4().hex
         code = (
@@ -218,7 +284,7 @@ def _tool_errors() -> Iterator[None]:
             f"{frame.f_code.co_filename}:{line} in {frame.f_code.co_name}"
             for frame, line in walk_tb(error.__traceback__)
         ]
-        logging.getLogger("fora.model").error(
+        logging.getLogger("fora.model").exception(
             "Tool failure %s agent=%s turn=%s tool=%s call=%s code=%s type=%s\n%s",
             error_id,
             agent_id,
@@ -228,6 +294,7 @@ def _tool_errors() -> Iterator[None]:
             code,
             type(error).__name__,
             "\n".join(frames),
+            exc_info=False,
         )
         raise ToolFailed(
             f"{code}: {type(error).__name__}. Tool execution failed "
@@ -345,6 +412,10 @@ class LiveModel(WrapperModel):
         self._model_snapshot = model_snapshot or {}
         self._last_request_handle: ModelRequestHandle | None = None
         self._last_response: ModelResponse | None = None
+        self.current_request_handle: ModelRequestHandle | None = None
+        self.tool_response: tuple[ModelResponse, ModelRequestHandle | None] | None = (
+            None
+        )
         super().__init__(resolve())
 
     @property
@@ -489,6 +560,8 @@ class LiveModel(WrapperModel):
     def _record_response(
         self, handle: ModelRequestHandle | None, response: ModelResponse
     ) -> None:
+        if any(isinstance(part, ToolCallPart) for part in response.parts):
+            self.tool_response = (response, handle)
         if handle is None or self._request_recorder is None:
             return
         try:
@@ -528,6 +601,7 @@ class LiveModel(WrapperModel):
         )
         settings = self._caching(wrapped, model_settings)
         handle = self._start_request(wrapped, outgoing, settings, parameters, False)
+        self.current_request_handle = handle
         try:
             response = await wrapped.request(outgoing, settings, parameters)
         except BaseException as error:
@@ -550,6 +624,7 @@ class LiveModel(WrapperModel):
         )
         settings = self._caching(wrapped, model_settings)
         handle = self._start_request(wrapped, outgoing, settings, parameters, True)
+        self.current_request_handle = handle
         try:
             async with wrapped.request_stream(
                 outgoing,
@@ -1055,6 +1130,7 @@ class PydanticModelRunner:
         history_length = len(history)
         error = None
         context_exceeded = False
+        overflow_context = None
         snapshot = (
             _persist_history(request, history)
             if new_window
@@ -1065,7 +1141,14 @@ class PydanticModelRunner:
                 result = asyncio.run(once())
             except HistoryPersistenceError:
                 raise
-            except Exception as failure:  # noqa: BLE001
+            except Exception as failure:
+                logging.getLogger("fora.model").exception(
+                    "Model failure agent=%s turn=%s type=%s",
+                    request.agent_id,
+                    request.sequence,
+                    type(failure).__name__,
+                    exc_info=False,
+                )
                 messages = snapshot
                 if captured:
                     final_messages = _settle_tool_calls(captured)
@@ -1076,6 +1159,17 @@ class PydanticModelRunner:
                 input_tokens = _last_input_tokens(new_messages)
                 error = f"{type(failure).__name__}: {failure}"
                 context_exceeded = is_context_exceeded(failure)
+                if context_exceeded:
+                    overflow_context = _overflow_context(
+                        request.sequence,
+                        captured if captured else history,
+                        history_length,
+                        error,
+                        live_model.current_request_handle
+                        if live_model is not None
+                        else None,
+                        live_model.tool_response if live_model is not None else None,
+                    )
             else:
                 final_messages = _settle_tool_calls(result.all_messages())
                 assert live_model is not None
@@ -1105,6 +1199,7 @@ class PydanticModelRunner:
             error=error,
             input_tokens=input_tokens,
             context_exceeded=context_exceeded,
+            overflow_context=overflow_context,
         )
 
 

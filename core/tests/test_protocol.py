@@ -1214,7 +1214,9 @@ def test_agent_detail_reports_runs(server) -> None:
         "reset_at": None,
         "reason": None,
     }
-    state = deps.history.reset_window(agent["id"], "overflow")
+    state = deps.history.reset_window(
+        agent["id"], "overflow", "private diagnostic data"
+    )
     detail = call(dispatcher, output, "agent.detail", agent_id=agent["id"])["result"]
     assert detail["window"] == {
         "number": 2,

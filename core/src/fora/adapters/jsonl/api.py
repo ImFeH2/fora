@@ -753,7 +753,9 @@ class Api:
             statistics = self._scheduler.statistics(agent_id, idle_streak=streak)
             return {
                 **self._scheduler.agent_status(agent_id),
-                "window": asdict(self._scheduler.history.window(agent_id)),
+                "window": _window_event_payload(
+                    self._scheduler.history.window(agent_id)
+                ),
                 "workspace": self._human().list_workspace(agent_id=agent_id),
                 "usage": self._scheduler.history.usage_total(agent_id),
                 **statistics,
