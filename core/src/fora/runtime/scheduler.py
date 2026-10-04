@@ -871,6 +871,7 @@ class Scheduler:
                         )
                     persisted_history = messages
                 except Exception as failure:
+                    window = None
                     logger.exception("Turn finalization failed for agent %s", agent_id)
                     status = "failed"
                     error = f"{type(failure).__name__}: {failure}"
@@ -895,7 +896,6 @@ class Scheduler:
                         self.store.set_agent_state(
                             agent_id, "paused" if requested else "error"
                         )
-                    window = None
                 if self._blocked.get(agent_id) == "storage_unavailable":
                     self._blocked.pop(agent_id)
         except Exception as failure:

@@ -3417,3 +3417,47 @@ def test_sdk_setup_error_after_success_keeps_persistent_streak_clear(
         assert world.history.window(MAIN).number == 1
     finally:
         scheduler.stop()
+
+
+def test_persistent_lifecycle_save_failure_preserves_window_and_suppresses_reset_event(
+    world, monkeypatch
+):
+    scheduler, _runner, state, events, _room = _model_failure_world(world, monkeypatch)
+    try:
+        for _ in range(2):
+            scheduler.resume(MAIN)
+            assert scheduler.run_turn(MAIN).status == "failed"
+        scheduler.resume(MAIN)
+        pending = world.store.pending(MAIN)
+        window = world.history.window(MAIN)
+
+        def reject_lifecycle():
+            world.store._db.execute(
+                "CREATE TEMP TRIGGER reject_all_lifecycle BEFORE INSERT ON agent_lifecycle "
+                "BEGIN SELECT RAISE(ABORT, 'lifecycle unavailable'); END"
+            )
+
+        state["before_failure"] = reject_lifecycle
+        with pytest.raises(sqlite3.IntegrityError, match="lifecycle unavailable"):
+            scheduler.run_turn(MAIN)
+        assert world.history.window(MAIN) == window
+        assert world.store.pending(MAIN) == pending
+        assert len(world.history.window_events(MAIN)) == 1
+        assert not any(name == "window.reset" for name, _ in events)
+        assert scheduler.agent_status(MAIN)["state"] == "blocked"
+        run = world.history.runs(MAIN)[0]
+        assert run.status == "running"
+        summaries = world.history.model_request_summaries(MAIN, run.sequence)
+        assert len(summaries) == 1 and summaries[0].status == "failed"
+        assert summaries[0].response_count == 1
+        assert "UnexpectedModelBehavior" in summaries[0].error
+        assert world.history.preparation_failure_streak(MAIN, run.sequence) == 0
+        world.store._db.execute("DROP TRIGGER reject_all_lifecycle")
+        scheduler.resume(MAIN)
+        assert world.history.runs(MAIN)[0].status == "interrupted"
+        assert world.history.model_request_summaries(MAIN, run.sequence) == summaries
+        assert world.history.window(MAIN) == window
+        assert world.store.pending(MAIN) == pending
+        assert not any(name == "window.reset" for name, _ in events)
+    finally:
+        scheduler.stop()
