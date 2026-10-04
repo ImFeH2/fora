@@ -22,43 +22,55 @@ def bounded_text(value: str, limit: int) -> str:
 
 
 def model_error_signature(error: str) -> str:
-    protected: list[str] = []
+    uuid = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    patterns = (
+        (
+            "fixed",
+            (
+                r"\b(?:status_code|model_name|model_id|code|type)['\"]?\s*[:=]\s*"
+                r"(?:'[^']*'|\"[^\"]*\"|[\w./:+-]+)"
+            ),
+        ),
+        (
+            "identifier",
+            (
+                r"\b(?:request[_ -]?id|trace[_ -]?id|diagnostic[_ -]?id)"
+                r"['\"]?\s*[:=]\s*['\"]?[\w.-]+"
+                rf"|\bdiagnostic\s+(?:{uuid}|[0-9a-f]{{6,}})(?![\w-])"
+            ),
+        ),
+        ("random", rf"(?<![\w-])(?:{uuid}|[0-9a-f]{{24,}})(?![\w-])"),
+        (
+            "duration",
+            (
+                r"(?<![\w./-])\d+(?:\.\d+)?\s*"
+                r"(?:milliseconds?|seconds?|minutes?|hours?|ms|s|m|h)\b"
+            ),
+        ),
+        (
+            "number",
+            r"(?<![\w./-])[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?(?![\w./-]|\d)",
+        ),
+    )
+    replacements = {
+        "identifier": "<id>",
+        "random": "<id>",
+        "duration": "<duration>",
+        "number": "<number>",
+    }
 
-    def preserve(match: re.Match[str]) -> str:
-        protected.append(match.group())
-        return f"\x00{chr(65 + len(protected) - 1)}\x00"
+    def normalize(match: re.Match[str]) -> str:
+        if match.lastgroup == "fixed":
+            return match.group()
+        assert match.lastgroup is not None
+        return replacements[match.lastgroup]
 
     value = re.sub(
-        r"(?i)\b(?:status_code|model_name|model_id|code|type)['\"]?\s*[:=]\s*"
-        r"(?:'[^']*'|\"[^\"]*\"|[\w./:+-]+)",
-        preserve,
+        "|".join(f"(?P<{name}>{pattern})" for name, pattern in patterns),
+        normalize,
         error,
+        flags=re.IGNORECASE,
     )
-    value = re.sub(
-        r"(?i)\b(?:request[_ -]?id|trace[_ -]?id|diagnostic(?:[_ -]?id)?)"
-        r"['\"]?\s*[:=]?\s*['\"]?[\w.-]+",
-        "<id>",
-        value,
-    )
-    value = re.sub(
-        r"(?i)(?<![\w-])(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
-        r"[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{24,})(?![\w-])",
-        "<id>",
-        value,
-    )
-    value = re.sub(
-        r"(?i)(?<![\w./-])\d+(?:\.\d+)?\s*"
-        r"(milliseconds?|seconds?|minutes?|hours?|ms|s|m|h)\b",
-        "<duration>",
-        value,
-    )
-    value = re.sub(
-        r"(?<![\w./-])[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?(?![\w./-]|\d)",
-        "<number>",
-        value,
-    )
-    for index, field in enumerate(protected):
-        value = value.replace(f"\x00{chr(65 + index)}\x00", field)
     return " ".join(value.split())
 
 

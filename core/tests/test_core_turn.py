@@ -78,6 +78,18 @@ def test_model_error_signature_normalizes_variable_details(first, second):
         ("UnexpectedModelBehavior: tool2", "UnexpectedModelBehavior: tool3"),
         ("UnexpectedModelBehavior: model-6.1", "UnexpectedModelBehavior: model-6.2"),
         ("UnexpectedModelBehavior: response", "UnexpectedModelBehavior: request"),
+        (
+            "UnexpectedModelBehavior: diagnostic failed",
+            "UnexpectedModelBehavior: diagnostic unavailable",
+        ),
+        (
+            "UnexpectedModelBehavior: request id unavailable",
+            "UnexpectedModelBehavior: request id invalid",
+        ),
+        (
+            "UnexpectedModelBehavior: trace id unavailable",
+            "UnexpectedModelBehavior: trace id invalid",
+        ),
     ],
 )
 def test_model_error_signature_preserves_failure_identity(first, second):
@@ -90,3 +102,15 @@ def test_model_error_signature_compares_complete_text_and_keeps_original():
         original + "filtered"
     )
     assert original.endswith("same reason ")
+
+
+def test_model_error_signature_preserves_fixed_fields_among_variable_values():
+    error = "ModelHTTPError: " + ", ".join(
+        f"status_code: 502, model_name: gpt-6.1, request_id: req-{index}, after {index + 1}ms"
+        for index in range(1000)
+    )
+    signature = model_error_signature(error)
+    assert signature.count("status_code: 502") == 1000
+    assert signature.count("model_name: gpt-6.1") == 1000
+    assert signature.count("<id>") == 1000
+    assert signature.count("<duration>") == 1000
