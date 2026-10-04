@@ -1131,3 +1131,34 @@ def test_sdk_completion_save_failure_preserves_response_status_and_fields(
         agent_store.model_request_summary(AGENT, run.sequence, handle.ordinal)
         == original
     )
+
+
+@pytest.mark.parametrize("status", ["running", "failed", "interrupted", "completed"])
+@pytest.mark.parametrize("ordinary", [False, True])
+def test_preparation_stage_uses_current_window_and_latest_run_metadata(
+    agent_store, status, ordinary
+):
+    assert not agent_store.preparation_incomplete(AGENT)
+    run = agent_store.start_run(AGENT, reminded=[(1, 1)] if ordinary else [])
+    if status != "running":
+        agent_store.finish_run(
+            AGENT,
+            run.sequence,
+            status=status,
+            messages_json="[]",
+            usage_json='{"last_input_tokens":null}',
+        )
+    original = agent_store.runs(AGENT)
+    expected = not ordinary and status != "completed"
+    assert agent_store.preparation_incomplete(AGENT) is expected
+    assert agent_store.preparation_incomplete(999) is False
+    assert agent_store.preparation_incomplete(AGENT) is expected
+    assert agent_store.runs(AGENT) == original
+    agent_store.reset_window(AGENT, "overflow")
+    assert not agent_store.preparation_incomplete(AGENT)
+    assert agent_store.runs(AGENT) == original
+    next_run = agent_store.start_run(AGENT, reminded=[(1, 2)])
+    agent_store.finish_run(
+        AGENT, next_run.sequence, status="failed", messages_json="[]"
+    )
+    assert not agent_store.preparation_incomplete(AGENT)

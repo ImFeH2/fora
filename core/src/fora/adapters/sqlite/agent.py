@@ -1130,6 +1130,21 @@ class SqliteAgentStore:
         )
         return tuple(self._run(row) for row in rows)
 
+    def preparation_incomplete(self, agent_id: int) -> bool:
+        row = first(
+            self._db.execute(
+                "SELECT status, reminded_json FROM agent_runs WHERE agent_id = ?"
+                " AND sequence >= COALESCE((SELECT since_sequence FROM agent_windows"
+                " WHERE agent_id = ?), 1) ORDER BY sequence DESC LIMIT 1",
+                (agent_id, agent_id),
+            )
+        )
+        return (
+            row is not None
+            and row["status"] != "completed"
+            and row["reminded_json"] == "[]"
+        )
+
     def run_summaries(
         self, agent_id: int, *, limit: int = 50
     ) -> tuple[RunSummary, ...]:
