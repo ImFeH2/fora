@@ -2990,3 +2990,430 @@ def test_agents_file_changed_during_tool_call_waits_for_next_window(
     record = scheduler.run_turn(MAIN)
     assert record.status == "failed" and str(path) in record.error
     assert len(seen) == 3
+
+
+def _model_failure_world(world, monkeypatch, *, preparation=True):
+    from pydantic_ai import models
+    from pydantic_ai.messages import ModelResponse, TextPart, ThinkingPart, ToolCallPart
+    from pydantic_ai.models.function import FunctionModel
+    from pydantic_ai.usage import RequestUsage
+
+    from fora.adapters.model.runner import PydanticModelRunner
+
+    monkeypatch.setattr(models, "ALLOW_MODEL_REQUESTS", False)
+    world.settings.set_settings(
+        "model",
+        {"base_url": "https://example.invalid", "api_key": "unused", "model": "local"},
+    )
+    world.settings.set_settings("agent", {"context_window_tokens": 230000})
+    room = mention(world)
+    state = {"phase": "initial", "calls": 0, "initial_calls": 0}
+
+    def respond(messages, info):
+        state["calls"] += 1
+        if state["phase"] == "initial":
+            state["initial_calls"] += 1
+            if state["initial_calls"] == 1:
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            "discussion",
+                            {"action": "read", "discussion_id": room},
+                            "original-read",
+                        )
+                    ]
+                )
+            return ModelResponse(
+                parts=[TextPart("Done")],
+                usage=RequestUsage(input_tokens=230001 if preparation else 100),
+            )
+        if state["phase"] == "failure":
+            if callback := state.get("before_failure"):
+                callback()
+            return ModelResponse(
+                parts=[ThinkingPart("THINKING_MARKER")],
+                finish_reason="length",
+                usage=RequestUsage(
+                    input_tokens=230001 if preparation else 100, output_tokens=4000
+                ),
+            )
+        if state["phase"] == "tool_failure":
+            if not any(
+                getattr(part, "tool_call_id", None) == "new-read"
+                for message in messages
+                for part in message.parts
+            ):
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            "discussion",
+                            {"action": "read", "discussion_id": room},
+                            "new-read",
+                        )
+                    ],
+                    usage=RequestUsage(input_tokens=230001),
+                )
+            return ModelResponse(
+                parts=[ThinkingPart("THINKING_MARKER")],
+                finish_reason="length",
+                usage=RequestUsage(input_tokens=230001, output_tokens=4000),
+            )
+        return ModelResponse(
+            parts=[TextPart("Recovered")], usage=RequestUsage(input_tokens=100)
+        )
+
+    class ObservedRunner(PydanticModelRunner):
+        def __init__(self):
+            super().__init__(
+                world.settings, build_model=lambda config: FunctionModel(respond)
+            )
+            self.requests = []
+            self.outcomes = []
+
+        def run(self, request, tools):
+            self.requests.append(request)
+            outcome = super().run(request, tools)
+            self.outcomes.append(outcome)
+            return outcome
+
+    runner = ObservedRunner()
+    events = []
+    scheduler = Scheduler(world, runner, on_event=lambda *event: events.append(event))
+    assert scheduler.run_turn(MAIN).status == "completed"
+    state["phase"] = "failure"
+    return scheduler, runner, state, events, room
+
+
+@pytest.mark.parametrize("trigger", ["mention", "resume"])
+@pytest.mark.parametrize("restart", [None, "current", "legacy"])
+def test_preparation_model_failure_streak_resets_and_tick_reminds(
+    world, monkeypatch, trigger, restart
+):
+    scheduler, runner, state, events, room = _model_failure_world(world, monkeypatch)
+    try:
+        for index in range(2):
+            if index:
+                if trigger == "resume":
+                    scheduler.resume(MAIN)
+                else:
+                    world.store.append_message(room, HUMAN, "@Main continue")
+            before_calls = state["calls"]
+            record = scheduler.run_turn(MAIN)
+            assert record.status == "failed"
+            assert runner.requests[-1].reminder is None
+            assert (
+                world.history.preparation_failure_streak(MAIN, record.sequence)
+                == index + 1
+            )
+            assert world.history.window(MAIN).number == 1
+            assert world.history.lifecycle(MAIN).error == record.error
+            assert scheduler.tick() == ()
+            assert state["calls"] == before_calls + 1
+            summary = world.history.model_request_summaries(MAIN, record.sequence)[0]
+            assert summary.status == "failed" and summary.error == record.error
+            assert summary.response_count == 1 and summary.response_length > 0
+        if restart == "legacy":
+            with world.history.transaction():
+                world.store._db.execute(
+                    "INSERT INTO agent_windows (agent_id, number, since_sequence) VALUES (?, 89, 420)",
+                    (MAIN,),
+                )
+                world.store._db.execute(
+                    "UPDATE agent_window_events SET number = 89, since_sequence = 420 WHERE agent_id = ?",
+                    (MAIN,),
+                )
+                world.store._db.execute(
+                    "UPDATE agent_runs SET window_number = 89 WHERE agent_id = ?",
+                    (MAIN,),
+                )
+                world.store._db.execute(
+                    "UPDATE agent_model_requests SET window_number = 89 WHERE agent_id = ?",
+                    (MAIN,),
+                )
+                world.store._db.execute(
+                    "UPDATE agent_runs SET sequence = sequence + 419 WHERE agent_id = ?",
+                    (MAIN,),
+                )
+                world.store._db.execute(
+                    "UPDATE agent_model_requests SET sequence = sequence + 419,"
+                    " status = CASE WHEN status IN ('failed', 'completed') THEN 'responded' ELSE status END,"
+                    " error = NULL WHERE agent_id = ?",
+                    (MAIN,),
+                )
+                world.store._db.execute(
+                    "UPDATE agent_model_request_messages SET sequence = sequence + 419 WHERE agent_id = ?",
+                    (MAIN,),
+                )
+        originals = world.history.runs(MAIN)
+        request_originals = tuple(
+            (run.sequence, world.history.model_request_summaries(MAIN, run.sequence))
+            for run in originals
+        )
+        blobs = world.store._db.execute(
+            "SELECT * FROM agent_history_message_blobs ORDER BY content_hash"
+        )
+        if restart is not None:
+            path = world.store._path
+            scheduler.stop()
+            world.store.close()
+            world.store = SqliteStore(path)
+            world.history = SqliteAgentStore(world.store._db)
+            world.settings = world.history
+            world.execution = ExecutionManager(
+                settings={"write_directories": [str(path.parent)]}, enforce=False
+            )
+            runner = type(runner)()
+            scheduler = Scheduler(
+                world, runner, on_event=lambda *event: events.append(event)
+            )
+            scheduler.recover()
+            assert (
+                world.history.preparation_failure_streak(MAIN, originals[0].sequence)
+                == 2
+            )
+            assert world.history.runs(MAIN) == originals
+        if trigger == "resume":
+            scheduler.resume(MAIN)
+        else:
+            world.store.append_message(room, HUMAN, "@Main third call")
+        state["before_failure"] = lambda: world.store.append_message(
+            room, HUMAN, "@Main work arriving during failure"
+        )
+        before_calls = state["calls"]
+        record = scheduler.run_turn(MAIN)
+        assert record.status == "failed"
+        assert state["calls"] == before_calls + 1
+        pending = world.store.pending(MAIN)
+        state_window = world.history.window(MAIN)
+        assert state_window.number == (90 if restart == "legacy" else 2)
+        assert state_window.reason == "overflow"
+        assert state_window.since_sequence == record.sequence + 1
+        assert "original-read" in state_window.overflow_context
+        assert "Failed model request ordinal: 1" in state_window.overflow_context
+        assert record.error in state_window.overflow_context
+        assert "THINKING_MARKER" not in state_window.overflow_context
+        assert world.history.lifecycle(MAIN).error is None
+        assert world.history.latest_messages(MAIN) == "[]"
+        assert world.history.preparation_failure_streak(MAIN, record.sequence) == 0
+        assert world.history.runs(MAIN)[1:] == originals
+        assert (
+            tuple(
+                (sequence, world.history.model_request_summaries(MAIN, sequence))
+                for sequence, _ in request_originals
+            )
+            == request_originals
+        )
+        assert (
+            world.store._db.execute(
+                "SELECT * FROM agent_history_message_blobs WHERE content_hash IN ("
+                + ",".join("?" for _ in blobs)
+                + ") ORDER BY content_hash",
+                tuple(row["content_hash"] for row in blobs),
+            )
+            == blobs
+        )
+        assert sum(name == "window.reset" for name, _ in events) == 1
+        state["phase"] = "recovery"
+        assert scheduler.tick() == (MAIN,)
+        scheduler._threads[MAIN].join(timeout=5)
+        assert not scheduler._threads[MAIN].is_alive()
+        recovered = runner.requests[-1]
+        assert recovered.history_json == "[]" and recovered.reminder is not None
+        assert {
+            (item.discussion_id, item.message_id) for item in recovered.reminder.items
+        } == {(item.discussion_id, item.message_id) for item in pending}
+        assert recovered.reminder.items[0].previously_reminded
+        assert recovered.resident.endswith(reset_notice(state_window))
+        assert world.store.pending(MAIN) == pending
+        assert world.history.window(MAIN) == state_window
+        assert world.history.runs(MAIN)[0].status == "completed"
+    finally:
+        scheduler.stop()
+
+
+def test_ordinary_model_failures_do_not_reset_window(world, monkeypatch):
+    scheduler, runner, _state, events, room = _model_failure_world(
+        world, monkeypatch, preparation=False
+    )
+    try:
+        for _ in range(3):
+            world.store.append_message(room, HUMAN, "@Main continue")
+            record = scheduler.run_turn(MAIN)
+            assert record.status == "failed"
+            assert runner.requests[-1].reminder is not None
+            assert world.history.preparation_failure_streak(MAIN, record.sequence) == 0
+            assert world.history.window(MAIN).number == 1
+            assert world.history.lifecycle(MAIN).error == record.error
+            assert scheduler.tick() == ()
+        assert not any(name == "window.reset" for name, _ in events)
+    finally:
+        scheduler.stop()
+
+
+def test_successful_tool_response_interrupts_preparation_failure_streak(
+    world, monkeypatch
+):
+    scheduler, _runner, state, events, _room = _model_failure_world(world, monkeypatch)
+    try:
+        assert scheduler.run_turn(MAIN).status == "failed"
+        scheduler.resume(MAIN)
+        assert scheduler.run_turn(MAIN).status == "failed"
+        scheduler.resume(MAIN)
+        state["phase"] = "tool_failure"
+        record = scheduler.run_turn(MAIN)
+        assert record.status == "failed"
+        summaries = world.history.model_request_summaries(MAIN, record.sequence)
+        assert [summary.status for summary in summaries] == ["completed", "failed"]
+        assert world.history.preparation_failure_streak(MAIN, record.sequence) == 1
+        state["phase"] = "failure"
+        scheduler.resume(MAIN)
+        record = scheduler.run_turn(MAIN)
+        assert world.history.preparation_failure_streak(MAIN, record.sequence) == 2
+        assert world.history.window(MAIN).number == 1
+        assert not any(name == "window.reset" for name, _ in events)
+    finally:
+        scheduler.stop()
+
+
+@pytest.mark.parametrize(
+    "table", ["agent_runs", "agent_window_events", "agent_windows", "agent_lifecycle"]
+)
+def test_model_failure_reset_transaction_keeps_originals_and_pending(
+    world, monkeypatch, table
+):
+    scheduler, _runner, _state, events, _room = _model_failure_world(world, monkeypatch)
+    try:
+        for _ in range(2):
+            scheduler.resume(MAIN)
+            assert scheduler.run_turn(MAIN).status == "failed"
+        scheduler.resume(MAIN)
+        pending = world.store.pending(MAIN)
+        window = world.history.window(MAIN)
+        condition = (
+            "NEW.sequence = 4 AND NEW.error LIKE 'UnexpectedModelBehavior:%'"
+            if table == "agent_runs"
+            else "NEW.error IS NULL AND EXISTS (SELECT 1 FROM agent_windows WHERE reason = 'overflow')"
+            if table == "agent_lifecycle"
+            else "NEW.reason = 'overflow'"
+        )
+        operation = "UPDATE" if table == "agent_runs" else "INSERT"
+        world.store._db.execute(
+            f"CREATE TEMP TRIGGER reject_model_reset BEFORE {operation} ON {table} WHEN {condition} "
+            "BEGIN SELECT RAISE(ABORT, 'model reset save failed'); END"
+        )
+        record = scheduler.run_turn(MAIN)
+        assert record.status == "failed" and "model reset save failed" in record.error
+        assert world.history.window(MAIN) == window
+        assert len(world.history.window_events(MAIN)) == 1
+        assert world.store.pending(MAIN) == pending
+        assert world.history.lifecycle(MAIN).error == record.error
+        summary = world.history.model_request_summaries(MAIN, record.sequence)[0]
+        assert summary.status == "failed" and "UnexpectedModelBehavior" in summary.error
+        assert summary.response_count == 1
+        assert world.history.preparation_failure_streak(MAIN, record.sequence) == 0
+        assert not any(name == "window.reset" for name, _ in events)
+        assert scheduler.tick() == ()
+    finally:
+        scheduler.stop()
+
+
+@pytest.mark.parametrize(
+    "gate", ["pause", "safety", "token_limit", "stop", "no_pending"]
+)
+def test_third_preparation_failure_respects_scheduling_intent(world, monkeypatch, gate):
+    scheduler, _runner, state, events, room = _model_failure_world(world, monkeypatch)
+    try:
+        for _ in range(2):
+            scheduler.resume(MAIN)
+            assert scheduler.run_turn(MAIN).status == "failed"
+        scheduler.resume(MAIN)
+
+        def apply_gate():
+            if gate == "pause":
+                scheduler.pause(MAIN)
+            elif gate == "safety":
+                world.history.pause_for_safety(MAIN, "runtime_error")
+            elif gate == "token_limit":
+                world.settings.set_settings(
+                    "agent", {"context_window_tokens": 230000, "token_limit": 1}
+                )
+            elif gate == "stop":
+                scheduler._stop.set()
+            else:
+                world.store.ack(room, [1], MAIN)
+
+        state["before_failure"] = apply_gate
+        record = scheduler.run_turn(MAIN)
+        assert record.status == "failed"
+        assert world.history.window(MAIN).number == 2
+        assert world.history.lifecycle(MAIN).error is None
+        assert scheduler.tick() == ()
+        assert sum(name == "window.reset" for name, _ in events) == 1
+        if gate == "pause":
+            assert world.history.lifecycle(MAIN).pause_requested
+        if gate == "no_pending":
+            assert world.store.pending(MAIN) == ()
+            assert world.store.acknowledged(room, MAIN) == (1,)
+    finally:
+        scheduler.stop()
+
+
+def test_sdk_setup_error_after_success_keeps_persistent_streak_clear(
+    world, monkeypatch
+):
+    from pydantic_ai.capabilities import Hooks
+    from pydantic_ai.exceptions import UnexpectedModelBehavior
+
+    scheduler, runner, state, _events, _room = _model_failure_world(world, monkeypatch)
+    hooks = Hooks()
+
+    @hooks.on.before_model_request
+    async def fail_before_request(ctx, request_context):
+        if state["phase"] == "tool_failure" and ctx.run_step == 2:
+            raise UnexpectedModelBehavior("request setup failed")
+        return request_context
+
+    original_run = runner._agent.run
+
+    async def run_with_hooks(*args, **kwargs):
+        kwargs["capabilities"] = [*kwargs["capabilities"], hooks]
+        return await original_run(*args, **kwargs)
+
+    monkeypatch.setattr(runner._agent, "run", run_with_hooks)
+    try:
+        for _ in range(2):
+            scheduler.resume(MAIN)
+            assert scheduler.run_turn(MAIN).status == "failed"
+        scheduler.resume(MAIN)
+        state["phase"] = "tool_failure"
+        record = scheduler.run_turn(MAIN)
+        assert record.error == "UnexpectedModelBehavior: request setup failed"
+        summaries = world.history.model_request_summaries(MAIN, record.sequence)
+        assert len(summaries) == 1
+        assert summaries[0].status == "completed" and summaries[0].error is None
+        assert summaries[0].response_count == 1
+        assert world.history.preparation_failure_streak(MAIN, record.sequence) == 0
+        assert world.history.window(MAIN).number == 1
+        path = world.store._path
+        scheduler.stop()
+        world.store.close()
+        world.store = SqliteStore(path)
+        world.history = SqliteAgentStore(world.store._db)
+        world.settings = world.history
+        world.execution = ExecutionManager(
+            settings={"write_directories": [str(path.parent)]}, enforce=False
+        )
+        runner = type(runner)()
+        scheduler = Scheduler(world, runner)
+        scheduler.recover()
+        assert world.history.model_request_summaries(MAIN, record.sequence) == summaries
+        assert world.history.preparation_failure_streak(MAIN, record.sequence) == 0
+        state["phase"] = "failure"
+        scheduler.resume(MAIN)
+        failed = scheduler.run_turn(MAIN)
+        assert runner.requests[-1].reminder is None
+        assert failed.status == "failed"
+        assert world.history.preparation_failure_streak(MAIN, failed.sequence) == 1
+        assert world.history.window(MAIN).number == 1
+    finally:
+        scheduler.stop()

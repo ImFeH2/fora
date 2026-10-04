@@ -848,3 +848,286 @@ def test_turns_without_usage_do_not_break_the_total(
     run = agent_store.start_run(AGENT)
     agent_store.finish_run(AGENT, run.sequence, status="failed", messages_json="[]")
     assert agent_store.usage_total(AGENT)["total_tokens"] == 0
+
+
+def _record_preparation_call(
+    store,
+    *,
+    error="UnexpectedModelBehavior: empty",
+    request_status="failed",
+    run_status="failed",
+    reminded=(),
+    agent_id=AGENT,
+):
+    run = store.start_run(agent_id, reminded=reminded)
+    handle = store.start_model_request(
+        agent_id,
+        run.sequence,
+        run.run_id,
+        store.window(agent_id).number,
+        ('[{"input":"中文🙂"}]',),
+        "{}",
+        "{}",
+        "{}",
+        False,
+    )
+    if request_status in ("responded", "failed"):
+        store.finish_model_request(
+            agent_id, run.sequence, handle, ('[{"response":"中文🙂"}]',)
+        )
+    if request_status == "failed":
+        store.fail_model_request(agent_id, run.sequence, handle, error)
+    store.finish_run(
+        agent_id,
+        run.sequence,
+        status=run_status,
+        messages_json='[{"history":"中文🙂"}]',
+        error=error if run_status == "failed" else None,
+    )
+    return run, handle
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "success",
+        "ordinary",
+        "pending",
+        "interrupted",
+        "reason",
+        "type",
+        "status_code",
+        "provider_code",
+        "no_call",
+        "prepared",
+        "overflow",
+    ],
+)
+def test_preparation_failure_streak_reads_all_calls_and_window_boundaries(
+    agent_store, boundary
+):
+    for _ in range(2):
+        run, _ = _record_preparation_call(agent_store)
+    assert agent_store.preparation_failure_streak(AGENT, run.sequence) == 2
+    if boundary == "success":
+        _record_preparation_call(
+            agent_store, request_status="responded", run_status="completed"
+        )
+    elif boundary == "ordinary":
+        _record_preparation_call(agent_store, reminded=[(1, 1)])
+    elif boundary in ("pending", "interrupted"):
+        _record_preparation_call(
+            agent_store, request_status="pending", run_status=boundary
+        )
+    elif boundary in ("prepared", "overflow"):
+        agent_store.reset_window(AGENT, boundary)
+    elif boundary == "no_call":
+        no_call = agent_store.start_run(AGENT)
+        agent_store.finish_run(
+            AGENT,
+            no_call.sequence,
+            status="failed",
+            messages_json="[]",
+            error="RuntimeError: startup",
+        )
+        assert agent_store.preparation_failure_streak(AGENT, no_call.sequence) == 0
+    else:
+        replacement = {
+            "reason": "UnexpectedModelBehavior: filtered",
+            "type": "ContentFilterError: empty",
+            "status_code": "ModelHTTPError: status_code: 429, model_name: gpt-6.1, body: busy",
+            "provider_code": "ModelHTTPError: {'code': 'rate_limit', 'message': 'busy'}",
+        }[boundary]
+        _record_preparation_call(agent_store, error=replacement)
+    final, _ = _record_preparation_call(agent_store)
+    assert agent_store.preparation_failure_streak(AGENT, final.sequence) == (
+        3 if boundary == "no_call" else 1
+    )
+    assert agent_store.preparation_failure_streak(AGENT + 1, final.sequence) == 0
+    assert agent_store.preparation_failure_streak(AGENT, run.sequence) == 0
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    ["UnexpectedModelBehavior", "ContentFilterError", "IncompleteToolCall"],
+)
+def test_legacy_response_failure_binds_only_last_request_and_preserves_records(
+    agent_store, error_type
+):
+    error = f"{error_type}: empty after 4000 tokens"
+    for _ in range(2):
+        run, _ = _record_preparation_call(
+            agent_store, error=error, request_status="responded"
+        )
+    originals = agent_store.runs(AGENT)
+    summaries = [
+        agent_store.model_request_summaries(AGENT, run.sequence) for run in originals
+    ]
+    assert agent_store.preparation_failure_streak(AGENT, run.sequence) == 2
+    agent_store.mark_session_start()
+    agent_store.reset_safety(AGENT)
+    assert agent_store.preparation_failure_streak(AGENT, run.sequence) == 2
+    assert agent_store.runs(AGENT) == originals
+    assert [
+        agent_store.model_request_summaries(AGENT, run.sequence) for run in originals
+    ] == summaries
+    successful = agent_store.start_model_request(
+        AGENT,
+        run.sequence,
+        run.run_id,
+        1,
+        (),
+        "{}",
+        "{}",
+        "{}",
+        False,
+    )
+    agent_store.finish_model_request(
+        AGENT, run.sequence, successful, ('[{"text":"ok"}]',)
+    )
+    assert agent_store.preparation_failure_streak(AGENT, run.sequence) == 1
+    final, _ = _record_preparation_call(agent_store, error=error)
+    assert agent_store.preparation_failure_streak(AGENT, final.sequence) == 2
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        "RuntimeError",
+        "HistoryPersistenceError",
+        "HistoryValidationError",
+        "UsageLimitExceeded",
+        "RunCancelled",
+        "CancelledError",
+        "ToolFailed",
+        "ToolRetryError",
+        "ModelRetry",
+        "UserError",
+    ],
+)
+def test_non_model_legacy_errors_are_not_preparation_failures(agent_store, error_type):
+    for _ in range(3):
+        run, _ = _record_preparation_call(
+            agent_store, error=f"{error_type}: failed", request_status="responded"
+        )
+    assert agent_store.preparation_failure_streak(AGENT, run.sequence) == 0
+
+
+def test_preparation_failure_streak_is_bounded_metadata_and_repeatable(agent_store):
+    for index in range(5):
+        run, handle = _record_preparation_call(
+            agent_store,
+            error=f"ModelHTTPError: status_code: 502, model_name: gpt-6.1, body: request_id=req-{index}, busy after {index + 3}ms",
+        )
+    original = agent_store.model_request_summaries(AGENT, run.sequence)
+    agent_store.fail_model_request(AGENT, run.sequence, handle, original[0].error)
+    connection = agent_store._db._connection
+    denied = {
+        "messages_json",
+        "response_json",
+        "parameters_json",
+        "settings_json",
+        "model_json",
+        "content_json",
+    }
+
+    def authorize(action, table, column, database, source):
+        if action == sqlite3.SQLITE_READ and column in denied:
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    connection.set_authorizer(authorize)
+    try:
+        for _ in range(3):
+            assert agent_store.preparation_failure_streak(AGENT, run.sequence) == 3
+    finally:
+        connection.set_authorizer(None)
+    assert len(agent_store.model_request_summaries(AGENT, run.sequence)) == 1
+    assert (
+        agent_store.model_request_summaries(AGENT, run.sequence)[0].response_count == 1
+    )
+    assert len(agent_store.window_events(AGENT)) == 1
+
+
+def test_sdk_completed_request_retains_response_and_interrupts_legacy_error_reading(
+    agent_store,
+):
+    for _ in range(2):
+        _record_preparation_call(agent_store)
+    run, handle = _record_preparation_call(agent_store, request_status="responded")
+    original = agent_store.model_request_summary(AGENT, run.sequence, handle.ordinal)
+    payloads = agent_store.model_request_messages(
+        AGENT, run.sequence, handle.ordinal, "response", 0, 10
+    )
+    for _ in range(2):
+        agent_store.complete_model_request(AGENT, run.sequence, handle)
+        current = agent_store.model_request_summary(AGENT, run.sequence, handle.ordinal)
+        assert current == replace(original, status="completed")
+        assert agent_store.preparation_failure_streak(AGENT, run.sequence) == 0
+        assert (
+            agent_store.model_request_messages(
+                AGENT, run.sequence, handle.ordinal, "response", 0, 10
+            )
+            == payloads
+        )
+    failed_run, failed = _record_preparation_call(agent_store)
+    assert agent_store.preparation_failure_streak(AGENT, failed_run.sequence) == 1
+    with pytest.raises(DomainError, match="successful response"):
+        agent_store.complete_model_request(AGENT, failed_run.sequence, failed)
+
+
+@pytest.mark.parametrize(
+    "state", ["pending", "interrupted", "wrong_id", "missing_response"]
+)
+def test_sdk_completion_requires_successful_response_and_actual_identity(
+    agent_store, state
+):
+    run = agent_store.start_run(AGENT)
+    handle = agent_store.start_model_request(
+        AGENT, run.sequence, run.run_id, 1, (), "{}", "{}", "{}", False
+    )
+    if state == "interrupted":
+        agent_store.finish_run(
+            AGENT, run.sequence, status="interrupted", messages_json="[]"
+        )
+    elif state in ("wrong_id", "missing_response"):
+        agent_store.finish_model_request(
+            AGENT,
+            run.sequence,
+            handle,
+            ('[{"text":"done"}]',) if state == "wrong_id" else (),
+        )
+    original = agent_store.model_request_summary(AGENT, run.sequence, handle.ordinal)
+    invalid = replace(handle, request_id="wrong-id") if state == "wrong_id" else handle
+    with pytest.raises(DomainError, match="successful response"):
+        agent_store.complete_model_request(AGENT, run.sequence, invalid)
+    assert (
+        agent_store.model_request_summary(AGENT, run.sequence, handle.ordinal)
+        == original
+    )
+
+
+@pytest.mark.parametrize("failure", ["transaction", "completion"])
+def test_sdk_completion_save_failure_preserves_response_status_and_fields(
+    agent_store, failure
+):
+    run, handle = _record_preparation_call(agent_store, request_status="responded")
+    original = agent_store.model_request_summary(AGENT, run.sequence, handle.ordinal)
+    if failure == "completion":
+        agent_store._db.execute(
+            "CREATE TEMP TRIGGER reject_completed BEFORE UPDATE ON agent_model_requests "
+            "WHEN NEW.status = 'completed' BEGIN SELECT RAISE(ABORT, 'completion failed'); END"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="completion failed"):
+            agent_store.complete_model_request(AGENT, run.sequence, handle)
+    else:
+        with (
+            pytest.raises(ValueError, match="transaction failed"),
+            agent_store.transaction(),
+        ):
+            agent_store.complete_model_request(AGENT, run.sequence, handle)
+            raise ValueError("transaction failed")
+    assert (
+        agent_store.model_request_summary(AGENT, run.sequence, handle.ordinal)
+        == original
+    )

@@ -118,6 +118,12 @@ class _TurnRequestRecorder:
         )
         self._progress("request.error")
 
+    def success(self, handle: ModelRequestHandle) -> None:
+        self._history.complete_model_request(
+            self._run.agent_id, self._run.sequence, handle
+        )
+        self._progress("request.completed")
+
 
 class Scheduler:
     def __init__(
@@ -809,11 +815,20 @@ class Scheduler:
                         ):
                             self.history.pause_for_safety(agent_id, "no_tool_calls")
                         reason = None
-                        if (
-                            status == "failed"
-                            and context_exceeded
-                            and run.sequence
-                            != self.history.window(agent_id).since_sequence
+                        if status == "failed" and (
+                            (
+                                context_exceeded
+                                and run.sequence
+                                != self.history.window(agent_id).since_sequence
+                            )
+                            or (
+                                run_failure is None
+                                and reminder is None
+                                and self.history.preparation_failure_streak(
+                                    agent_id, run.sequence
+                                )
+                                >= 3
+                            )
                         ):
                             reason = "overflow"
                         elif status == "completed" and reminder is None:

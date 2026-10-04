@@ -2769,3 +2769,265 @@ def test_live_model_request_snapshot_failure_prevents_provider_call(settings):
             )
         )
     assert calls == []
+
+
+class FinalResultRecorder:
+    def __init__(self):
+        self.started = []
+        self.responses = []
+        self.errors = []
+        self.successes = []
+
+    def start(
+        self, messages_json, parameters_json, settings_json, model_json, streaming
+    ):
+        from fora.ports.agent import ModelRequestHandle
+
+        handle = ModelRequestHandle(
+            len(self.started) + 1, f"request-{len(self.started) + 1}"
+        )
+        self.started.append(handle)
+        return handle
+
+    def response(self, handle, response_json):
+        self.responses.append((handle, response_json))
+
+    def related(self, handle, messages_json):
+        pass
+
+    def error(self, handle, error):
+        self.errors.append((handle, error))
+
+    def success(self, handle):
+        self.successes.append(handle)
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [
+        [],
+        [TextPart("")],
+        [ThinkingPart("private thinking")],
+        [ToolCallPart("organization", '{"action":')],
+    ],
+)
+def test_sdk_final_model_error_records_response_and_matching_handle(settings, parts):
+    recorder = FinalResultRecorder()
+    runner = PydanticModelRunner(
+        settings,
+        build_model=lambda config: FunctionModel(
+            lambda messages, info: ModelResponse(
+                parts=parts,
+                finish_reason="length",
+                usage=RequestUsage(input_tokens=230001),
+            )
+        ),
+    )
+    outcome = runner.run(
+        replace(request(), reminder=None, request_recorder=recorder), None
+    )
+    assert outcome.error.startswith(("UnexpectedModelBehavior:", "IncompleteToolCall:"))
+    expected_calls = 3 if parts and isinstance(parts[0], ToolCallPart) else 1
+    assert len(recorder.started) == len(recorder.responses) == expected_calls
+    assert len(recorder.errors) == 1
+    assert recorder.successes == recorder.started[:-1]
+    assert recorder.responses[-1][0] == recorder.errors[0][0] == recorder.started[-1]
+    assert recorder.errors[0][1] == outcome.error
+    assert f"Failed model request ordinal: {expected_calls}" in outcome.overflow_context
+    assert "private thinking" not in outcome.overflow_context
+    original = ModelMessagesTypeAdapter.validate_json(recorder.responses[0][1][0])[0]
+    assert original.parts == parts
+    assert original.usage.input_tokens == 230001
+    assert not outcome.context_exceeded
+
+
+def test_sdk_error_before_second_request_preserves_first_success(settings, monkeypatch):
+    from pydantic_ai.exceptions import UnexpectedModelBehavior
+
+    recorder = FinalResultRecorder()
+    runner = PydanticModelRunner(
+        settings,
+        build_model=lambda config: FunctionModel(
+            lambda messages, info: ModelResponse(parts=[ToolCallPart("local_step", {})])
+        ),
+    )
+
+    @runner._agent.tool_plain
+    def local_step():
+        return "tool completed"
+
+    hooks = Hooks()
+
+    @hooks.on.before_model_request
+    async def fail_before_request(ctx, request_context):
+        if ctx.run_step == 2:
+            raise UnexpectedModelBehavior("request setup failed")
+        return request_context
+
+    original_run = runner._agent.run
+
+    async def run_with_hooks(*args, **kwargs):
+        kwargs["capabilities"] = [*kwargs["capabilities"], hooks]
+        return await original_run(*args, **kwargs)
+
+    monkeypatch.setattr(runner._agent, "run", run_with_hooks)
+    outcome = runner.run(
+        replace(request(), reminder=None, request_recorder=recorder), None
+    )
+    assert outcome.error == "UnexpectedModelBehavior: request setup failed"
+    assert len(recorder.started) == len(recorder.responses) == 1
+    assert recorder.successes == recorder.started
+    assert recorder.errors == []
+    assert outcome.overflow_context is None
+
+
+def test_live_model_failure_notification_is_idempotent(settings):
+    from pydantic_ai.exceptions import UnexpectedModelBehavior
+
+    recorder = FinalResultRecorder()
+    error = UnexpectedModelBehavior("invalid provider response")
+
+    def fail(messages, info):
+        raise error
+
+    wrapped = FunctionModel(fail)
+    live = LiveModel(lambda: wrapped, lambda: "", "key", request_recorder=recorder)
+    with pytest.raises(UnexpectedModelBehavior) as failure:
+        asyncio.run(
+            live.request(
+                [ModelRequest(parts=[UserPromptPart("input")])],
+                None,
+                ModelRequestParameters(),
+            )
+        )
+    assert failure.value is error
+    live._record_error(live.current_request_handle, error)
+    live._record_error(live.current_request_handle, error)
+    assert len(recorder.started) == len(recorder.errors) == 1
+    assert live.model_failure == (recorder.started[0], error)
+
+
+@pytest.mark.parametrize("position", ["response", "error"])
+def test_final_model_result_save_failure_preserves_persistence_chain(
+    settings, position
+):
+    class Recorder(FinalResultRecorder):
+        def response(self, handle, response_json):
+            if position == "response":
+                raise OSError("response unavailable")
+            super().response(handle, response_json)
+
+        def error(self, handle, error):
+            raise OSError("error unavailable")
+
+    recorder = Recorder()
+    runner = PydanticModelRunner(
+        settings,
+        build_model=lambda config: FunctionModel(
+            lambda messages, info: ModelResponse(
+                parts=[ThinkingPart("thinking")], finish_reason="length"
+            )
+        ),
+    )
+    with pytest.raises(HistoryPersistenceError) as failure:
+        runner.run(replace(request(), reminder=None, request_recorder=recorder), None)
+    assert isinstance(failure.value.__cause__, OSError)
+    assert position in str(failure.value.__cause__)
+    assert len(recorder.started) == 1
+    assert recorder.errors == []
+
+
+def test_streaming_actual_call_retains_response_and_final_error_handle(settings):
+    from pydantic_ai.exceptions import UnexpectedModelBehavior
+
+    recorder = FinalResultRecorder()
+
+    async def stream(messages, info):
+        yield "streamed text"
+
+    wrapped = FunctionModel(stream_function=stream)
+    live = LiveModel(lambda: wrapped, lambda: "", "key", request_recorder=recorder)
+
+    async def consume():
+        async with live.request_stream(
+            [ModelRequest(parts=[UserPromptPart("input")])],
+            None,
+            ModelRequestParameters(),
+        ) as response:
+            async for _ in response:
+                pass
+
+    asyncio.run(consume())
+    error = UnexpectedModelBehavior("stream response rejected")
+    live._record_error(live.current_request_handle, error)
+    live._record_error(live.current_request_handle, error)
+    assert len(recorder.started) == len(recorder.responses) == len(recorder.errors) == 1
+    assert recorder.responses[0][0] == recorder.errors[0][0]
+    assert (
+        ModelMessagesTypeAdapter.validate_json(recorder.responses[0][1][0])[0]
+        .parts[0]
+        .content
+        == "streamed text"
+    )
+
+
+def test_provider_http_retries_share_one_actual_request_identity(settings, monkeypatch):
+    import httpx
+    from openai import AsyncOpenAI
+
+    attempts = []
+
+    def fail_http(http_request):
+        attempts.append(http_request)
+        return httpx.Response(
+            502,
+            json={"error": {"code": "server_error", "message": "busy"}},
+            headers={"retry-after-ms": "1"},
+        )
+
+    monkeypatch.setattr(models, "ALLOW_MODEL_REQUESTS", True)
+    client = AsyncOpenAI(
+        api_key="unused",
+        base_url="https://example.invalid/v1",
+        max_retries=2,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(fail_http)),
+    )
+    recorder = FinalResultRecorder()
+    runner = PydanticModelRunner(
+        settings,
+        build_model=lambda config: OpenAIChatModel(
+            "local", provider=OpenAIProvider(openai_client=client)
+        ),
+    )
+    try:
+        outcome = runner.run(
+            replace(request(), reminder=None, request_recorder=recorder), None
+        )
+        assert outcome.error.startswith("ModelHTTPError: status_code: 502")
+        assert len(attempts) == 3
+        assert len(recorder.started) == len(recorder.errors) == 1
+        assert recorder.responses == []
+        assert recorder.errors[0] == (recorder.started[0], outcome.error)
+        assert "Failed model request ordinal: 1" in outcome.overflow_context
+    finally:
+        asyncio.run(client.close())
+
+
+def test_sdk_success_save_failure_propagates_at_completed_step(settings):
+    class Recorder(FinalResultRecorder):
+        def success(self, handle):
+            raise OSError("completion unavailable")
+
+    recorder = Recorder()
+    runner = PydanticModelRunner(
+        settings,
+        build_model=lambda config: FunctionModel(
+            lambda messages, info: ModelResponse(parts=[TextPart("done")])
+        ),
+    )
+    with pytest.raises(HistoryPersistenceError) as failure:
+        runner.run(replace(request(), request_recorder=recorder), None)
+    assert isinstance(failure.value.__cause__, OSError)
+    assert str(failure.value.__cause__) == "completion unavailable"
+    assert len(recorder.started) == len(recorder.responses) == 1
+    assert recorder.errors == []

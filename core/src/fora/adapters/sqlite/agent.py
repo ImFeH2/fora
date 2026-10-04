@@ -15,7 +15,7 @@ from fora.adapters.model.config import (
 )
 from fora.adapters.sqlite.store import LockedConnection, first
 from fora.core.errors import DomainError
-from fora.core.turn import OVERFLOW_CONTEXT_BYTES
+from fora.core.turn import OVERFLOW_CONTEXT_BYTES, model_error_signature
 from fora.ports.agent import (
     AgentHistoryRun,
     AgentLifecycle,
@@ -359,6 +359,65 @@ class SqliteAgentStore:
             streak += 1
         return streak
 
+    def preparation_failure_streak(self, agent_id: int, sequence: int) -> int:
+        window = self.window(agent_id)
+        rows = self._db.execute(
+            "SELECT m.sequence, m.ordinal, m.status, m.error,"
+            " r.status AS run_status, r.error AS run_error, r.reminded_json,"
+            " m.ordinal = (SELECT MAX(last.ordinal) FROM agent_model_requests last"
+            " WHERE last.agent_id = m.agent_id AND last.sequence = m.sequence) AS is_last"
+            " FROM agent_model_requests m JOIN agent_runs r"
+            " ON r.agent_id = m.agent_id AND r.sequence = m.sequence"
+            " WHERE m.agent_id = ? AND m.window_number = ? AND r.window_number = ?"
+            " AND m.sequence >= ? ORDER BY m.sequence DESC, m.ordinal DESC LIMIT 3",
+            (agent_id, window.number, window.number, window.since_sequence),
+        )
+        if not rows or rows[0]["sequence"] != sequence:
+            return 0
+        signature = None
+        streak = 0
+        for row in rows:
+            if row["reminded_json"] != "[]" or row["run_status"] != "failed":
+                break
+            error = row["error"]
+            if row["status"] == "responded" and row["is_last"]:
+                error = row["run_error"]
+                if not error or not error.startswith(
+                    (
+                        "UnexpectedModelBehavior:",
+                        "ContentFilterError:",
+                        "IncompleteToolCall:",
+                    )
+                ):
+                    break
+            elif row["status"] != "failed":
+                break
+            if (
+                not error
+                or error != row["run_error"]
+                or error.startswith(
+                    (
+                        "HistoryPersistenceError:",
+                        "HistoryValidationError:",
+                        "UsageLimitExceeded:",
+                        "RunCancelled:",
+                        "CancelledError:",
+                        "ToolFailed:",
+                        "ToolRetryError:",
+                        "ToolFailedError:",
+                        "ModelRetry:",
+                        "UserError:",
+                    )
+                )
+            ):
+                break
+            current = model_error_signature(error)
+            if signature is not None and signature != current:
+                break
+            signature = current
+            streak += 1
+        return streak
+
     def pause_reason(self, agent_id: int) -> str | None:
         row = first(
             self._db.execute(
@@ -620,6 +679,21 @@ class SqliteAgentStore:
             )
             if cursor.rowcount != 1:
                 raise DomainError("not_found", "Model request does not exist")
+
+    def complete_model_request(
+        self, agent_id: int, sequence: int, handle: ModelRequestHandle
+    ) -> None:
+        with self._db:
+            cursor = self._db.execute_cursor(
+                "UPDATE agent_model_requests SET status = 'completed'"
+                " WHERE agent_id = ? AND sequence = ? AND ordinal = ? AND request_id = ?"
+                " AND status IN ('responded', 'completed') AND response_count > 0",
+                (agent_id, sequence, handle.ordinal, handle.request_id),
+            )
+            if cursor.rowcount != 1:
+                raise DomainError(
+                    "invalid_state", "Model request has no successful response"
+                )
 
     def link_model_request(
         self,

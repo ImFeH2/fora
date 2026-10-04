@@ -20,7 +20,9 @@ from pydantic import TypeAdapter
 from pydantic_ai import (
     Agent,
     BinaryContent,
+    CallToolsNode,
     ModelMessagesTypeAdapter,
+    ModelRequestNode,
     ModelRetry,
     RunContext,
     Tool,
@@ -28,14 +30,22 @@ from pydantic_ai import (
     capture_run_messages,
 )
 from pydantic_ai._genai_prices import fill_response_cost
-from pydantic_ai.capabilities import Hooks, WrapToolExecuteHandler
+from pydantic_ai.capabilities import (
+    AgentNode,
+    Hooks,
+    NodeResult,
+    WrapToolExecuteHandler,
+)
 from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
 from pydantic_ai.exceptions import (
     ApprovalRequired,
     CallDeferred,
     ModelHTTPError,
+    RunCancelled,
     SkipToolExecution,
     ToolFailed,
+    UnexpectedModelBehavior,
+    UsageLimitExceeded,
 )
 from pydantic_ai.messages import (
     InstructionPart,
@@ -413,6 +423,11 @@ class LiveModel(WrapperModel):
         self._last_request_handle: ModelRequestHandle | None = None
         self._last_response: ModelResponse | None = None
         self.current_request_handle: ModelRequestHandle | None = None
+        self.current_response: ModelResponse | None = None
+        self.model_failure: tuple[ModelRequestHandle | None, BaseException] | None = (
+            None
+        )
+        self._failed_request_handle: ModelRequestHandle | None = None
         self.tool_response: tuple[ModelResponse, ModelRequestHandle | None] | None = (
             None
         )
@@ -560,6 +575,7 @@ class LiveModel(WrapperModel):
     def _record_response(
         self, handle: ModelRequestHandle | None, response: ModelResponse
     ) -> None:
+        self.current_response = response
         if any(isinstance(part, ToolCallPart) for part in response.parts):
             self.tool_response = (response, handle)
         if handle is None or self._request_recorder is None:
@@ -578,7 +594,20 @@ class LiveModel(WrapperModel):
     def _record_error(
         self, handle: ModelRequestHandle | None, error: BaseException
     ) -> None:
-        if handle is None or self._request_recorder is None:
+        if not isinstance(
+            error,
+            HistoryPersistenceError
+            | HistoryValidationError
+            | UsageLimitExceeded
+            | RunCancelled
+            | asyncio.CancelledError,
+        ):
+            self.model_failure = (handle, error)
+        if (
+            handle is None
+            or self._request_recorder is None
+            or handle == self._failed_request_handle
+        ):
             return
         try:
             self._request_recorder.error(handle, f"{type(error).__name__}: {error}")
@@ -587,6 +616,20 @@ class LiveModel(WrapperModel):
         except Exception as failure:
             raise HistoryPersistenceError(
                 "Could not save the model request failure"
+            ) from failure
+        self._failed_request_handle = handle
+
+    def record_success(self) -> None:
+        handle = self.current_request_handle
+        if handle is None or self._request_recorder is None:
+            return
+        try:
+            self._request_recorder.success(handle)
+        except HistoryPersistenceError:
+            raise
+        except Exception as failure:
+            raise HistoryPersistenceError(
+                "Could not save the model request completion"
             ) from failure
 
     async def request(
@@ -602,6 +645,8 @@ class LiveModel(WrapperModel):
         settings = self._caching(wrapped, model_settings)
         handle = self._start_request(wrapped, outgoing, settings, parameters, False)
         self.current_request_handle = handle
+        self.current_response = None
+        self.model_failure = None
         try:
             response = await wrapped.request(outgoing, settings, parameters)
         except BaseException as error:
@@ -625,6 +670,8 @@ class LiveModel(WrapperModel):
         settings = self._caching(wrapped, model_settings)
         handle = self._start_request(wrapped, outgoing, settings, parameters, True)
         self.current_request_handle = handle
+        self.current_response = None
+        self.model_failure = None
         try:
             async with wrapped.request_stream(
                 outgoing,
@@ -1089,6 +1136,56 @@ class PydanticModelRunner:
 
         counted = RunUsage()
         live_model: LiveModel | None = None
+        node_request_handle: ModelRequestHandle | None = None
+
+        @hooks.on.before_node_run
+        async def track_node(
+            ctx: RunContext[AgentTools], *, node: AgentNode[AgentTools]
+        ) -> AgentNode[AgentTools]:
+            nonlocal node_request_handle
+            if isinstance(node, ModelRequestNode):
+                node_request_handle = (
+                    live_model.current_request_handle
+                    if live_model is not None
+                    else None
+                )
+            return node
+
+        @hooks.on.after_node_run
+        async def record_model_success(
+            ctx: RunContext[AgentTools],
+            *,
+            node: AgentNode[AgentTools],
+            result: NodeResult[AgentTools],
+        ) -> NodeResult[AgentTools]:
+            if (
+                live_model is not None
+                and isinstance(node, CallToolsNode)
+                and node.model_response is live_model.current_response
+            ):
+                live_model.record_success()
+            return result
+
+        @hooks.on.node_run_error
+        async def record_model_error(
+            ctx: RunContext[AgentTools],
+            *,
+            node: AgentNode[AgentTools],
+            error: Exception,
+        ) -> NodeResult[AgentTools]:
+            if live_model is not None and isinstance(error, UnexpectedModelBehavior):
+                handle = live_model.current_request_handle
+                if (
+                    isinstance(node, ModelRequestNode)
+                    and handle is not None
+                    and handle != node_request_handle
+                ) or (
+                    isinstance(node, CallToolsNode)
+                    and live_model.current_response is not None
+                    and node.model_response is live_model.current_response
+                ):
+                    live_model._record_error(handle, error)
+            raise error
 
         async def once() -> Any:
             nonlocal live_model
@@ -1159,7 +1256,12 @@ class PydanticModelRunner:
                 input_tokens = _last_input_tokens(new_messages)
                 error = f"{type(failure).__name__}: {failure}"
                 context_exceeded = is_context_exceeded(failure)
-                if context_exceeded:
+                if context_exceeded or (
+                    request.reminder is None
+                    and live_model is not None
+                    and live_model.model_failure is not None
+                    and live_model.model_failure[1] is failure
+                ):
                     overflow_context = _overflow_context(
                         request.sequence,
                         captured if captured else history,
