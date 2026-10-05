@@ -137,15 +137,21 @@ function getModelForm(element: HTMLElement): HTMLFormElement {
   return form;
 }
 
-function getAddModelToggle(): HTMLElement {
-  const toggle = screen
-    .getAllByRole("button", { name: /^Add model$/ })
-    .find((button) => button.hasAttribute("aria-controls"));
-  if (!toggle) throw new Error("Add model toggle is missing");
-  return toggle;
+async function getModelsSection(settings: ReturnType<typeof within>) {
+  const heading = await settings.findByRole("heading", { name: "Models" });
+  const section = heading.closest("section");
+  if (!section) throw new Error("Models section is missing");
+  return within(section);
 }
 
-function prepareApplication() {
+function getAddModelToggle(
+  models: ReturnType<typeof within>,
+  expanded: boolean,
+): HTMLElement {
+  return models.getByRole("button", { name: "Add model", expanded });
+}
+
+async function prepareApplication() {
   vi.spyOn(backend, "connect").mockResolvedValue();
   vi.spyOn(backend, "onEvent").mockReturnValue(vi.fn());
   vi.spyOn(backend, "onFailure").mockReturnValue(vi.fn());
@@ -171,15 +177,25 @@ function prepareApplication() {
   });
   vi.stubGlobal("ResizeObserver", ResizeObserverStub);
   vi.stubGlobal("requestAnimationFrame", vi.fn());
-  render(<App />);
+  await act(async () => {
+    render(<App />);
+  });
+}
+
+async function getSettingsNavigation() {
+  const navigation = await screen.findByLabelText("Settings", {
+    selector: "nav",
+  });
+  return within(navigation).getByRole("button", { name: "Settings" });
 }
 
 async function openSettings(section: "model" | "agent") {
-  await screen.findByRole("button", { name: "Settings" });
-  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
-  const tab = await screen.findByRole("tab", { name: "Model" });
+  fireEvent.click(await getSettingsNavigation());
+  const tablist = await screen.findByRole("tablist", { name: "Settings" });
+  const tabs = within(tablist);
+  const tab = await tabs.findByRole("tab", { name: "Model" });
   if (section === "agent") {
-    fireEvent.click(screen.getByRole("tab", { name: "Agent" }));
+    fireEvent.click(tabs.getByRole("tab", { name: "Agent" }));
     await screen.findByLabelText("Model requests per Turn");
   }
   return tab;
@@ -218,24 +234,31 @@ describe("mounted Settings interactions", () => {
 
   it("resets new Model fields between Providers and retains them on collapse", async () => {
     await openSettings("model");
-    const provider = await screen.findByLabelText("Provider");
+    const settings = within(
+      await screen.findByRole("group", { name: "Model settings" }),
+    );
+    const provider = await settings.findByLabelText("Provider");
     fireEvent.change(provider, { target: { value: "provider-a" } });
 
-    fireEvent.click(await screen.findByRole("button", { name: /^Add model$/ }));
-    const name = await screen.findByLabelText("Model name");
+    let models = await getModelsSection(settings);
+    fireEvent.click(getAddModelToggle(models, false));
+    const name = await models.findByLabelText("Model name");
     const form = getModelForm(name);
     const remote = within(form).getByRole("combobox", {
       name: "Remote model ID",
     });
     const enabled = within(form).getByRole("checkbox", { name: "Enabled" });
 
-    fireEvent.change(name, { target: { value: "A draft" } });
-    fireEvent.change(remote, { target: { value: "remote-a" } });
-    fireEvent.click(enabled);
+    act(() => {
+      fireEvent.change(name, { target: { value: "A draft" } });
+      fireEvent.change(remote, { target: { value: "remote-a" } });
+      fireEvent.click(enabled);
+    });
 
     fireEvent.change(provider, { target: { value: "provider-b" } });
-    fireEvent.click(await screen.findByRole("button", { name: /^Add model$/ }));
-    const nameB = await screen.findByLabelText("Model name");
+    models = await getModelsSection(settings);
+    fireEvent.click(getAddModelToggle(models, false));
+    const nameB = await models.findByLabelText("Model name");
     const formB = getModelForm(nameB);
     expect((nameB as HTMLInputElement).value).toBe("");
     expect(
@@ -254,41 +277,38 @@ describe("mounted Settings interactions", () => {
     ).toBe(true);
 
     fireEvent.change(provider, { target: { value: "provider-a" } });
-    fireEvent.click(await screen.findByRole("button", { name: /^Add model$/ }));
-    const nameA = await screen.findByLabelText("Model name");
+    models = await getModelsSection(settings);
+    fireEvent.click(getAddModelToggle(models, false));
+    const nameA = await models.findByLabelText("Model name");
     const formA = getModelForm(nameA);
     expect((nameA as HTMLInputElement).value).toBe("");
-    expect(
-      (
-        within(formA).getByRole("combobox", {
-          name: "Remote model ID",
-        }) as HTMLInputElement
-      ).value,
-    ).toBe("");
+    const remoteA = within(formA).getByRole("combobox", {
+      name: "Remote model ID",
+    }) as HTMLInputElement;
+    expect(remoteA.value).toBe("");
     const enabledA = within(formA).getByRole("checkbox", {
       name: "Enabled",
     }) as HTMLInputElement;
     expect(enabledA.checked).toBe(true);
 
-    fireEvent.change(nameA, { target: { value: "Retained draft" } });
-    fireEvent.change(
-      within(formA).getByRole("combobox", { name: "Remote model ID" }),
-      { target: { value: "retained-remote" } },
-    );
-    fireEvent.click(enabledA);
-    fireEvent.click(getAddModelToggle());
-    fireEvent.click(getAddModelToggle());
+    act(() => {
+      fireEvent.change(nameA, { target: { value: "Retained draft" } });
+      fireEvent.change(remoteA, { target: { value: "retained-remote" } });
+      fireEvent.click(enabledA);
+    });
+    const toggleA = getAddModelToggle(models, true);
+    fireEvent.click(toggleA);
+    expect(toggleA.getAttribute("aria-expanded")).toBe("false");
+    expect(toggleA.isConnected).toBe(true);
+    fireEvent.click(toggleA);
+    expect(toggleA.getAttribute("aria-expanded")).toBe("true");
 
-    expect(
-      ((await screen.findByLabelText("Model name")) as HTMLInputElement).value,
-    ).toBe("Retained draft");
-    expect(
-      (
-        within(formA).getByRole("combobox", {
-          name: "Remote model ID",
-        }) as HTMLInputElement
-      ).value,
-    ).toBe("retained-remote");
+    const retainedName = await models.findByLabelText("Model name");
+    expect((retainedName as HTMLInputElement).value).toBe("Retained draft");
+    expect(getModelForm(retainedName)).toBe(formA);
+    expect(remoteA.isConnected).toBe(true);
+    expect(enabledA.isConnected).toBe(true);
+    expect(remoteA.value).toBe("retained-remote");
     expect(enabledA.checked).toBe(false);
   });
 
@@ -311,9 +331,7 @@ describe("mounted Settings interactions", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     const agentTab = screen.getByRole("tab", { name: "Agent" });
-    const settingsNavigation = screen.getByRole("button", {
-      name: "Settings",
-    });
+    const settingsNavigation = await getSettingsNavigation();
     await waitFor(() => {
       expect((agentTab as HTMLButtonElement).disabled).toBe(true);
       expect(settingsNavigation.closest("[inert]")).not.toBeNull();
@@ -352,9 +370,7 @@ describe("mounted Settings interactions", () => {
       (screen.getByRole("tab", { name: "Agent" }) as HTMLButtonElement)
         .disabled,
     ).toBe(false);
-    expect(
-      screen.getByRole("button", { name: "Settings" }).closest("[inert]"),
-    ).toBeNull();
+    expect((await getSettingsNavigation()).closest("[inert]")).toBeNull();
     expect((requestLimit as HTMLInputElement).value).toBe("9");
   });
 });
