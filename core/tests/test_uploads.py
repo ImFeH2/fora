@@ -22,18 +22,10 @@ import httpx
 import pytest
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
-from pydantic_ai import BinaryContent, ModelMessagesTypeAdapter
-from pydantic_ai.messages import (
-    ModelRequest,
-    ModelResponse,
-    ToolCallPart,
-    ToolReturnPart,
-)
 from websockets.sync.client import connect
 
 from fora.adapters.files.uploads import DirectoryUploads, decode_image
 from fora.adapters.jsonl.protocol import Dispatcher
-from fora.adapters.model.runner import attachment_result
 from fora.adapters.sqlite.agent import SqliteAgentStore
 from fora.adapters.sqlite.store import SqliteStore
 from fora.adapters.websocket.server import ControlOutbox, WebServer, resource
@@ -191,60 +183,140 @@ def test_control_slow_connection_isolated(monkeypatch) -> None:
         assert not value.responses and not value.items
 
 
-def test_control_heartbeat_during_large_response_and_worker() -> None:
-    from aiohttp import ClientSession, WSMsgType
+def test_control_heartbeat_during_large_response_and_worker(monkeypatch) -> None:
+    from aiohttp import ClientSession, WSMsgType, web
 
+    heartbeat = 2
+    defaults = []
+    initialize = web.WebSocketResponse.__init__
+    send_str = web.WebSocketResponse.send_str
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    sending = threading.Event()
+    sent = threading.Event()
+
+    def short_heartbeat(connection, *args, **kwargs):
+        defaults.append(kwargs["heartbeat"])
+        assert kwargs["heartbeat"] == 20
+        kwargs["heartbeat"] = heartbeat
+        initialize(connection, *args, **kwargs)
+
+    async def observe_send(connection, text, *args, **kwargs):
+        if len(text) > 32 * 1024 * 1024:
+            sending.set()
+            await send_str(connection, text, *args, **kwargs)
+            sent.set()
+        else:
+            await send_str(connection, text, *args, **kwargs)
+
+    monkeypatch.setattr(web.WebSocketResponse, "__init__", short_heartbeat)
+    monkeypatch.setattr(web.WebSocketResponse, "send_str", observe_send)
     dispatcher = Dispatcher()
     dispatcher.register("large", lambda params: "x" * (32 * 1024 * 1024))
 
     def delayed(params):
-        time.sleep(45)
-        return {"finished": True}
+        entered.set()
+        try:
+            assert release.wait(55)
+            return {"finished": True}
+        finally:
+            finished.set()
 
     dispatcher.register("delayed", delayed)
     server = WebServer(dispatcher, "test-token", None, port=0)
     server.start()
     address = f"http://127.0.0.1:{server.port}/ws?token=test-token"
 
-    async def large(session):
-        async with session.ws_connect(address, max_msg_size=0) as connection:
-            transport = connection._response.connection.transport
-            transport.pause_reading()
-            await connection.send_json({"id": 1, "method": "large"})
-            for _ in range(9):
-                await asyncio.sleep(5)
-                await connection.pong()
-            transport.resume_reading()
-            message = await connection.receive()
-            assert message.type == WSMsgType.TEXT
-            assert len(json.loads(message.data)["result"]) == 32 * 1024 * 1024
-
-    async def long_worker(session):
-        async with session.ws_connect(address) as connection:
-            await connection.send_json({"id": 2, "method": "delayed"})
-            message = await connection.receive()
-            assert message.type == WSMsgType.TEXT
-            assert json.loads(message.data)["result"] == {"finished": True}
-
-    async def missing_pong(session):
-        async with session.ws_connect(address, autoping=False) as connection:
-            started = time.monotonic()
-            message = await connection.receive()
-            assert message.type == WSMsgType.PING
-            message = await connection.receive()
-            assert message.type in (WSMsgType.CLOSED, WSMsgType.CLOSE, WSMsgType.ERROR)
-            assert 29 <= time.monotonic() - started < 36
-
     async def exercise():
+        worker_ping = asyncio.Event()
+        closed_without_pong = asyncio.Event()
+
+        async def large(session):
+            async with session.ws_connect(address, max_msg_size=0) as connection:
+                transport = connection._response.connection.transport
+                transport.pause_reading()
+                await connection.send_json({"id": 1, "method": "large"})
+
+                async def maintain_connection():
+                    while not closed_without_pong.is_set():
+                        await connection.pong()
+                        await asyncio.sleep(heartbeat / 4)
+
+                keepalive = asyncio.create_task(maintain_connection())
+                try:
+                    assert await asyncio.to_thread(sending.wait, 55)
+                    assert not sent.is_set()
+                    await worker_ping.wait()
+                    await closed_without_pong.wait()
+                    assert not sent.is_set()
+                    assert not connection.closed
+                    transport.resume_reading()
+                    message = await connection.receive()
+                    assert message.type == WSMsgType.TEXT
+                    assert len(json.loads(message.data)["result"]) == 32 * 1024 * 1024
+                    assert sent.is_set()
+                finally:
+                    transport.resume_reading()
+                    keepalive.cancel()
+                    await asyncio.gather(keepalive, return_exceptions=True)
+
+        async def long_worker(session):
+            async with session.ws_connect(address, autoping=False) as connection:
+                await connection.send_json({"id": 2, "method": "delayed"})
+                assert await asyncio.to_thread(entered.wait, 55)
+                message = await connection.receive()
+                assert message.type == WSMsgType.PING
+                assert not finished.is_set()
+                worker_ping.set()
+                await connection.pong(message.data)
+                release.set()
+                while True:
+                    message = await connection.receive()
+                    if message.type == WSMsgType.PING:
+                        await connection.pong(message.data)
+                        continue
+                    assert message.type == WSMsgType.TEXT
+                    assert json.loads(message.data)["result"] == {"finished": True}
+                    assert finished.is_set()
+                    break
+
+        async def missing_pong(session):
+            started = time.monotonic()
+            async with session.ws_connect(address, autoping=False) as connection:
+                message = await connection.receive()
+                assert message.type == WSMsgType.PING
+                message = await connection.receive()
+                assert message.type in (
+                    WSMsgType.CLOSED,
+                    WSMsgType.CLOSE,
+                    WSMsgType.ERROR,
+                )
+                assert heartbeat * 1.45 <= time.monotonic() - started < heartbeat * 1.8
+                closed_without_pong.set()
+
         async with ClientSession() as session, asyncio.timeout(55):
-            await asyncio.gather(
-                large(session), long_worker(session), missing_pong(session)
-            )
+            tasks = [
+                asyncio.create_task(large(session)),
+                asyncio.create_task(long_worker(session)),
+                asyncio.create_task(missing_pong(session)),
+            ]
+            try:
+                await asyncio.gather(*tasks)
+            finally:
+                release.set()
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     try:
         asyncio.run(exercise())
     finally:
+        release.set()
         server.stop()
+    assert entered.is_set() and finished.is_set()
+    assert defaults == [20, 20, 20]
+    assert not server._handlers and not dispatcher._sinks
 
 
 @pytest.mark.parametrize("mode", ["worker", "sending"])
@@ -891,6 +963,9 @@ def test_resource_acquisition_cancel_releases_file(tmp_path: Path) -> None:
 
 
 def restore_image_history(database: Path, report: Path, expected_digest: str) -> None:
+    from pydantic_ai import BinaryContent, ModelMessagesTypeAdapter
+    from pydantic_ai.messages import ToolCallPart, ToolReturnPart
+
     started = time.perf_counter()
     store = SqliteStore(database)
     try:
@@ -932,6 +1007,16 @@ def restore_image_history(database: Path, report: Path, expected_digest: str) ->
 
 
 def test_image_history_survives_process_restart(tmp_path: Path) -> None:
+    from pydantic_ai import ModelMessagesTypeAdapter
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        ToolCallPart,
+        ToolReturnPart,
+    )
+
+    from fora.adapters.model.runner import attachment_result
+
     original = Path(__file__).parents[2] / "app/icons/icon.ico"
     with Image.open(original) as source:
         image = source.convert("RGB")
