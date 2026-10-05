@@ -29,7 +29,7 @@ def test_history_reads_unicode_slices_without_loading_or_changing_the_run(
     agent_store: SqliteAgentStore,
 ) -> None:
     prefix = '[{"text":"'
-    payload = prefix + "x" * (2047 - len(prefix)) + "\\n漢" + "x" * 3_000_000 + '終"}]'
+    payload = prefix + "x" * (2047 - len(prefix)) + "\\n漢" + "x" * 8192 + '終"}]'
     run = agent_store.start_run(AGENT)
     agent_store.finish_run(
         AGENT, run.sequence, status="completed", messages_json=payload
@@ -41,6 +41,9 @@ def test_history_reads_unicode_slices_without_loading_or_changing_the_run(
     while True:
         part = history.read(run.sequence, offset)
         assert part is not None
+        assert part.offset == offset
+        assert part.total_length == len(payload)
+        assert part.messages == payload[offset : offset + 2048]
         assert len(part.messages) <= 2048
         chunks.append(part.messages)
         offset += len(part.messages)
@@ -61,6 +64,40 @@ def test_history_reads_unicode_slices_without_loading_or_changing_the_run(
         history.read(run.sequence, 2**63)
 
 
+def test_history_reads_bounded_slices_from_a_large_run(
+    agent_store: SqliteAgentStore,
+) -> None:
+    prefix = '[{"text":"'
+    payload = prefix + "x" * (2047 - len(prefix)) + "\\n漢" + "x" * 3_000_000 + '終"}]'
+    run = agent_store.start_run(AGENT)
+    agent_store.finish_run(
+        AGENT, run.sequence, status="completed", messages_json=payload
+    )
+    history = History(agent_store, AGENT)
+    before = agent_store.runs(AGENT)[0].messages_json
+    for offset in (0, 2048, len(payload) // 2, len(payload) - 2048, len(payload) - 1):
+        part = history.read(run.sequence, offset)
+        assert part is not None
+        assert part.offset == offset
+        assert part.total_length == len(payload)
+        assert part.messages == payload[offset : offset + 2048]
+        assert len(part.messages) <= 2048
+    tail = history.read(run.sequence)
+    assert tail is not None
+    assert tail.offset == len(payload) - 2048
+    assert tail.total_length == len(payload)
+    assert tail.messages == payload[-2048:]
+    final = history.read(run.sequence, len(payload))
+    assert final is not None
+    assert final.offset == len(payload)
+    assert final.total_length == len(payload)
+    assert final.messages == ""
+    for offset in (len(payload) + 1, True, 2**63):
+        with pytest.raises(DomainError):
+            history.read(run.sequence, offset)
+    assert agent_store.runs(AGENT)[0].messages_json == before == payload
+
+
 def test_history_reads_a_run_older_than_the_recent_run_window(
     agent_store: SqliteAgentStore,
 ) -> None:
@@ -68,8 +105,13 @@ def test_history_reads_a_run_older_than_the_recent_run_window(
     agent_store.finish_run(
         AGENT, original.sequence, status="completed", messages_json='[{"text":"old"}]'
     )
-    for _ in range(1000):
-        agent_store.start_run(AGENT)
+    with agent_store._db:
+        for _ in range(1000):
+            agent_store.start_run(AGENT)
+    recent = agent_store.runs(AGENT)
+    assert len(recent) == 50
+    assert [run.sequence for run in recent] == list(range(1001, 951, -1))
+    assert original.sequence not in {run.sequence for run in recent}
     part = History(agent_store, AGENT).read(original.sequence)
     assert part is not None
     assert part.messages == '[{"text":"old"}]'

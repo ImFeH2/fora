@@ -100,8 +100,8 @@ beforeEach(() => {
   listeners = new Set();
 });
 
-afterEach(() => {
-  cleanup();
+afterEach(async () => {
+  await act(async () => cleanup());
   vi.restoreAllMocks();
 });
 
@@ -117,22 +117,24 @@ function organization() {
   } as Awaited<ReturnType<typeof backend.organization>>;
 }
 
-function mountComposer(
+async function mountComposer(
   discussionId: number,
   onSend: () => Promise<boolean> = async () => true,
 ) {
-  return render(
-    <Composer
-      discussionId={discussionId}
-      members={[]}
-      memberIds={new Set<number>()}
-      busy={false}
-      placeholder="Message"
-      onSend={onSend}
-      onHeightChange={() => {}}
-      onOpenVoiceSettings={() => {}}
-    />,
-  );
+  await act(async () => {
+    render(
+      <Composer
+        discussionId={discussionId}
+        members={[]}
+        memberIds={new Set<number>()}
+        busy={false}
+        placeholder="Message"
+        onSend={onSend}
+        onHeightChange={() => {}}
+        onOpenVoiceSettings={() => {}}
+      />,
+    );
+  });
 }
 
 function input() {
@@ -157,20 +159,22 @@ it("retries a failed draft initialization from the Composer", async () => {
     return () => listeners.delete(listener);
   });
 
-  mountComposer(1);
+  await mountComposer(1);
   await failed;
   await waitFor(() =>
     expect(screen.getByRole("alert").textContent).toContain(
       "Draft initialization failed",
     ),
   );
-  expect(input().disabled).toBe(true);
+  const message = input();
+  expect(message.disabled).toBe(true);
   const retry = screen.getByRole("button", { name: "Retry" });
 
-  act(() => retry.click());
+  await act(async () => retry.click());
 
-  await waitFor(() => expect(input().disabled).toBe(false));
-  expect(input().value).toBe("Recovered message");
+  expect(message.isConnected).toBe(true);
+  await waitFor(() => expect(message.disabled).toBe(false));
+  expect(message.value).toBe("Recovered message");
   expect(screen.queryByRole("alert")).toBeNull();
   expect(backend.organization).toHaveBeenCalledTimes(2);
 });
@@ -229,7 +233,7 @@ it("completes upload cancellation after connection recovery", async () => {
     .mockResolvedValue({ cancelled: 1 });
   const send = vi.fn().mockResolvedValue(true);
 
-  mountComposer(3, send);
+  await mountComposer(3, send);
   await waitFor(() => expect(backend.cancelUploads).toHaveBeenCalledOnce());
   expect(screen.getByText("Cancelling upload")).toBeTruthy();
   expect(screen.getByText(/Could not finish cancelling send/)).toBeTruthy();
@@ -300,7 +304,7 @@ it("clears a timed-out upload cancellation when the connection closes", async ()
     .mockResolvedValue({ cancelled: 1 });
   const send = vi.fn().mockResolvedValue(true);
 
-  mountComposer(8, send);
+  await mountComposer(8, send);
   await waitFor(() => expect(input().value).toBe("Edited message"));
   act(() => screen.getByRole("button", { name: "Send · Enter" }).click());
   await waitFor(() => expect(stopUpload).toBeTypeOf("function"));
@@ -381,7 +385,7 @@ it("shows one local save error when cancelling an in-progress upload", async () 
   vi.spyOn(backend, "cancelUploads").mockResolvedValue({ cancelled: 1 });
   const send = vi.fn().mockResolvedValue(true);
 
-  mountComposer(9, send);
+  await mountComposer(9, send);
   await waitFor(() => expect(input().value).toBe("Edited during upload"));
   act(() => screen.getByRole("button", { name: "Send · Enter" }).click());
   await waitFor(() => expect(stopUpload).toBeTypeOf("function"));
@@ -464,7 +468,7 @@ it("keeps connection feedback global when cancellation fails after closure", asy
     .mockResolvedValue({ cancelled: 1 });
   const send = vi.fn().mockResolvedValue(true);
 
-  mountComposer(5, send);
+  await mountComposer(5, send);
   await waitFor(() => expect(backend.cancelUploads).toHaveBeenCalledOnce());
   await act(async () => {
     disconnected = true;
@@ -531,7 +535,7 @@ it("keeps a local cancellation save failure after connection closure", async () 
   vi.spyOn(backend, "cancelUploads").mockResolvedValue({ cancelled: 1 });
   const send = vi.fn().mockResolvedValue(true);
 
-  mountComposer(6, send);
+  await mountComposer(6, send);
   await waitFor(() =>
     expect(screen.getByRole("alert").textContent).toContain(
       "Local storage unavailable",
@@ -596,7 +600,7 @@ it("keeps a file validation error after replacing cancellation feedback", async 
     ),
   );
 
-  mountComposer(7, vi.fn());
+  await mountComposer(7, vi.fn());
   await waitFor(() =>
     expect(screen.getByRole("alert").textContent).toContain(
       "Upload cancellation result unknown",
@@ -680,7 +684,7 @@ it("offers a retry for an upload cleanup timeout on an open connection", async (
     .mockResolvedValue({ cancelled: 1 });
   const send = vi.fn().mockResolvedValue(true);
 
-  mountComposer(4, send);
+  await mountComposer(4, send);
   await waitFor(() => expect(backend.cancelUploads).toHaveBeenCalledOnce());
   expect(screen.getByText("Cancelling upload")).toBeTruthy();
   const retry = screen.getByRole("button", { name: "Retry" });
@@ -717,18 +721,20 @@ it("re-enables the Composer after connection recovery without duplicate feedback
     return () => listeners.delete(listener);
   });
 
-  mountComposer(2);
+  await mountComposer(2);
   await failed;
   await waitFor(() => expect(backend.organization).toHaveBeenCalledOnce());
-  expect(input().disabled).toBe(true);
+  const message = input();
+  expect(message.disabled).toBe(true);
   expect(screen.queryByRole("alert")).toBeNull();
 
-  act(() => {
+  await act(async () => {
     for (const listener of listeners) listener({ type: "connection.restored" });
   });
 
-  await waitFor(() => expect(input().disabled).toBe(false));
-  expect(input().value).toBe("Recovered message");
+  expect(message.isConnected).toBe(true);
+  await waitFor(() => expect(message.disabled).toBe(false));
+  expect(message.value).toBe("Recovered message");
   expect(screen.queryByRole("alert")).toBeNull();
   expect(backend.organization).toHaveBeenCalledTimes(2);
 });
