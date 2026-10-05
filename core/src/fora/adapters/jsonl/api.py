@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict
+from functools import partial
 from typing import Any
 
-from fora.adapters.jsonl.protocol import Dispatcher
+from fora.adapters.files.tree import relative_path
+from fora.adapters.jsonl.protocol import Dispatcher, RequestScope, Resource
 from fora.adapters.model.config import ModelCatalog
 from fora.adapters.model.history import (
     binary_from_history,
@@ -160,12 +163,14 @@ class Api:
         list_models: ModelProbe = _list_models,
         test_model: ModelProbe = _test_model,
         runtime_info: RuntimeInfo | None = None,
+        reading: Callable[[], AbstractContextManager[None]] = nullcontext,
     ) -> None:
         self._scheduler = scheduler
         self._dispatcher = dispatcher
         self._list_models = list_models
         self._test_model = test_model
         self._runtime_info = runtime_info or RuntimeInfo.capture()
+        self._reading = reading
         self._register()
 
     def _human(self) -> AgentTools:
@@ -185,18 +190,23 @@ class Api:
 
         def organization_get(params: dict[str, Any]) -> Any:
             del params
-            members = self._human().list_members()
+            with self._reading():
+                members = self._human().list_member_records()
+                for member in members:
+                    if member["type"] == "agent":
+                        usage = self._scheduler.history.usage_total(int(member["id"]))
+                        member["tokens"] = usage["total_tokens"]
+                organization_uuid = self._human().organization_uuid()
+                statistics = self._scheduler.statistics()
             for member in members:
-                if member["type"] != "agent":
-                    continue
-                usage = self._scheduler.history.usage_total(int(member["id"]))
-                member["tokens"] = usage["total_tokens"]
+                if member["type"] == "agent":
+                    member.update(self._scheduler.agent_status(int(member["id"])))
             return {
                 "id": 1,
-                "uuid": self._human().organization_uuid(),
+                "uuid": organization_uuid,
                 "members": members,
                 "human_id": HUMAN_ID,
-                **self._scheduler.statistics(),
+                **statistics,
             }
 
         def create_agent(params: dict[str, Any]) -> Any:
@@ -295,20 +305,135 @@ class Api:
                 params.get("media_type", ""),
             )
 
-        register("upload.create", upload_create)
+        member_set = Resource("member")
+        discussion_set = Resource("discussion")
+        model_settings = Resource("settings", "model")
+        attachments = Resource("attachments", HUMAN_ID)
+
+        def independent(params: dict[str, Any]) -> RequestScope:
+            return RequestScope()
+
+        def discussion_resource(params: dict[str, Any]) -> Resource:
+            return Resource("discussion", int(params["discussion_id"]))
+
+        def discussion_query(params: dict[str, Any]) -> RequestScope:
+            return RequestScope(reads=(discussion_resource(params), member_set))
+
+        def discussion_change(params: dict[str, Any]) -> RequestScope:
+            return RequestScope(
+                reads=(member_set,), writes=(discussion_resource(params),)
+            )
+
+        def discussion_send_scope(params: dict[str, Any]) -> RequestScope:
+            scope = discussion_change(params)
+            if params.get("attachment_ids"):
+                return RequestScope(
+                    scope.reads + (attachments,), scope.writes + (attachments,)
+                )
+            return scope
+
+        def agent_query(params: dict[str, Any]) -> RequestScope:
+            identity = _required_integer(params, "agent_id")
+            return RequestScope(
+                reads=(Resource("member", identity), Resource("history", identity))
+            )
+
+        def agent_change(params: dict[str, Any]) -> RequestScope:
+            return RequestScope(writes=(Resource("member", int(params["agent_id"])),))
+
+        def workspace_scope(params: dict[str, Any]) -> RequestScope:
+            identity = int(params["agent_id"])
+            return RequestScope(
+                reads=(Resource("member", identity),),
+                writes=(Resource("workspace", identity),),
+            )
+
+        def detail_scope(params: dict[str, Any]) -> RequestScope:
+            scope = workspace_scope(params)
+            return RequestScope(
+                scope.reads
+                + (
+                    Resource("history", int(params["agent_id"])),
+                    model_settings,
+                    Resource("settings", "agent"),
+                ),
+                scope.writes,
+            )
+
+        def setting_query(params: dict[str, Any]) -> RequestScope:
+            section = str(params.get("section", "model"))
+            resource = Resource("settings", section)
+            return (
+                RequestScope(writes=(resource,))
+                if section == "voice"
+                else RequestScope(reads=(resource,))
+            )
+
+        def setting_change(params: dict[str, Any]) -> RequestScope:
+            section = str(params.get("section", "model"))
+            return RequestScope(
+                reads=(member_set,) if section == "model" else (),
+                writes=(Resource("settings", section),),
+            )
+
+        def library_scope(
+            params: dict[str, Any],
+            *,
+            writing: bool = False,
+            directory: bool = False,
+            moving: bool = False,
+        ) -> RequestScope:
+            path = (
+                params.get("path") if directory and not writing else str(params["path"])
+            )
+            root = self._human().library_root
+
+            def identities(value: str, descendants: bool) -> tuple[Resource, ...]:
+                target = root / relative_path(value, allow_root=descendants)
+                resolved = target.resolve()
+                if not resolved.is_relative_to(root):
+                    raise DomainError("invalid_path", "Path must stay inside the tree")
+                return tuple(
+                    dict.fromkeys(
+                        (
+                            Resource("library", target, descendants),
+                            Resource("library", resolved, descendants),
+                        )
+                    )
+                )
+
+            resources = identities(path if path is not None else ".", directory)
+            if moving:
+                resources += identities(str(params["destination"]), True)
+            return (
+                RequestScope(writes=resources)
+                if writing
+                else RequestScope(reads=resources)
+            )
+
+        register(
+            "upload.create",
+            upload_create,
+            scope=lambda params: RequestScope(
+                writes=(discussion_resource(params), attachments)
+            ),
+        )
         register(
             "upload.status",
             lambda params: self._human().upload_status(params["upload_ids"]),
+            scope=lambda params: RequestScope(writes=(attachments,)),
         )
         register(
             "upload.cancel",
             lambda params: self._human().cancel_uploads(params["upload_ids"]),
+            scope=lambda params: RequestScope(writes=(attachments,)),
         )
         register(
             "discussion.send_status",
             lambda params: self._human().send_status(
                 params["discussion_id"], params["client_message_id"]
             ),
+            scope=discussion_query,
         )
 
         register(
@@ -316,6 +441,7 @@ class Api:
             lambda params: self._human().cancel_send(
                 params["discussion_id"], params["client_message_id"]
             ),
+            scope=discussion_change,
         )
 
         def discussion_ack(params: dict[str, Any]) -> Any:
@@ -417,12 +543,14 @@ class Api:
             if limit == 0 or windows_limit == 0:
                 raise DomainError("invalid_params", "history limits must be positive")
             before = _integer_param(params, "before", maximum=2**63 - 1)
-            runs = self._scheduler.history.history_runs(
-                agent_id, before=before, limit=limit
-            )
-            window_page = self._scheduler.history.window_events(
-                agent_id, after=windows_after, limit=windows_limit + 1
-            )
+            with self._reading():
+                self._human().authorize_agent_history(agent_id)
+                runs = self._scheduler.history.history_runs(
+                    agent_id, before=before, limit=limit
+                )
+                window_page = self._scheduler.history.window_events(
+                    agent_id, after=windows_after, limit=windows_limit + 1
+                )
             windows = window_page[:windows_limit]
             has_more_windows = len(window_page) > windows_limit
             return {
@@ -437,7 +565,7 @@ class Api:
                 ),
             }
 
-        def agent_history_read(params: dict[str, Any]) -> Any:
+        def agent_history_read_data(params: dict[str, Any]) -> Any:
             agent_id = _required_integer(params, "agent_id")
             self._human().authorize_agent_history(agent_id)
             sequence = _required_integer(params, "sequence")
@@ -605,26 +733,35 @@ class Api:
             )
             result["request"] = {
                 "summary": _request_summary_payload(summary),
-                "input": _render_message_page(input_page, "input", ordinal),
-                "parameters": _render_model_field_page(
-                    parameters_page, "parameters", ordinal
-                ),
-                "settings": _render_model_field_page(
-                    settings_page, "settings", ordinal
-                ),
-                "model": _render_model_field_page(model_page, "model", ordinal),
-                "response": (
-                    _render_message_page(response_page, "response", ordinal)
-                    if summary.response_count
-                    else None
-                ),
-                "related": _render_message_page(related_page, "related", ordinal),
+                "input": input_page,
+                "parameters": parameters_page,
+                "settings": settings_page,
+                "model": model_page,
+                "response": response_page if summary.response_count else None,
+                "related": related_page,
             }
             if summary.status == "pending" and run.status != "running":
                 result["missing"].append("model_response")
             return result
 
-        def agent_history_text(params: dict[str, Any]) -> Any:
+        def agent_history_read(params: dict[str, Any]) -> Any:
+            with self._reading():
+                result = agent_history_read_data(params)
+            request = result.get("request")
+            if request is not None:
+                ordinal = request["summary"]["ordinal"]
+                for source in ("input", "response", "related"):
+                    if request[source] is not None:
+                        request[source] = _render_message_page(
+                            request[source], source, ordinal
+                        )
+                for source in ("parameters", "settings", "model"):
+                    request[source] = _render_model_field_page(
+                        request[source], source, ordinal
+                    )
+            return result
+
+        def agent_history_text_data(params: dict[str, Any]) -> Callable[[], Any]:
             agent_id = _required_integer(params, "agent_id")
             self._human().authorize_agent_history(agent_id)
             sequence = _required_integer(params, "sequence")
@@ -661,7 +798,7 @@ class Api:
                 page = self._scheduler.history.model_request_field(
                     agent_id, sequence, ordinal, source, offset, limit
                 )
-                return _render_model_field_page(page, source, ordinal)
+                return partial(_render_model_field_page, page, source, ordinal)
             raw = (
                 self._scheduler.history.run_messages(agent_id, sequence)
                 if source == "run"
@@ -678,9 +815,14 @@ class Api:
                 index = 0
             if raw is None:
                 raise DomainError("not_found", "History content does not exist")
-            return text_from_history(raw, index, path, offset, limit)
+            return partial(text_from_history, raw, index, path, offset, limit)
 
-        def agent_history_image(params: dict[str, Any]) -> Any:
+        def agent_history_text(params: dict[str, Any]) -> Any:
+            with self._reading():
+                render = agent_history_text_data(params)
+            return render()
+
+        def agent_history_image_data(params: dict[str, Any]) -> Any:
             agent_id = _required_integer(params, "agent_id")
             self._human().authorize_agent_history(agent_id)
             sequence = _required_integer(params, "sequence")
@@ -710,11 +852,16 @@ class Api:
                     raise DomainError("not_found", "History content does not exist")
             if raw is None:
                 raise DomainError("not_found", "History content does not exist")
-            image = binary_from_history(
+            return (
                 raw,
                 0 if source in ("input", "response", "related") else message_index,
                 path,
             )
+
+        def agent_history_image(params: dict[str, Any]) -> Any:
+            with self._reading():
+                data = agent_history_image_data(params)
+            image = binary_from_history(*data)
             return {
                 "media_type": image.media_type,
                 "size": len(image.data),
@@ -724,14 +871,21 @@ class Api:
 
         def agent_detail(params: dict[str, Any]) -> Any:
             agent_id = int(params["agent_id"])
-            runs = self._scheduler.history.run_summaries(agent_id, limit=30)
-            history_runs = {
-                run.sequence: run
-                for run in self._scheduler.history.history_runs(agent_id, limit=30)
-            }
-            effects = self._scheduler.history.effects(
-                agent_id, sequences=[run.sequence for run in runs]
-            )
+            status = self._scheduler.agent_status(agent_id)
+            with self._reading():
+                self._human().authorize_agent_history(agent_id)
+                runs = self._scheduler.history.run_summaries(agent_id, limit=30)
+                history_runs = {
+                    run.sequence: run
+                    for run in self._scheduler.history.history_runs(agent_id, limit=30)
+                }
+                effects = self._scheduler.history.effects(
+                    agent_id, sequences=[run.sequence for run in runs]
+                )
+                window = self._scheduler.history.window(agent_id)
+                usage = self._scheduler.history.usage_total(agent_id)
+                pause_reason = self._scheduler.history.pause_reason(agent_id)
+                no_tool_streak = self._scheduler.history.no_tool_streak(agent_id)
             produced: dict[int, list[dict[str, Any]]] = {}
             for effect in effects:
                 produced.setdefault(effect.sequence, []).append(
@@ -752,15 +906,13 @@ class Api:
             )
             statistics = self._scheduler.statistics(agent_id, idle_streak=streak)
             return {
-                **self._scheduler.agent_status(agent_id),
-                "window": _window_event_payload(
-                    self._scheduler.history.window(agent_id)
-                ),
+                **status,
+                "window": _window_event_payload(window),
                 "workspace": self._human().list_workspace(agent_id=agent_id),
-                "usage": self._scheduler.history.usage_total(agent_id),
+                "usage": usage,
                 **statistics,
-                "pause_reason": self._scheduler.history.pause_reason(agent_id),
-                "no_tool_streak": self._scheduler.history.no_tool_streak(agent_id),
+                "pause_reason": pause_reason,
+                "no_tool_streak": no_tool_streak,
                 "idle_streak": streak,
                 "runs": [
                     {
@@ -840,43 +992,143 @@ class Api:
         def settings_test_model(params: dict[str, Any]) -> Any:
             return self._test_model(dict(params), settings.get_settings("model"))
 
-        register("info.get", info_get)
-        register("organization.get", organization_get)
-        register("organization.create_agent", create_agent)
-        register("organization.rename_member", rename_member)
-        register("organization.pause_agent", pause_agent)
-        register("organization.resume_agent", resume_agent)
-        register("organization.delete_agent", delete_agent)
-        register("discussion.create", discussion_create)
-        register("discussion.list", discussion_list)
-        register("discussion.read", discussion_read)
-        register("discussion.page", discussion_page)
-        register("discussion.mark_read", discussion_mark_read)
-        register("discussion.ack_pending", discussion_ack_pending)
-        register("discussion.send", discussion_send)
-        register("discussion.ack", discussion_ack)
-        register("discussion.revoke_ack", discussion_revoke_ack)
-        register("discussion.set_members", discussion_members)
-        register("discussion.add_members", discussion_add_members)
-        register("discussion.remove_members", discussion_remove_members)
-        register("discussion.archive", discussion_archive)
-        register("discussion.unarchive", discussion_unarchive)
-        register("discussion.search", discussion_search)
-        register("library.list", library_list)
-        register("library.read", library_read)
-        register("library.write", library_write)
-        register("library.edit", library_edit)
-        register("library.mkdir", library_mkdir)
-        register("workspace.list", workspace_list)
-        register("workspace.read", workspace_read)
-        register("library.delete", library_delete)
-        register("library.move", library_move)
-        register("agent.detail", agent_detail)
-        register("agent.history", agent_history)
-        register("agent.history.read", agent_history_read)
-        register("agent.history.text", agent_history_text)
-        register("agent.history.image", agent_history_image)
-        register("settings.get", settings_get)
-        register("settings.update", settings_update)
-        register("settings.list_models", settings_list_models)
-        register("settings.test_model", settings_test_model)
+        register("info.get", info_get, scope=independent)
+        register(
+            "organization.get",
+            organization_get,
+            scope=lambda params: RequestScope(
+                reads=(
+                    member_set,
+                    model_settings,
+                    Resource("settings", "agent"),
+                    Resource("settings", "execution"),
+                )
+            ),
+        )
+        register(
+            "organization.create_agent",
+            create_agent,
+            scope=lambda params: RequestScope(writes=(member_set, model_settings)),
+        )
+        register(
+            "organization.rename_member",
+            rename_member,
+            scope=lambda params: RequestScope(
+                reads=(member_set,),
+                writes=(Resource("member", int(params["member_id"])),),
+            ),
+        )
+        register("organization.pause_agent", pause_agent, scope=agent_change)
+        register("organization.resume_agent", resume_agent, scope=agent_change)
+        register(
+            "organization.delete_agent",
+            delete_agent,
+            scope=lambda params: RequestScope(
+                writes=(
+                    Resource("member", int(params["agent_id"])),
+                    discussion_set,
+                    model_settings,
+                )
+            ),
+        )
+        register(
+            "discussion.create",
+            discussion_create,
+            scope=lambda params: RequestScope(
+                reads=(member_set,), writes=(discussion_set,)
+            ),
+        )
+        register(
+            "discussion.list",
+            discussion_list,
+            scope=lambda params: RequestScope(reads=(discussion_set, member_set)),
+        )
+        register("discussion.read", discussion_read, scope=discussion_change)
+        register("discussion.page", discussion_page, scope=discussion_query)
+        register("discussion.mark_read", discussion_mark_read, scope=discussion_change)
+        register(
+            "discussion.ack_pending", discussion_ack_pending, scope=discussion_change
+        )
+        register("discussion.send", discussion_send, scope=discussion_send_scope)
+        register("discussion.ack", discussion_ack, scope=discussion_change)
+        register(
+            "discussion.revoke_ack", discussion_revoke_ack, scope=discussion_change
+        )
+        register("discussion.set_members", discussion_members, scope=discussion_change)
+        register(
+            "discussion.add_members", discussion_add_members, scope=discussion_change
+        )
+        register(
+            "discussion.remove_members",
+            discussion_remove_members,
+            scope=discussion_change,
+        )
+        register("discussion.archive", discussion_archive, scope=discussion_change)
+        register("discussion.unarchive", discussion_unarchive, scope=discussion_change)
+        register(
+            "discussion.search",
+            discussion_search,
+            scope=lambda params: RequestScope(
+                reads=(
+                    Resource(
+                        "discussion",
+                        int(params["discussion_id"])
+                        if params.get("discussion_id") is not None
+                        else None,
+                    ),
+                    member_set,
+                )
+            ),
+        )
+        register(
+            "library.list",
+            library_list,
+            scope=lambda params: library_scope(params, directory=True),
+        )
+        register("library.read", library_read, scope=library_scope)
+        register(
+            "library.write",
+            library_write,
+            scope=lambda params: library_scope(params, writing=True),
+        )
+        register(
+            "library.edit",
+            library_edit,
+            scope=lambda params: library_scope(params, writing=True),
+        )
+        register(
+            "library.mkdir",
+            library_mkdir,
+            scope=lambda params: library_scope(params, writing=True, directory=True),
+        )
+        register("workspace.list", workspace_list, scope=workspace_scope)
+        register("workspace.read", workspace_read, scope=workspace_scope)
+        register(
+            "library.delete",
+            library_delete,
+            scope=lambda params: library_scope(params, writing=True, directory=True),
+        )
+        register(
+            "library.move",
+            library_move,
+            scope=lambda params: library_scope(
+                params, writing=True, directory=True, moving=True
+            ),
+        )
+        register("agent.detail", agent_detail, scope=detail_scope)
+        register("agent.history", agent_history, scope=agent_query)
+        register("agent.history.read", agent_history_read, scope=agent_query)
+        register("agent.history.text", agent_history_text, scope=agent_query)
+        register("agent.history.image", agent_history_image, scope=agent_query)
+        register("settings.get", settings_get, scope=setting_query)
+        register("settings.update", settings_update, scope=setting_change)
+        register(
+            "settings.list_models",
+            settings_list_models,
+            scope=lambda params: RequestScope(reads=(model_settings,)),
+        )
+        register(
+            "settings.test_model",
+            settings_test_model,
+            scope=lambda params: RequestScope(reads=(model_settings,)),
+        )

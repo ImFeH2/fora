@@ -88,7 +88,11 @@ def test_distinct_discussion_identity_and_deleted_mention(world):
     assert world.history.pending_revision(MAIN) == 2
     world.store.ack(first, [1], MAIN)
     assert world.history.pending_revision(MAIN) == 3
-    world.store._db.execute("DELETE FROM mentions WHERE discussion_id = ?", (second,))
+    with world.store._db:
+        world.store._db.execute(
+            "DELETE FROM mentions WHERE discussion_id = ?", (second,)
+        )
+        assert world.history.pending_revision(MAIN) == 4
     assert world.history.pending_revision(MAIN) == 4
     assert world.store.pending(MAIN) == ()
 

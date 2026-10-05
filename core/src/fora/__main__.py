@@ -278,6 +278,7 @@ def main(argv: list[str] | None = None) -> int:
             agent_directory_for=agent_directory_for,
             decode_image=decode_image,
             uploads=uploads,
+            reading=store._db.read,
             library_tree=DirectoryTree(directory / "library"),
             workspace_tree_for=lambda member_id: DirectoryTree(
                 directory / "agents" / str(member_id) / "workspace"
@@ -291,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
             on_event=lambda name, payload: dispatcher.emit(name, payload),
         )
         scheduler.recover()
-        Api(scheduler, dispatcher, runtime_info=runtime_info)
+        Api(scheduler, dispatcher, runtime_info=runtime_info, reading=store._db.read)
 
         stop = Stop()
         install_signal_handlers(stop.stop)

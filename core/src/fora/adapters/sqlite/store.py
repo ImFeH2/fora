@@ -3,10 +3,13 @@ from __future__ import annotations
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
+from functools import wraps
 from pathlib import Path
+from threading import Condition, get_ident
 from types import TracebackType
 from typing import Any, Self, cast
 
@@ -245,34 +248,132 @@ def now() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def reading[T, **P](operation: Callable[P, T]) -> Callable[P, T]:
+    @wraps(operation)
+    def query(*args: P.args, **kwargs: P.kwargs) -> T:
+        db: LockedConnection = cast(Any, args[0])._db
+        with db.read():
+            return operation(*args, **kwargs)
+
+    return query
+
+
+class ReadPool:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self.condition = Condition()
+        self.connections: list[LockedConnection] = []
+        self.available: list[LockedConnection] = []
+        self.borrowed = 0
+        self.closed = False
+
+    @contextmanager
+    def borrow(self) -> Iterator[LockedConnection]:
+        with self.condition:
+            self.condition.wait_for(
+                lambda: self.closed or self.available or len(self.connections) < 8
+            )
+            if self.closed:
+                raise RuntimeError("Database read pool is closed")
+            if self.available:
+                db = self.available.pop()
+            else:
+                with ExitStack() as cleanup:
+                    connection = sqlite3.connect(
+                        self._path.resolve().as_uri() + "?mode=ro",
+                        uri=True,
+                        check_same_thread=False,
+                    )
+                    cleanup.callback(connection.close)
+                    connection.row_factory = sqlite3.Row
+                    connection.execute("PRAGMA query_only=ON")
+                    if connection.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
+                        raise RuntimeError("Database read connections require WAL mode")
+                    db = LockedConnection(connection)
+                    self.connections.append(db)
+                    cleanup.pop_all()
+            self.borrowed += 1
+        try:
+            yield db
+        finally:
+            with self.condition:
+                self.borrowed -= 1
+                self.available.append(db)
+                self.condition.notify_all()
+
+    def close(self) -> None:
+        with self.condition:
+            self.closed = True
+            self.condition.notify_all()
+            self.condition.wait_for(lambda: self.borrowed == 0)
+            for db in self.connections:
+                db.close()
+            self.connections.clear()
+            self.available.clear()
+
+
 class LockedConnection:
-    def __init__(self, connection: sqlite3.Connection) -> None:
+    def __init__(
+        self, connection: sqlite3.Connection, path: Path | None = None
+    ) -> None:
         self._connection = connection
         self._lock = OrderedRLock(LockLevel.DATABASE)
         self._depth = 0
         self._rollback_only = False
+        self._owner: int | None = None
+        self._selected: ContextVar[LockedConnection | None] = ContextVar(
+            "sqlite_read_connection", default=None
+        )
+        self._readers = ReadPool(path) if path is not None else None
+
+    @property
+    def current(self) -> LockedConnection:
+        return self._selected.get() or self
 
     @property
     def lock(self) -> OrderedRLock:
-        return self._lock
+        return self.current._lock
+
+    @contextmanager
+    def read(self) -> Iterator[None]:
+        if self._owner == get_ident() or self._selected.get() is not None:
+            yield
+            return
+        assert self._readers is not None
+        with self._readers.borrow() as db:
+            token = self._selected.set(db)
+            try:
+                with db.transaction(immediate=False):
+                    yield
+            finally:
+                self._selected.reset(token)
 
     def execute(self, sql: str, parameters: Sequence[Any] = ()) -> list[sqlite3.Row]:
-        with self._lock:
-            return self._connection.execute(sql, parameters).fetchall()
+        db = self.current
+        with db._lock:
+            cursor = db._connection.execute(sql, parameters)
+            try:
+                return cursor.fetchall()
+            finally:
+                cursor.close()
 
     def execute_cursor(
         self, sql: str, parameters: Sequence[Any] = ()
     ) -> sqlite3.Cursor:
-        with self._lock:
-            return self._connection.execute(sql, parameters)
+        db = self.current
+        with db._lock:
+            return db._connection.execute(sql, parameters)
 
     def executemany(
         self, sql: str, parameters: Sequence[Sequence[Any]]
     ) -> sqlite3.Cursor:
-        with self._lock:
-            return self._connection.executemany(sql, parameters)
+        db = self.current
+        with db._lock:
+            return db._connection.executemany(sql, parameters)
 
     def executescript(self, sql: str) -> None:
+        if self.current is not self:
+            raise RuntimeError("Cannot execute a script in a read context")
         with self._lock:
             if self._depth or self._connection.in_transaction:
                 self._rollback_only = True
@@ -282,6 +383,8 @@ class LockedConnection:
             self._connection.executescript(sql)
 
     def commit(self) -> None:
+        if self.current is not self:
+            raise RuntimeError("Cannot commit inside a read context")
         with self._lock:
             if self._depth:
                 self._rollback_only = True
@@ -289,23 +392,29 @@ class LockedConnection:
             self._connection.commit()
 
     def close(self) -> None:
+        if self.current is not self:
+            raise RuntimeError("Cannot close inside a read context")
         with self._lock:
             if self._depth:
                 self._rollback_only = True
                 raise RuntimeError("Cannot close an active transaction")
+        if self._readers is not None:
+            self._readers.close()
+        with self._lock:
             self._connection.close()
 
     def transaction(self, *, immediate: bool = True) -> Transaction:
-        return Transaction(self, immediate=immediate)
+        return Transaction(self.current, immediate=immediate)
 
     def __enter__(self) -> Self:
-        return self._enter(immediate=True)
+        return cast(Self, self.current._enter(immediate=True))
 
     def _enter(self, *, immediate: bool) -> Self:
         with self._lock:
             if self._depth == 0:
                 self._connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
                 self._rollback_only = False
+                self._owner = get_ident()
             self._depth += 1
             self._lock.acquire()
         return self
@@ -316,6 +425,9 @@ class LockedConnection:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
+        if self.current is not self:
+            self.current.__exit__(exc_type, exc, traceback)
+            return
         try:
             self._rollback_only = self._rollback_only or exc_type is not None
             self._depth -= 1
@@ -327,6 +439,7 @@ class LockedConnection:
                     else:
                         self._connection.commit()
                 finally:
+                    self._owner = None
                     if self._connection.in_transaction:
                         self._connection.rollback()
         finally:
@@ -386,7 +499,7 @@ class SqliteStore:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA foreign_keys=ON")
-            self._db = LockedConnection(connection)
+            self._db = LockedConnection(connection, self._path)
             self._db.executescript(SCHEMA)
             if "state" not in {
                 row["name"]
@@ -458,6 +571,7 @@ class SqliteStore:
     def close(self) -> None:
         self._db.close()
 
+    @reading
     def organization_uuid(self) -> str:
         row = first(
             self._db.execute("SELECT uuid FROM organization_identity WHERE id = 1")
@@ -571,6 +685,7 @@ class SqliteStore:
             )
             return self.get_upload(upload_id, owner_id)
 
+    @reading
     def get_upload(self, upload_id: str, owner_id: int) -> Upload:
         row = first(
             self._db.execute(
@@ -582,6 +697,7 @@ class SqliteStore:
             raise DomainError("not_found", "Upload not found")
         return self._upload(row)
 
+    @reading
     def ready_attachment(self, upload_id: str, owner_id: int) -> Attachment:
         row = first(
             self._db.execute(
@@ -659,6 +775,7 @@ class SqliteStore:
                 (upload_id,),
             )
 
+    @reading
     def attachment(
         self,
         discussion_id: int,
@@ -679,6 +796,7 @@ class SqliteStore:
                 raise DomainError("not_found", "Attachment not found in this message")
             return self._attachment(row)
 
+    @reading
     def message_receipt(
         self, discussion_id: int, owner_id: int, client_message_id: str
     ) -> Message | None:
@@ -691,6 +809,7 @@ class SqliteStore:
             )
             return rows[0] if rows else None
 
+    @reading
     def send_outcome(
         self, discussion_id: int, owner_id: int, client_message_id: str
     ) -> tuple[str, Message | None]:
@@ -725,6 +844,7 @@ class SqliteStore:
         with self._db as connection:
             yield connection
 
+    @reading
     def list_members(self, *, include_deleted: bool = False) -> tuple[Member, ...]:
         sql = "SELECT * FROM members"
         if not include_deleted:
@@ -732,12 +852,14 @@ class SqliteStore:
         sql += " ORDER BY id"
         return tuple(member_from_row(row) for row in self._db.execute(sql))
 
+    @reading
     def get_member(self, member_id: int) -> Member | None:
         row = first(
             self._db.execute("SELECT * FROM members WHERE id = ?", (member_id,))
         )
         return member_from_row(row) if row else None
 
+    @reading
     def name_taken(self, name: str) -> bool:
         row = first(
             self._db.execute(
@@ -778,6 +900,7 @@ class SqliteStore:
             archived=bool(row["archived"]),
         )
 
+    @reading
     def list_discussions(
         self,
         *,
@@ -805,6 +928,7 @@ class SqliteStore:
             params.append(min(limit, 2**63 - 1))
         return tuple(self._discussion(row) for row in self._db.execute(sql, params))
 
+    @reading
     def get_discussion(self, discussion_id: int) -> Discussion | None:
         row = first(
             self._db.execute("SELECT * FROM discussions WHERE id = ?", (discussion_id,))
@@ -1060,6 +1184,7 @@ class SqliteStore:
                 self._advance_read(discussion_id, sender_id, message_id)
             return message, mentions, True
 
+    @reading
     def messages(
         self,
         discussion_id: int,
@@ -1107,6 +1232,7 @@ class SqliteStore:
         )[0]
         return int(row["n"]), int(row["last"])
 
+    @reading
     def discussion_page(
         self,
         discussion_id: int,
@@ -1266,6 +1392,7 @@ class SqliteStore:
                 count, self.watermark(discussion_id, member_id), remaining
             )
 
+    @reading
     def message_count(self, discussion_id: int) -> int:
         row = first(
             self._db.execute(
@@ -1275,6 +1402,7 @@ class SqliteStore:
         )
         return int(row["v"]) if row else 0
 
+    @reading
     def mentions_by_message(self, discussion_id: int) -> Mapping[int, frozenset[int]]:
         found: dict[int, set[int]] = {}
         for row in self._db.execute(
@@ -1284,6 +1412,7 @@ class SqliteStore:
             found.setdefault(int(row["message_id"]), set()).add(int(row["member_id"]))
         return {key: frozenset(value) for key, value in found.items()}
 
+    @reading
     def search_messages(
         self,
         query: str,
@@ -1305,6 +1434,7 @@ class SqliteStore:
         params.append(limit)
         return self._messages(sql, params)
 
+    @reading
     def pending(self, member_id: int) -> tuple[Mention, ...]:
         rows = self._db.execute(
             """
@@ -1349,6 +1479,7 @@ class SqliteStore:
             )
             return cursor.rowcount
 
+    @reading
     def acknowledged(self, discussion_id: int, member_id: int) -> tuple[int, ...]:
         return tuple(
             int(row["message_id"])
@@ -1370,6 +1501,7 @@ class SqliteStore:
             )
             return cursor.rowcount
 
+    @reading
     def watermark(self, discussion_id: int, member_id: int) -> int:
         row = first(
             self._db.execute(
@@ -1390,6 +1522,7 @@ class SqliteStore:
                 (discussion_id, member_id, message_id),
             )
 
+    @reading
     def unread_counts(self, member_id: int) -> Mapping[int, int]:
         rows = self._db.execute(
             """

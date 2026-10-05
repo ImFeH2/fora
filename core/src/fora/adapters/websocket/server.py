@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import os
 import secrets
@@ -9,16 +10,17 @@ import sys
 import threading
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import quote, unquote
 
 from aiohttp import WSMsgType, web
 
-from fora.adapters.jsonl.protocol import Dispatcher, encode
+from fora.adapters.jsonl.protocol import Dispatcher, RequestScope, encode, parse
 from fora.adapters.websocket.access_error import ACCESS_ERROR_PAGE
 from fora.core.attachment import Upload
 from fora.core.errors import DomainError
@@ -50,6 +52,15 @@ def payload_size(value: Any, available: int) -> int:
             if size > available:
                 return size
     return size
+
+
+@dataclass(eq=False)
+class ControlRequest:
+    identifier: int | None
+    scope: RequestScope
+    business: asyncio.Event
+    task: asyncio.Task[None] | None = None
+    thread: Future[None] | None = None
 
 
 @dataclass
@@ -162,9 +173,13 @@ class ControlOutbox:
                     counted = False
                     reserved = 0
                     self._wake_locked()
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             self.fail()
-            log.error("Control connection encoding failed: %s", error)
+            log.exception(
+                "Control connection encoding failed: %s",
+                type(error).__name__,
+                exc_info=False,
+            )
         finally:
             payload = {}
             text = None
@@ -323,6 +338,10 @@ class WebServer:
         self._control_transports: dict[web.WebSocketResponse, asyncio.Transport] = {}
         self._handlers: set[asyncio.Task[Any]] = set()
         self._http: set[asyncio.Task[Any]] = set()
+        self._requests: set[ControlRequest] = set()
+        self._executor = ThreadPoolExecutor(
+            max_workers=16, thread_name_prefix="fora-control"
+        )
         self._app = web.Application(
             middlewares=[self._boundary], client_max_size=20 * 1024 * 1024
         )
@@ -406,6 +425,7 @@ class WebServer:
         else:
             self._finished.set_result(None)
         finally:
+            self._executor.shutdown(wait=True, cancel_futures=True)
             self._socket.close()
 
     async def _serve(self) -> None:
@@ -558,6 +578,83 @@ class WebServer:
 
     async def _control(self, connection: web.WebSocketResponse) -> None:
         outbox = ControlOutbox()
+        records: set[ControlRequest] = set()
+        identifiers: dict[int, ControlRequest] = {}
+        positions = asyncio.BoundedSemaphore(16)
+
+        async def execute(
+            record: ControlRequest,
+            text: str,
+            dependencies: tuple[asyncio.Event, ...],
+            failure: tuple[str, str] | None,
+        ) -> None:
+            for dependency in dependencies:
+                await dependency.wait()
+            dependencies = ()
+            async with positions:
+                if outbox.closed:
+                    raise asyncio.CancelledError
+                completion = outbox.register_response()
+                responded = False
+
+                def response(payload: dict[str, Any]) -> None:
+                    nonlocal responded
+                    if responded:
+                        raise RuntimeError("Request already responded")
+                    responded = True
+                    outbox.put(payload, completion)
+
+                def operation() -> None:
+                    if failure is None:
+                        self._dispatcher.receive(text, response)
+                    else:
+                        request = parse(text)
+                        assert request is not None
+                        self._dispatcher._fail(request, response, *failure)
+
+                try:
+                    record.thread = self._executor.submit(
+                        contextvars.copy_context().run, operation
+                    )
+                    thread = asyncio.wrap_future(record.thread)
+                    cancelled = False
+                    try:
+                        while True:
+                            try:
+                                await asyncio.shield(thread)
+                                break
+                            except asyncio.CancelledError:
+                                cancelled = True
+                                if record.thread.cancel():
+                                    break
+                                if thread.done():
+                                    thread.result()
+                                    break
+                    finally:
+                        record.business.set()
+                    if cancelled:
+                        raise asyncio.CancelledError
+                    if not responded:
+                        outbox.complete(completion)
+                    await asyncio.shield(completion)
+                finally:
+                    if not completion.done():
+                        outbox.complete(completion)
+                    if not completion.cancelled():
+                        completion.exception()
+                    record.thread = None
+
+        def completed(record: ControlRequest, task: asyncio.Task[None]) -> None:
+            record.business.set()
+            records.discard(record)
+            self._requests.discard(record)
+            if record.identifier is not None:
+                identifiers.pop(record.identifier, None)
+            record.task = None
+            if not task.cancelled() and (error := task.exception()) is not None:
+                if not isinstance(error, ConnectionError):
+                    log.error("Control request failed: %s", type(error).__name__)
+                outbox.fail()
 
         async def receive() -> None:
             async for message in connection:
@@ -570,25 +667,33 @@ class WebServer:
                     if message.type == WSMsgType.TEXT
                     else message.data.decode("utf-8")
                 )
-                completion = outbox.register_response()
-                responded = False
-
-                def response(
-                    payload: dict[str, Any],
-                    result: asyncio.Future[None] = completion,
-                ) -> None:
-                    nonlocal responded
-                    responded = True
-                    outbox.put(payload, result)
-
-                try:
-                    await worker(self._dispatcher.receive, text, response)
-                    if not responded:
-                        outbox.complete(completion)
-                    await completion
-                finally:
-                    if completion.done() and not completion.cancelled():
-                        completion.exception()
+                request = parse(text)
+                identifier = request.id if request is not None else None
+                if identifier is not None and identifier in identifiers:
+                    await self._close_socket(connection, code=1002)
+                    return
+                scope = RequestScope()
+                failure = None
+                if request is not None:
+                    try:
+                        scope = self._dispatcher.scope(request)
+                    except DomainError as error:
+                        failure = (error.code, str(error))
+                    except (TypeError, ValueError, KeyError) as error:
+                        failure = ("invalid_params", f"{type(error).__name__}: {error}")
+                dependencies = tuple(
+                    previous.business
+                    for previous in records
+                    if not previous.business.is_set() and scope.follows(previous.scope)
+                )
+                record = ControlRequest(identifier, scope, asyncio.Event())
+                records.add(record)
+                self._requests.add(record)
+                if identifier is not None:
+                    identifiers[identifier] = record
+                task = asyncio.create_task(execute(record, text, dependencies, failure))
+                record.task = task
+                task.add_done_callback(partial(completed, record))
 
         self._dispatcher.attach(outbox.broadcast)
         sender = asyncio.create_task(outbox.send(connection))
@@ -608,12 +713,33 @@ class WebServer:
             sender.cancel()
             receiver.cancel()
             closing.cancel()
-            try:
-                await asyncio.gather(sender, closing, return_exceptions=True)
-                await self._close_socket(connection, code=1013)
-            finally:
-                await asyncio.gather(receiver, return_exceptions=True)
-                await worker(outbox.wait_producers)
+            requests = tuple(
+                record.task for record in records if record.task is not None
+            )
+            for task in requests:
+                task.cancel()
+
+            async def finish() -> None:
+                try:
+                    await asyncio.gather(sender, closing, return_exceptions=True)
+                    await self._close_socket(connection, code=1013)
+                finally:
+                    await asyncio.gather(receiver, *requests, return_exceptions=True)
+                    await worker(outbox.wait_producers)
+
+            cleanup = asyncio.create_task(finish())
+            cancelled = False
+            while True:
+                try:
+                    await asyncio.shield(cleanup)
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+                    if cleanup.done():
+                        cleanup.result()
+                        break
+            if cancelled:
+                raise asyncio.CancelledError
 
     def _uploads_service(self) -> Uploads:
         if self._uploads is None:

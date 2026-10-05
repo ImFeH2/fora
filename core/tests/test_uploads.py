@@ -25,7 +25,7 @@ from PIL.PngImagePlugin import PngInfo
 from websockets.sync.client import connect
 
 from fora.adapters.files.uploads import DirectoryUploads, decode_image
-from fora.adapters.jsonl.protocol import Dispatcher
+from fora.adapters.jsonl.protocol import Dispatcher, RequestScope
 from fora.adapters.sqlite.agent import SqliteAgentStore
 from fora.adapters.sqlite.store import SqliteStore
 from fora.adapters.websocket.server import ControlOutbox, WebServer, resource
@@ -131,7 +131,11 @@ def test_control_slow_connection_isolated(monkeypatch) -> None:
 
     monkeypatch.setattr(module, "ControlOutbox", outbox)
     dispatcher = Dispatcher()
-    dispatcher.register("large", lambda params: "x" * (32 * 1024 * 1024))
+    dispatcher.register(
+        "large",
+        lambda params: "x" * (32 * 1024 * 1024),
+        scope=lambda params: RequestScope(),
+    )
     server = WebServer(dispatcher, "test-token", None, port=0)
     server.start()
 
@@ -198,7 +202,11 @@ def test_control_heartbeat_during_large_response_and_worker() -> None:
         return connection
 
     dispatcher = Dispatcher()
-    dispatcher.register("large", lambda params: "x" * (32 * 1024 * 1024))
+    dispatcher.register(
+        "large",
+        lambda params: "x" * (32 * 1024 * 1024),
+        scope=lambda params: RequestScope(),
+    )
 
     def delayed(params):
         entered.set()
@@ -208,7 +216,7 @@ def test_control_heartbeat_during_large_response_and_worker() -> None:
         finally:
             finished.set()
 
-    dispatcher.register("delayed", delayed)
+    dispatcher.register("delayed", delayed, scope=lambda params: RequestScope())
     server = WebServer(dispatcher, "test-token", None, port=0)
     server.start()
     address = f"http://127.0.0.1:{server.port}/ws?token=test-token"
@@ -400,7 +408,7 @@ def test_control_owner_cancellation(mode: str, monkeypatch) -> None:
         finished.set()
         return "x" * (32 * 1024 * 1024) if mode == "sending" else "done"
 
-    dispatcher.register("operation", operation)
+    dispatcher.register("operation", operation, scope=lambda params: RequestScope())
     server = WebServer(dispatcher, "test-token", None, port=0)
     server.start()
 
@@ -438,6 +446,9 @@ def test_control_owner_cancellation(mode: str, monkeypatch) -> None:
                     await asyncio.sleep(0.1)
                     assert not propagated.is_set() and not observed.is_set()
                     assert server._handlers
+                    server._loop.call_soon_threadsafe(state["task"].cancel)
+                    await asyncio.sleep(0.05)
+                    assert not propagated.is_set() and not observed.is_set()
                     release.set()
                 await asyncio.wrap_future(waiter)
                 async with asyncio.timeout(7):

@@ -489,6 +489,93 @@ describe("Backend", () => {
     await expect(second).resolves.toMatchObject({ members: [] });
   });
 
+  it("keeps mixed response results and errors associated while history waits", async () => {
+    vi.useFakeTimers();
+    const { backend, connected } = harness();
+    const socket = await connected();
+    let historyFinished = false;
+    const history = backend
+      .call("agent.history.read", { agent_id: 2, sequence: 1 })
+      .then((result) => {
+        historyFinished = true;
+        return result;
+      });
+    const send = backend.send(1, "Concurrent").catch((error) => error);
+    const ping = backend.call("ping", { token: "concurrent" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(socket.sent).toHaveLength(3);
+    socket.reply({
+      type: "response",
+      id: socket.sent[2].id,
+      result: { pong: "concurrent" },
+    });
+    socket.reply({
+      type: "response",
+      id: socket.sent[1].id,
+      error: { code: "not_a_member", message: "Membership required" },
+    });
+    await expect(ping).resolves.toEqual({ pong: "concurrent" });
+    expect(await send).toMatchObject({ code: "not_a_member" });
+    expect(historyFinished).toBe(false);
+    expect(vi.getTimerCount()).toBe(1);
+    socket.reply({
+      type: "response",
+      id: socket.sent[0].id,
+      result: { requests: [] },
+    });
+    await expect(history).resolves.toEqual({ requests: [] });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("isolates delayed old responses from active recovered requests", async () => {
+    vi.useFakeTimers();
+    const { backend, connected, socket } = harness();
+    const old = await connected();
+    const history = backend
+      .call("agent.history.read", { agent_id: 2, sequence: 1 })
+      .catch((error) => error);
+    const send = backend.send(1, "Once").catch((error) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    old.fail();
+    expect(await history).toMatchObject({ code: "disconnected" });
+    expect(await send).toMatchObject({
+      code: "unconfirmed",
+      operation: "discussion.send",
+    });
+    const reconnect = backend.reconnect();
+    socket().open();
+    await reconnect;
+    const current = socket();
+    let resolved = false;
+    const organization = backend.organization().then((result) => {
+      resolved = true;
+      return result;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(current.sent).toHaveLength(1);
+    old.reply({
+      type: "response",
+      id: current.sent[0].id,
+      result: { members: [{ name: "Old" }] },
+    });
+    old.reply({
+      type: "response",
+      id: old.sent[0].id,
+      result: { requests: [] },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resolved).toBe(false);
+    expect(backend.disconnected).toBe(false);
+    current.reply({
+      type: "response",
+      id: current.sent[0].id,
+      result: { members: [] },
+    });
+    await expect(organization).resolves.toEqual({ members: [] });
+    expect(vi.getTimerCount()).toBe(0);
+    expect(current.sent).toHaveLength(1);
+  });
+
   it("delivers non-response frames to event listeners", async () => {
     const { backend, connected } = harness();
     const seen: unknown[] = [];

@@ -6,6 +6,7 @@ import sys
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import PurePath
 from typing import Any, TextIO
 
 from fora.core.errors import DomainError
@@ -23,6 +24,42 @@ class Request:
     id: int | None
     method: str
     params: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class Resource:
+    kind: str
+    identity: int | str | PurePath | None = None
+    descendants: bool = False
+
+    def intersects(self, other: Resource) -> bool:
+        if self.kind != other.kind:
+            return False
+        if self.identity is None or other.identity is None:
+            return True
+        if self.identity == other.identity:
+            return True
+        if isinstance(self.identity, PurePath) and isinstance(other.identity, PurePath):
+            return (
+                self.descendants and other.identity.is_relative_to(self.identity)
+            ) or (other.descendants and self.identity.is_relative_to(other.identity))
+        return False
+
+
+@dataclass(frozen=True)
+class RequestScope:
+    reads: tuple[Resource, ...] = ()
+    writes: tuple[Resource, ...] = ()
+
+    def follows(self, previous: RequestScope) -> bool:
+        return any(
+            modified.intersects(resource)
+            for modified in previous.writes
+            for resource in (*self.reads, *self.writes)
+        )
+
+
+ScopeResolver = Callable[[dict[str, Any]], RequestScope]
 
 
 def encode(payload: dict[str, Any]) -> str:
@@ -51,12 +88,30 @@ def parse(line: str) -> Request | None:
 class Dispatcher:
     def __init__(self) -> None:
         self._handlers: dict[str, Callable[[dict[str, Any]], Any]] = {}
+        self._scopes: dict[str, ScopeResolver] = {}
         self._sinks: list[Sink] = []
         self._lock = threading.Lock()
-        self.register("ping", lambda params: {"pong": params.get("token")})
+        self.register(
+            "ping",
+            lambda params: {"pong": params.get("token")},
+            scope=lambda params: RequestScope(),
+        )
 
-    def register(self, method: str, handler: Callable[[dict[str, Any]], Any]) -> None:
+    def register(
+        self,
+        method: str,
+        handler: Callable[[dict[str, Any]], Any],
+        *,
+        scope: ScopeResolver,
+    ) -> None:
         self._handlers[method] = handler
+        self._scopes[method] = scope
+
+    def scope(self, request: Request) -> RequestScope:
+        if request.method.startswith(INTERNAL_PREFIX):
+            return RequestScope()
+        resolver = self._scopes.get(request.method)
+        return resolver(request.params) if resolver is not None else RequestScope()
 
     def methods(self) -> tuple[str, ...]:
         return tuple(sorted(self._handlers))
@@ -105,7 +160,8 @@ class Dispatcher:
             self._fail(
                 request, sink, "invalid_params", f"{type(error).__name__}: {error}"
             )
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
+            log.exception("Request handler failed", exc_info=False)
             self._fail(
                 request, sink, "internal_error", f"{type(error).__name__}: {error}"
             )

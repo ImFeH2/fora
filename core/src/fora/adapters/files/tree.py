@@ -16,6 +16,24 @@ def content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
 
 
+def relative_path(path: str, *, allow_root: bool = False) -> PurePosixPath:
+    if not isinstance(path, str) or "\0" in path:
+        raise DomainError("invalid_path", "Path must be a string without NUL")
+    if path in (".", "./") or not path.replace("/", "").strip():
+        if allow_root:
+            return PurePosixPath()
+        raise DomainError(
+            "invalid_path", "Path must name a file or folder inside the tree"
+        )
+    path = path.removeprefix("./")
+    pure = PurePosixPath(path.replace("\\", "/"))
+    if PureWindowsPath(path).drive or pure.is_absolute() or ".." in pure.parts:
+        raise DomainError("invalid_path", "Path must be relative without '..'")
+    if not pure.parts:
+        raise DomainError("invalid_path", "Path must stay inside the tree")
+    return pure
+
+
 class DirectoryTree:
     def __init__(self, root: Path | str) -> None:
         self._root = Path(root).resolve()
@@ -28,19 +46,9 @@ class DirectoryTree:
     def _resolve(
         self, path: str, *, allow_root: bool = False, follow_symlinks: bool = True
     ) -> Path:
-        if not isinstance(path, str) or "\0" in path:
-            raise DomainError("invalid_path", "Path must be a string without NUL")
-        if path in (".", "./") or not path.replace("/", "").strip():
-            if allow_root:
-                return self._root
-            raise DomainError(
-                "invalid_path", "Path must name a file or folder inside the tree"
-            )
-        path = path.removeprefix("./")
-        parts = path.replace("\\", "/").split("/")
-        pure = PurePosixPath(path.replace("\\", "/"))
-        if PureWindowsPath(path).drive or pure.is_absolute() or ".." in parts:
-            raise DomainError("invalid_path", "Path must be relative without '..'")
+        pure = relative_path(path, allow_root=allow_root)
+        if pure == PurePosixPath():
+            return self._root
         entry = self._root / pure
         target = entry.resolve()
         if target == self._root or self._root not in target.parents:

@@ -6,6 +6,7 @@ import io
 import json
 import sqlite3
 import threading
+import time
 import uuid
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -30,7 +31,13 @@ from fora.adapters.execution.manager import ExecutionManager
 from fora.adapters.files.tree import DirectoryTree
 from fora.adapters.files.uploads import DirectoryUploads, decode_image
 from fora.adapters.jsonl.api import HUMAN_ID, Api
-from fora.adapters.jsonl.protocol import Dispatcher, parse, wait_for_shutdown
+from fora.adapters.jsonl.protocol import (
+    Dispatcher,
+    RequestScope,
+    Resource,
+    parse,
+    wait_for_shutdown,
+)
 from fora.adapters.model.config import ModelCatalog
 from fora.adapters.model.runner import PydanticModelRunner
 from fora.adapters.sqlite.agent import SqliteAgentStore
@@ -90,6 +97,7 @@ def server(tmp_path: Path):
         store=store,
         history=agent_store,
         settings=agent_store,
+        reading=store._db.read,
         agent_directory_for=agent_directory_for,
         decode_image=decode_image,
         execution=ExecutionManager(
@@ -113,6 +121,7 @@ def server(tmp_path: Path):
         dispatcher,
         list_models=probe.list_models,
         test_model=probe.test_model,
+        reading=store._db.read,
     )
     deps.__dict__["probe"] = probe
     deps.__dict__["scheduler"] = scheduler
@@ -2280,3 +2289,1090 @@ def test_remote_recording_cancel_closes_upstream_and_discards_late_events(
     events = asyncio.run(scenario())
     assert client.socket.closed
     assert [event["type"] for event in events] == ["ready"]
+
+
+def send_control(connection, identifier, method, **params):
+    connection.send(json.dumps({"id": identifier, "method": method, "params": params}))
+
+
+def test_control_independent_requests_complete_during_history(server, monkeypatch):
+    dispatcher, _, deps = server
+    reader = deps.store.create_member("agent", "Reader")
+    room = deps.store.create_discussion("Concurrent", [HUMAN_ID, reader.id])
+    entered = threading.Event()
+    release = threading.Event()
+    original = deps.history.history_runs
+
+    def history(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(deps.history, "history_runs", history)
+    web = WebServer(dispatcher, "test-token", None)
+    web.start()
+    receipt = str(uuid.uuid4())
+    try:
+        with connect(f"ws://127.0.0.1:{web.port}/ws?token=test-token") as connection:
+            send_control(connection, 1, "agent.history", agent_id=reader.id)
+            assert entered.wait(5)
+            send_control(connection, 2, "ping", token="independent")
+            send_control(connection, 3, "discussion.list")
+            send_control(
+                connection,
+                4,
+                "discussion.send",
+                discussion_id=room.id,
+                body="@Reader concurrent",
+                client_message_id=receipt,
+            )
+            responses = {}
+            broadcasts = []
+            while len(responses) < 3:
+                frame = json.loads(connection.recv(timeout=3))
+                if frame["type"] == "response":
+                    assert frame["id"] in {2, 3, 4}
+                    assert "error" not in frame
+                    responses[frame["id"]] = frame["result"]
+                else:
+                    broadcasts.append(frame)
+            assert not release.is_set()
+            assert responses[2] == {"pong": "independent"}
+            message = deps.store.messages(room.id)[0]
+            assert message.body == "@Reader concurrent"
+            assert responses[4]["id"] == message.id
+            assert deps.store.mentions_by_message(room.id)[message.id] == frozenset(
+                {reader.id}
+            )
+            assert (
+                deps.store.message_receipt(room.id, HUMAN_ID, receipt).id == message.id
+            )
+            assert any(frame["type"] == "message.created" for frame in broadcasts)
+            release.set()
+            while (frame := json.loads(connection.recv(timeout=5)))[
+                "type"
+            ] != "response":
+                pass
+            assert frame["id"] == 1 and frame["result"]["runs"] == []
+    finally:
+        release.set()
+        web.stop()
+    assert not web._requests and not web._handlers
+    assert len(dispatcher._sinks) == 1
+    assert not any(
+        thread.name.startswith("fora-control") for thread in threading.enumerate()
+    )
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_control_same_discussion_order_and_failure_release(server, monkeypatch, failed):
+    dispatcher, _, deps = server
+    room = deps.store.create_discussion("Ordered", [HUMAN_ID])
+    entered = threading.Event()
+    release = threading.Event()
+    original = deps.store.submit_message
+
+    def submit(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        if failed:
+            raise DomainError("probe_failed", "Rejected operation")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(deps.store, "submit_message", submit)
+    web = WebServer(dispatcher, "test-token", None)
+    web.start()
+    try:
+        with connect(f"ws://127.0.0.1:{web.port}/ws?token=test-token") as connection:
+            send_control(
+                connection, 1, "discussion.send", discussion_id=room.id, body="Ordered"
+            )
+            assert entered.wait(5)
+            send_control(connection, 2, "discussion.page", discussion_id=room.id)
+            send_control(connection, 3, "ping")
+            assert json.loads(connection.recv(timeout=3))["id"] == 3
+            with pytest.raises(TimeoutError):
+                connection.recv(timeout=0.1)
+            release.set()
+            responses = {}
+            while len(responses) < 2:
+                frame = json.loads(connection.recv(timeout=5))
+                if frame["type"] == "response":
+                    responses[frame["id"]] = frame
+            assert ("error" in responses[1]) == failed
+            messages = responses[2]["result"]["messages"]
+            assert len(messages) == int(not failed)
+            if not failed:
+                assert messages[0]["body"] == "Ordered"
+    finally:
+        release.set()
+        web.stop()
+    assert not web._requests
+
+
+def test_control_all_received_requests_wait_and_finish():
+    dispatcher = Dispatcher()
+    lock = threading.Lock()
+    entered = threading.Event()
+    release = threading.Event()
+    current = 0
+    peak = 0
+
+    def operation(params):
+        nonlocal current, peak
+        with lock:
+            current += 1
+            peak = max(peak, current)
+            if current == 16:
+                entered.set()
+        try:
+            assert release.wait(5)
+            return params["number"]
+        finally:
+            with lock:
+                current -= 1
+
+    dispatcher.register("operation", operation, scope=lambda params: RequestScope())
+    web = WebServer(dispatcher, "test-token", None)
+    web.start()
+    try:
+        with connect(f"ws://127.0.0.1:{web.port}/ws?token=test-token") as connection:
+            for number in range(100):
+                send_control(connection, number, "operation", number=number)
+            assert entered.wait(5)
+            deadline = time.monotonic() + 3
+            while len(web._requests) != 100:
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+            assert current == peak == 16
+            release.set()
+            responses = [json.loads(connection.recv(timeout=5)) for _ in range(100)]
+            assert {frame["id"]: frame["result"] for frame in responses} == {
+                number: number for number in range(100)
+            }
+    finally:
+        release.set()
+        web.stop()
+    assert current == 0 and not web._requests
+    assert not any(
+        thread.name.startswith("fora-control") for thread in threading.enumerate()
+    )
+
+
+def test_control_duplicate_active_ids_close_only_their_connection():
+    from websockets.exceptions import ConnectionClosed
+
+    dispatcher = Dispatcher()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def operation(params):
+        entered.set()
+        assert release.wait(5)
+        return "completed"
+
+    dispatcher.register("operation", operation, scope=lambda params: RequestScope())
+    web = WebServer(dispatcher, "test-token", None)
+    web.start()
+    try:
+        with (
+            connect(f"ws://127.0.0.1:{web.port}/ws?token=test-token") as first,
+            connect(f"ws://127.0.0.1:{web.port}/ws?token=test-token") as second,
+        ):
+            first.send('{"id":1,"method":"operation"}')
+            assert entered.wait(5)
+            second.send('{"id":1,"method":"ping"}')
+            assert json.loads(second.recv(timeout=3))["id"] == 1
+            first.send('{"id":1,"method":"ping"}')
+            with pytest.raises(ConnectionClosed) as closed:
+                first.recv(timeout=3)
+            assert closed.value.rcvd.code == 1002
+            release.set()
+            for _ in range(3):
+                second.send('{"id":1,"method":"ping"}')
+                assert json.loads(second.recv(timeout=3))["id"] == 1
+    finally:
+        release.set()
+        web.stop()
+    assert not web._requests
+
+
+def test_request_scope_resources_and_real_side_effects(server):
+    dispatcher, _, deps = server
+    reader = deps.store.create_member("agent", "Reader")
+    room = deps.store.create_discussion("Resources", [HUMAN_ID, reader.id])
+
+    def scope(method, **params):
+        request = parse(json.dumps({"id": 1, "method": method, "params": params}))
+        return dispatcher.scope(request)
+
+    assert set(dispatcher.methods()) == set(dispatcher._scopes)
+    assert scope("discussion.page", discussion_id=room.id).follows(
+        scope("discussion.send", discussion_id=room.id)
+    )
+    assert not scope("discussion.send", discussion_id=room.id + 1).follows(
+        scope("discussion.send", discussion_id=room.id)
+    )
+    assert not scope("agent.history", agent_id=reader.id).follows(
+        scope("discussion.send", discussion_id=room.id)
+    )
+    assert scope("settings.get", section="model").follows(
+        scope("settings.update", section="model")
+    )
+    assert not scope("settings.get", section="agent").follows(
+        scope("settings.update", section="model")
+    )
+    assert scope("settings.get", section="voice").writes == (
+        Resource("settings", "voice"),
+    )
+    assert scope("workspace.read", agent_id=reader.id).writes == (
+        Resource("workspace", reader.id),
+    )
+    assert scope("agent.detail", agent_id=reader.id).writes == (
+        Resource("workspace", reader.id),
+    )
+    assert scope("upload.status", upload_ids=[]).writes
+    assert scope("discussion.read", discussion_id=room.id).writes
+    assert scope("library.read", path="folder/file.txt").follows(
+        scope("library.mkdir", path="folder")
+    )
+    assert scope("library.list", path="folder").follows(
+        scope("library.write", path="./folder/file.txt")
+    )
+    assert not scope("library.read", path="other.txt").follows(
+        scope("library.write", path="file.txt")
+    )
+    assert scope("library.read", path="target/file.txt").follows(
+        scope("library.move", path="source", destination="target")
+    )
+
+
+def test_control_slow_connection_keeps_positions_and_other_connections_run(
+    server, monkeypatch
+):
+    from fora.adapters.websocket import server as module
+
+    dispatcher, _, deps = server
+    original = module.ControlOutbox
+    outboxes = []
+
+    def outbox():
+        value = original()
+        outboxes.append(value)
+        return value
+
+    monkeypatch.setattr(module, "ControlOutbox", outbox)
+    dispatcher.register(
+        "large",
+        lambda params: "x" * params["size"],
+        scope=lambda params: RequestScope(),
+    )
+    web = WebServer(dispatcher, "test-token", None)
+    web.start()
+
+    async def exercise():
+        address = f"http://127.0.0.1:{web.port}/ws?token=test-token"
+        async with (
+            ClientSession() as session,
+            session.ws_connect(address, max_msg_size=0) as slow,
+            session.ws_connect(address) as normal,
+        ):
+            transport = slow._response.connection.transport
+            transport.pause_reading()
+            try:
+                sizes = [32 * 1024 * 1024] * 2 + [65536] * 15
+                for number, size in enumerate(sizes):
+                    await slow.send_json(
+                        {"id": number, "method": "large", "params": {"size": size}}
+                    )
+                async with asyncio.timeout(10):
+                    while True:
+                        records = [
+                            record
+                            for record in web._requests
+                            if record.identifier is not None and record.identifier < 17
+                        ]
+                        if (
+                            len(records) == 17
+                            and sum(
+                                record.thread is not None and record.thread.done()
+                                for record in records
+                            )
+                            == 16
+                        ):
+                            break
+                        await asyncio.sleep(0.001)
+                assert len(outboxes[0].responses) == 16
+                assert (
+                    next(record for record in records if record.identifier == 16).thread
+                    is None
+                )
+                for number, method in [(100, "ping"), (101, "discussion.list")]:
+                    await normal.send_json({"id": number, "method": method})
+                    async with asyncio.timeout(3):
+                        frame = await normal.receive_json()
+                    assert frame["id"] == number and "result" in frame
+                assert len(outboxes[0].responses) == 16
+                transport.resume_reading()
+                responses = {}
+                async with asyncio.timeout(15):
+                    for _ in sizes:
+                        frame = await slow.receive_json()
+                        responses[frame["id"]] = len(frame["result"])
+                assert responses == dict(enumerate(sizes))
+            finally:
+                transport.abort()
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        web.stop()
+    assert not web._requests and not web._handlers
+    assert deps.store._db._readers.borrowed == 0
+    assert all(
+        not value.responses and not value.items and value.producers == 0
+        for value in outboxes
+    )
+
+
+def test_control_disconnect_cancels_dependency_wait_and_preserves_started_send(
+    server, monkeypatch
+):
+    dispatcher, _, deps = server
+    reader = deps.store.create_member("agent", "Reader")
+    room = deps.store.create_discussion("Disconnect", [HUMAN_ID, reader.id])
+    entered = threading.Event()
+    release = threading.Event()
+    page_started = threading.Event()
+    original_send = deps.store.submit_message
+    original_page = deps.store.discussion_page
+    receipt = str(uuid.uuid4())
+
+    def submit(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original_send(*args, **kwargs)
+
+    def page(*args, **kwargs):
+        page_started.set()
+        return original_page(*args, **kwargs)
+
+    monkeypatch.setattr(deps.store, "submit_message", submit)
+    monkeypatch.setattr(deps.store, "discussion_page", page)
+    web = WebServer(dispatcher, "test-token", None)
+    web.start()
+    try:
+        with connect(f"ws://127.0.0.1:{web.port}/ws?token=test-token") as connection:
+            send_control(
+                connection,
+                1,
+                "discussion.send",
+                discussion_id=room.id,
+                body="@Reader saved",
+                client_message_id=receipt,
+            )
+            assert entered.wait(5)
+            send_control(connection, 2, "discussion.page", discussion_id=room.id)
+            deadline = time.monotonic() + 3
+            while len(web._requests) != 2:
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+            waiting = next(record for record in web._requests if record.identifier == 2)
+            connection.close()
+            deadline = time.monotonic() + 3
+            while not waiting.business.is_set():
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+            assert waiting.thread is None and not page_started.is_set()
+            assert web._requests
+        release.set()
+        deadline = time.monotonic() + 5
+        while web._requests:
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        with connect(f"ws://127.0.0.1:{web.port}/ws?token=test-token") as connection:
+            send_control(
+                connection,
+                1,
+                "discussion.send_status",
+                discussion_id=room.id,
+                client_message_id=receipt,
+            )
+            status = json.loads(connection.recv(timeout=3))
+            assert status["id"] == 1 and status["result"]["state"] == "sent"
+            assert deps.store.message_count(room.id) == 1
+            original_send(
+                room.id,
+                HUMAN_ID,
+                "@Reader saved",
+                client_message_id=receipt,
+                mark_read=True,
+            )
+            assert deps.store.message_count(room.id) == 1
+    finally:
+        release.set()
+        web.stop()
+    assert not web._requests and not page_started.is_set()
+
+
+def test_all_registered_operations_declare_their_business_resources(server):
+    dispatcher, _, _ = server
+    params = {
+        "agent_id": 2,
+        "member_id": 2,
+        "discussion_id": 3,
+        "section": "model",
+        "path": "folder/file.txt",
+        "destination": "target/file.txt",
+    }
+    groups = {
+        "independent": {"ping", "info.get"},
+        "members": {
+            "organization.get",
+            "organization.create_agent",
+            "organization.rename_member",
+            "organization.pause_agent",
+            "organization.resume_agent",
+            "organization.delete_agent",
+        },
+        "discussions": {
+            "discussion.create",
+            "discussion.list",
+            "discussion.read",
+            "discussion.page",
+            "discussion.mark_read",
+            "discussion.ack_pending",
+            "discussion.send",
+            "discussion.ack",
+            "discussion.revoke_ack",
+            "discussion.set_members",
+            "discussion.add_members",
+            "discussion.remove_members",
+            "discussion.archive",
+            "discussion.unarchive",
+            "discussion.search",
+            "discussion.send_status",
+            "discussion.cancel_send",
+        },
+        "uploads": {"upload.create", "upload.status", "upload.cancel"},
+        "history": {
+            "agent.history",
+            "agent.history.read",
+            "agent.history.text",
+            "agent.history.image",
+        },
+        "workspace": {"agent.detail", "workspace.list", "workspace.read"},
+        "library": {
+            "library.list",
+            "library.read",
+            "library.write",
+            "library.edit",
+            "library.mkdir",
+            "library.delete",
+            "library.move",
+        },
+        "settings": {
+            "settings.get",
+            "settings.update",
+            "settings.list_models",
+            "settings.test_model",
+        },
+    }
+    expected = set().union(*groups.values())
+    assert expected == set(dispatcher.methods())
+    modifications = {
+        "organization.create_agent",
+        "organization.rename_member",
+        "organization.pause_agent",
+        "organization.resume_agent",
+        "organization.delete_agent",
+        "discussion.create",
+        "discussion.read",
+        "discussion.mark_read",
+        "discussion.ack_pending",
+        "discussion.send",
+        "discussion.ack",
+        "discussion.revoke_ack",
+        "discussion.set_members",
+        "discussion.add_members",
+        "discussion.remove_members",
+        "discussion.archive",
+        "discussion.unarchive",
+        "discussion.cancel_send",
+        "upload.create",
+        "upload.status",
+        "upload.cancel",
+        "agent.detail",
+        "workspace.list",
+        "workspace.read",
+        "library.write",
+        "library.edit",
+        "library.mkdir",
+        "library.delete",
+        "library.move",
+        "settings.update",
+    }
+    for method in expected:
+        request = parse(json.dumps({"id": 1, "method": method, "params": params}))
+        scope = dispatcher.scope(request)
+        assert bool(scope.writes) == (method in modifications), method
+        assert bool(scope.reads or scope.writes) == (
+            method not in groups["independent"]
+        ), method
+        if method in groups["workspace"]:
+            assert Resource("workspace", 2) in scope.writes
+        if method in groups["history"]:
+            assert Resource("history", 2) in scope.reads
+        if method in groups["uploads"]:
+            assert Resource("attachments", HUMAN_ID) in scope.writes
+    with pytest.raises(TypeError):
+        dispatcher.register("missing_scope", lambda params: None)
+
+
+def test_control_disconnect_during_socket_send_preserves_committed_message(
+    server, monkeypatch
+):
+    from fora.adapters.websocket import server as module
+
+    dispatcher, _, deps = server
+    room = deps.store.create_discussion("Socket send", [HUMAN_ID])
+    receipt = str(uuid.uuid4())
+    original = dispatcher._handlers["discussion.send"]
+    original_outbox = module.ControlOutbox
+    outboxes = []
+
+    def send(params):
+        return {**original(params), "padding": "x" * (32 * 1024 * 1024)}
+
+    def outbox():
+        value = original_outbox()
+        outboxes.append(value)
+        return value
+
+    monkeypatch.setitem(dispatcher._handlers, "discussion.send", send)
+    monkeypatch.setattr(module, "ControlOutbox", outbox)
+    web = WebServer(dispatcher, "test-token", None)
+    web.start()
+
+    async def exercise():
+        address = f"http://127.0.0.1:{web.port}/ws?token=test-token"
+        async with ClientSession() as session:
+            async with session.ws_connect(address, max_msg_size=0) as connection:
+                transport = connection._response.connection.transport
+                transport.pause_reading()
+                try:
+                    await connection.send_json(
+                        {
+                            "id": 1,
+                            "method": "discussion.send",
+                            "params": {
+                                "discussion_id": room.id,
+                                "body": "Committed during socket send",
+                                "client_message_id": receipt,
+                            },
+                        }
+                    )
+                    async with asyncio.timeout(5):
+                        while True:
+                            record = next(
+                                (
+                                    item
+                                    for item in web._requests
+                                    if item.identifier == 1
+                                ),
+                                None,
+                            )
+                            if (
+                                record is not None
+                                and record.business.is_set()
+                                and len(outboxes[0].responses) == 1
+                                and not outboxes[0].items
+                                and outboxes[0].producers == 0
+                            ):
+                                break
+                            await asyncio.sleep(0.001)
+                    assert (
+                        deps.store.message_receipt(room.id, HUMAN_ID, receipt)
+                        is not None
+                    )
+                    assert record.task is not None and not record.task.done()
+                finally:
+                    transport.abort()
+            async with asyncio.timeout(7):
+                while web._requests or web._handlers:
+                    await asyncio.sleep(0.001)
+            async with session.ws_connect(address) as connection:
+                await connection.send_json(
+                    {
+                        "id": 2,
+                        "method": "discussion.send_status",
+                        "params": {
+                            "discussion_id": room.id,
+                            "client_message_id": receipt,
+                        },
+                    }
+                )
+                async with asyncio.timeout(3):
+                    result = await connection.receive_json()
+                assert result["id"] == 2 and result["result"]["state"] == "sent"
+                assert (
+                    result["result"]["message"]["body"]
+                    == "Committed during socket send"
+                )
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        web.stop()
+    assert deps.store.message_count(room.id) == 1
+    assert not web._requests and not web._handlers
+    assert all(
+        not value.responses and not value.items and value.producers == 0
+        for value in outboxes
+    )
+
+
+@pytest.mark.parametrize(
+    "effect",
+    [
+        "member",
+        "settings",
+        "library",
+        "workspace",
+        "detail",
+        "voice",
+        "watermark",
+        "upload",
+    ],
+)
+def test_control_related_side_effects_finish_before_following_reads(
+    server, monkeypatch, tmp_path, effect
+):
+    dispatcher, _, deps = server
+    agent = deps.store.create_member("agent", "Effects")
+    room = deps.store.create_discussion("Effects", [HUMAN_ID, agent.id])
+    deps.store.append_message(room.id, agent.id, "@You unread")
+    deps.settings.set_settings("voice", {"mode": "remote", "model": "transcribe"})
+    uploads = Uploads(deps.store, DirectoryUploads(tmp_path / "uploads"))
+    deps.uploads = uploads
+    upload = uploads.create(
+        room.id, HUMAN_ID, str(uuid.uuid4()), "file.txt", 4, "text/plain"
+    )
+    active, target = uploads.begin(upload.id, HUMAN_ID)
+    with target:
+        target.write(b"data")
+    uploads.complete(active)
+    uploads.end(active)
+    uploads.files.discard(upload.id)
+    cases = {
+        "member": (
+            "organization.rename_member",
+            {"member_id": agent.id, "name": "Renamed"},
+            "organization.get",
+            {},
+        ),
+        "settings": (
+            "settings.update",
+            {"section": "agent", "values": {"token_limit": 12345}},
+            "settings.get",
+            {"section": "agent"},
+        ),
+        "library": (
+            "library.write",
+            {"path": "created.txt", "content": "Created"},
+            "library.read",
+            {"path": "created.txt"},
+        ),
+        "workspace": (
+            "workspace.list",
+            {"agent_id": agent.id},
+            "workspace.read",
+            {"agent_id": agent.id, "path": "MEMORY.md"},
+        ),
+        "detail": (
+            "agent.detail",
+            {"agent_id": agent.id},
+            "workspace.read",
+            {"agent_id": agent.id, "path": "MEMORY.md"},
+        ),
+        "voice": (
+            "settings.get",
+            {"section": "voice"},
+            "settings.get",
+            {"section": "voice"},
+        ),
+        "watermark": (
+            "discussion.read",
+            {"discussion_id": room.id},
+            "discussion.page",
+            {"discussion_id": room.id},
+        ),
+        "upload": (
+            "upload.status",
+            {"upload_ids": [upload.id]},
+            "upload.status",
+            {"upload_ids": [upload.id]},
+        ),
+    }
+    first, first_params, second, second_params = cases[effect]
+    original = dispatcher._handlers[first]
+    entered = threading.Event()
+    release = threading.Event()
+    started = []
+
+    def operation(params):
+        started.append(params)
+        if len(started) == 1:
+            entered.set()
+            assert release.wait(5)
+        return original(params)
+
+    monkeypatch.setitem(dispatcher._handlers, first, operation)
+    web = WebServer(dispatcher, "test-token", None)
+    web.start()
+    try:
+        with connect(f"ws://127.0.0.1:{web.port}/ws?token=test-token") as connection:
+            send_control(connection, 1, first, **first_params)
+            assert entered.wait(3)
+            send_control(connection, 2, second, **second_params)
+            send_control(connection, 3, "ping")
+            assert json.loads(connection.recv(timeout=3))["id"] == 3
+            with pytest.raises(TimeoutError):
+                connection.recv(timeout=0.1)
+            waiting = next(item for item in web._requests if item.identifier == 2)
+            assert waiting.thread is None
+            release.set()
+            responses = {}
+            while len(responses) < 2:
+                frame = json.loads(connection.recv(timeout=3))
+                if frame["type"] == "response":
+                    assert "error" not in frame
+                    responses[frame["id"]] = frame["result"]
+            result = responses[2]
+            if effect == "member":
+                assert (
+                    next(item for item in result["members"] if item["id"] == agent.id)[
+                        "name"
+                    ]
+                    == "Renamed"
+                )
+            elif effect == "settings":
+                assert result["token_limit"] == 12345
+            elif effect == "library":
+                assert result["content"] == "Created"
+            elif effect in {"workspace", "detail"}:
+                assert result["content"] == ""
+                assert deps.workspace_tree_for(agent.id).read("MEMORY.md")[0] == ""
+            elif effect == "voice":
+                assert result["model"] == "transcribe"
+                assert "mode" not in deps.settings.get_settings("voice")
+            elif effect == "watermark":
+                assert (
+                    result["read_through"]
+                    == deps.store.watermark(room.id, HUMAN_ID)
+                    == 1
+                )
+            elif effect == "upload":
+                assert deps.store.get_upload(upload.id, HUMAN_ID).state == "expired"
+    finally:
+        release.set()
+        web.stop()
+    assert not web._requests and deps.store._db._readers.borrowed == 0
+
+
+def test_model_update_and_member_status_complete_with_real_lock_interleaving(
+    server, monkeypatch
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    dispatcher, _, deps = server
+    agent = deps.store.create_member("agent", "Interleaving")
+    scheduler = deps.__dict__["scheduler"]
+    held = threading.Event()
+    updating = threading.Event()
+    status_done = threading.Event()
+    release = threading.Event()
+    original = deps.store.list_members
+
+    def members(*args, **kwargs):
+        if deps.store._db._owner == threading.get_ident():
+            updating.set()
+            assert status_done.wait(3)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(deps.store, "list_members", members)
+
+    def status():
+        with scheduler.member_lock(agent.id):
+            held.set()
+            assert updating.wait(3)
+            result = scheduler.agent_status(agent.id)
+            status_done.set()
+            assert release.wait(5)
+            return result
+
+    def update():
+        output = Capture()
+        return call(
+            dispatcher,
+            output,
+            "settings.update",
+            section="model",
+            values={
+                "action": "set_defaults",
+                "values": {"model_id": None, "thinking": "default"},
+            },
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        reader = executor.submit(status)
+        try:
+            assert held.wait(3)
+            writer = executor.submit(update)
+            result = writer.result(timeout=4)
+            assert "error" not in result
+            assert deps.settings.get_settings("model")["default_thinking"] == "default"
+        finally:
+            release.set()
+        state = reader.result(timeout=4)
+    assert state["id"] == agent.id
+    assert set(state) >= {"state", "pause_requested", "reasons", "error"}
+    assert deps.store._db._readers.borrowed == 0
+
+    original_status = scheduler.agent_status
+
+    def outside_snapshot(identity):
+        assert deps.store._db.current is deps.store._db
+        return original_status(identity)
+
+    monkeypatch.setattr(scheduler, "agent_status", outside_snapshot)
+    result = call(dispatcher, Capture(), "organization.get")
+    assert "error" not in result
+    member = next(
+        item for item in result["result"]["members"] if item["id"] == agent.id
+    )
+    assert member["state"] == state["state"]
+
+
+def test_control_disconnect_cancels_executor_queue_without_side_effects(
+    server, monkeypatch
+):
+    dispatcher, _, deps = server
+    room = deps.store.create_discussion("Queued", [HUMAN_ID])
+    entered = threading.Event()
+    release = threading.Event()
+    lock = threading.Lock()
+    count = 0
+
+    def blocking(params):
+        nonlocal count
+        with lock:
+            count += 1
+            if count == 16:
+                entered.set()
+        assert release.wait(5)
+        return params["number"]
+
+    dispatcher.register("blocking", blocking, scope=lambda params: RequestScope())
+    web = WebServer(dispatcher, "test-token", None)
+    web.start()
+    try:
+        address = f"ws://127.0.0.1:{web.port}/ws?token=test-token"
+        with connect(address) as working, connect(address) as queued:
+            for number in range(16):
+                send_control(working, number, "blocking", number=number)
+            assert entered.wait(3)
+            send_control(
+                queued, 100, "discussion.send", discussion_id=room.id, body="Queued"
+            )
+            deadline = time.monotonic() + 3
+            while True:
+                record = next(
+                    (item for item in web._requests if item.identifier == 100), None
+                )
+                if record is not None and record.thread is not None:
+                    break
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+            future = record.thread
+            assert not future.running() and not future.done()
+            queued.close()
+            deadline = time.monotonic() + 3
+            while not record.business.is_set():
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+            assert future.cancelled()
+            assert deps.store.message_count(room.id) == 0
+            release.set()
+            assert {
+                json.loads(working.recv(timeout=5))["id"] for _ in range(16)
+            } == set(range(16))
+    finally:
+        release.set()
+        web.stop()
+    assert not web._requests and not web._handlers
+    assert deps.store.message_count(room.id) == 0
+
+
+def test_control_history_sdk_conversion_releases_snapshot_for_independent_business(
+    server, monkeypatch
+):
+    from fora.adapters.model import history as module
+
+    dispatcher, _, deps = server
+    agent = deps.store.create_member("agent", "History")
+    room = deps.store.create_discussion("Independent", [HUMAN_ID, agent.id])
+    run = deps.history.start_run(agent.id)
+    raw = ModelMessagesTypeAdapter.dump_json(
+        [ModelRequest(parts=[UserPromptPart(content="中文🙂 history")])]
+    ).decode()
+    handle = deps.history.start_model_request(
+        agent.id, run.sequence, run.run_id, 1, [raw], "{}", "{}", "{}", False
+    )
+    deps.history.finish_model_request(agent.id, run.sequence, handle, [])
+    deps.history.finish_run(
+        agent.id, run.sequence, status="completed", messages_json=raw
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    original = module.decode_history
+
+    def decode(value):
+        assert deps.store._db.current is deps.store._db
+        assert deps.store._db._readers.borrowed == 0
+        entered.set()
+        assert release.wait(5)
+        return original(value)
+
+    monkeypatch.setattr(module, "decode_history", decode)
+    web = WebServer(dispatcher, "test-token", None)
+    web.start()
+    try:
+        with connect(f"ws://127.0.0.1:{web.port}/ws?token=test-token") as connection:
+            send_control(
+                connection,
+                1,
+                "agent.history.read",
+                agent_id=agent.id,
+                sequence=run.sequence,
+            )
+            assert entered.wait(3)
+            send_control(connection, 2, "ping")
+            send_control(connection, 3, "discussion.list")
+            send_control(
+                connection,
+                4,
+                "discussion.send",
+                discussion_id=room.id,
+                body="Available",
+            )
+            responses = {}
+            while len(responses) < 3:
+                frame = json.loads(connection.recv(timeout=3))
+                if frame["type"] == "response":
+                    assert frame["id"] in {2, 3, 4} and "error" not in frame
+                    responses[frame["id"]] = frame["result"]
+            assert deps.store.messages(room.id)[0].body == "Available"
+            assert not release.is_set()
+            release.set()
+            while (frame := json.loads(connection.recv(timeout=5)))[
+                "type"
+            ] != "response":
+                pass
+            assert frame["id"] == 1 and "error" not in frame
+            content = frame["result"]["request"]["input"]["messages"][0]["parts"][0][
+                "content"
+            ]
+            assert content == "中文🙂 history"
+    finally:
+        release.set()
+        web.stop()
+    assert not web._requests and deps.store._db._readers.borrowed == 0
+
+
+def test_control_disconnect_during_response_encoding_preserves_committed_receipt(
+    server, monkeypatch
+):
+    from fora.adapters.websocket import server as module
+
+    dispatcher, _, deps = server
+    room = deps.store.create_discussion("Encoded", [HUMAN_ID])
+    entered = threading.Event()
+    release = threading.Event()
+    original = module.encode
+    outboxes = []
+    original_outbox = module.ControlOutbox
+    receipt = str(uuid.uuid4())
+
+    def encode(payload):
+        if payload.get("type") == "response" and payload.get("id") == 1:
+            assert deps.store._db.current is deps.store._db
+            assert deps.store.message_receipt(room.id, HUMAN_ID, receipt) is not None
+            entered.set()
+            assert release.wait(5)
+        return original(payload)
+
+    def outbox():
+        value = original_outbox()
+        outboxes.append(value)
+        return value
+
+    monkeypatch.setattr(module, "encode", encode)
+    monkeypatch.setattr(module, "ControlOutbox", outbox)
+    web = WebServer(dispatcher, "test-token", None)
+    web.start()
+    try:
+        address = f"ws://127.0.0.1:{web.port}/ws?token=test-token"
+        with connect(address) as connection:
+            send_control(
+                connection,
+                1,
+                "discussion.send",
+                discussion_id=room.id,
+                body="Committed",
+                client_message_id=receipt,
+            )
+            assert entered.wait(3)
+            record = next(item for item in web._requests if item.identifier == 1)
+            future = record.thread
+            assert future.running() and not record.business.is_set()
+            connection.close()
+            assert not future.done()
+        release.set()
+        deadline = time.monotonic() + 5
+        while web._requests:
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        assert future.done() and record.business.is_set()
+        with connect(address) as connection:
+            send_control(
+                connection,
+                2,
+                "discussion.send_status",
+                discussion_id=room.id,
+                client_message_id=receipt,
+            )
+            result = json.loads(connection.recv(timeout=3))
+            assert result["id"] == 2 and result["result"]["state"] == "sent"
+            send_control(
+                connection,
+                3,
+                "discussion.send",
+                discussion_id=room.id,
+                body="Committed",
+                client_message_id=receipt,
+            )
+            while (frame := json.loads(connection.recv(timeout=3)))[
+                "type"
+            ] != "response":
+                pass
+            assert frame["id"] == 3 and "error" not in frame
+            assert deps.store.message_count(room.id) == 1
+    finally:
+        release.set()
+        web.stop()
+    assert not web._requests and not web._handlers
+    assert all(
+        not value.responses and not value.items and value.producers == 0
+        for value in outboxes
+    )

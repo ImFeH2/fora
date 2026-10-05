@@ -39,6 +39,7 @@ class Dependencies:
     agent_directory_for: Callable[[int], Path]
     decode_image: Callable[[bytes], ImageData]
     uploads: Uploads | None = None
+    reading: Callable[[], AbstractContextManager[None]] = nullcontext
 
 
 @dataclass(frozen=True)
@@ -248,7 +249,13 @@ class AgentTools:
         self._check("discussion.list")
         if limit is not None and (type(limit) is not int or limit < 1):
             raise DomainError("invalid_pagination", "limit must be an integer >= 1")
-        unread = self._deps.store.unread_counts(self._actor.member_id)
+        with self._deps.reading():
+            unread = self._deps.store.unread_counts(self._actor.member_id)
+            discussions = self._deps.store.list_discussions(
+                member_id=self._actor.member_id,
+                include_archived=include_archived,
+                limit=limit,
+            )
         return [
             {
                 "id": item.id,
@@ -257,11 +264,7 @@ class AgentTools:
                 "archived": item.archived,
                 "unread": unread.get(item.id, 0),
             }
-            for item in self._deps.store.list_discussions(
-                member_id=self._actor.member_id,
-                include_archived=include_archived,
-                limit=limit,
-            )
+            for item in discussions
         ]
 
     def read_discussion(
@@ -855,6 +858,10 @@ class AgentTools:
         self._check("workspace.read", path)
         content, digest = self._workspace(agent_id).read(path)
         return {"path": path, "content": content, "hash": digest}
+
+    @property
+    def library_root(self) -> Path:
+        return self._deps.library_tree.root
 
     def _library(self) -> Library:
         return Library(self._deps.library_tree)
