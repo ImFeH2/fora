@@ -1210,46 +1210,64 @@ def test_membership_changes_preserve_history_and_pending(tmp_path: Path) -> None
         ("discussion.create", {"topic": "review", "member_ids": [2]}),
         ("discussion.send", {"discussion_id": 1, "body": "@Helper review this"}),
     ]
-    _, code, stderr = drive(
+    with Kernel(data) as kernel:
+        with kernel.connect() as connection:
+            client = Client(connection)
+            for index, (method, params) in enumerate(setup, 1):
+                client.call({"id": index, "method": method, "params": params})
+            for index, member_ids in enumerate(([1], [1, 2], [2])):
+                request_id = 5 + index * 3
+                first = len(client.frames)
+                updated = client.call(
+                    {
+                        "id": request_id,
+                        "method": "discussion.set_members",
+                        "params": {"discussion_id": 1, "member_ids": member_ids},
+                    }
+                )
+                read = client.call(
+                    {
+                        "id": request_id + 1,
+                        "method": "discussion.read",
+                        "params": {"discussion_id": 1},
+                    }
+                )
+                listed = client.call(
+                    {"id": request_id + 2, "method": "discussion.list"}
+                )
+                assert updated["result"]["member_ids"] == member_ids
+                if 1 in member_ids:
+                    detail = read["result"]
+                    assert [member["id"] for member in detail["members"]] == member_ids
+                    assert detail["messages"][0]["body"] == "@Helper review this"
+                else:
+                    assert read["error"]["code"] == "not_a_member"
+                    assert listed["result"] == []
+                assert len(events(client.frames[first:], "discussion.updated")) == 1
+                with closing(SqliteStore(data / "fora.sqlite3")) as store:
+                    assert store.message_count(1) == 1
+                    assert [item.message_id for item in store.pending(2)] == (
+                        [1] if 2 in member_ids else []
+                    )
+        assert kernel.shutdown() == 0, kernel.stderr
+        assert kernel.stdout == b"", kernel.stdout
+
+    frames, code, stderr = drive(
         data,
         [
-            {"id": index, "method": method, "params": params}
-            for index, (method, params) in enumerate(setup, 1)
+            {"id": 1, "method": "discussion.read", "params": {"discussion_id": 1}},
+            {"id": 2, "method": "discussion.list"},
         ],
     )
     assert code == 0, stderr
-
-    for member_ids in ([1], [1, 2], [2]):
-        frames, code, stderr = drive(
-            data,
-            [
-                {
-                    "id": 1,
-                    "method": "discussion.set_members",
-                    "params": {"discussion_id": 1, "member_ids": member_ids},
-                },
-                {"id": 2, "method": "discussion.read", "params": {"discussion_id": 1}},
-                {"id": 3, "method": "discussion.list"},
-            ],
-        )
-        assert code == 0, stderr
-        assert response(frames, 1)["result"]["member_ids"] == member_ids
-        if 1 in member_ids:
-            detail = response(frames, 2)["result"]
-            assert [member["id"] for member in detail["members"]] == member_ids
-            assert detail["messages"][0]["body"] == "@Helper review this"
-        else:
-            assert response(frames, 2)["error"]["code"] == "not_a_member"
-            assert response(frames, 3)["result"] == []
-        assert len(events(frames, "discussion.updated")) == 1
-        store = SqliteStore(data / "fora.sqlite3")
-        try:
-            assert store.message_count(1) == 1
-            assert [item.message_id for item in store.pending(2)] == (
-                [1] if 2 in member_ids else []
-            )
-        finally:
-            store.close()
+    assert response(frames, 1)["error"]["code"] == "not_a_member"
+    assert response(frames, 2)["result"] == []
+    with closing(SqliteStore(data / "fora.sqlite3")) as store:
+        discussion = store.get_discussion(1)
+        assert discussion is not None
+        assert discussion.member_ids == frozenset({2})
+        assert store.message_count(1) == 1
+        assert [item.message_id for item in store.pending(2)] == [1]
 
 
 def test_state_survives_a_restart(tmp_path: Path) -> None:

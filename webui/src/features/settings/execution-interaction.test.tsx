@@ -97,8 +97,8 @@ beforeEach(() => {
   }));
 });
 
-afterEach(() => {
-  cleanup();
+afterEach(async () => {
+  await act(async () => cleanup());
   clearToasts();
   vi.restoreAllMocks();
 });
@@ -131,14 +131,21 @@ function add(value = "/new") {
 }
 
 async function openPanel() {
-  const view = render(<ExecutionPanel />);
-  await waitFor(() => expect(button("Edit /work")).toBeTruthy());
+  let view!: ReturnType<typeof render>;
+  await act(async () => {
+    view = render(<ExecutionPanel />);
+  });
+  expect(button("Edit /work")).toBeTruthy();
   return view;
 }
 
 async function save(expected: string[]) {
-  fireEvent.click(button("Save"));
-  await waitFor(() => expect(button("Save").disabled).toBe(true));
+  const saving = button("Save");
+  fireEvent.click(saving);
+  await waitFor(() => {
+    expect(saving.isConnected).toBe(true);
+    expect(saving.disabled).toBe(true);
+  });
   expect(backend.updateSettings).toHaveBeenLastCalledWith("execution", {
     write_directories: expected,
   });

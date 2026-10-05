@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.usage import RunUsage, UsageLimits
-from test_sidecar_process import drive, response
+from test_sidecar_process import Client, Kernel, drive, response
 
 from fora.adapters.sqlite.agent import SqliteAgentStore
 from fora.adapters.sqlite.store import SqliteStore
@@ -48,30 +48,39 @@ def test_request_limit_survives_settings_api_and_restart(
     assert response(frames, 1)["result"] == expected
 
 
-@pytest.mark.parametrize("value", [-1, 1.5, True, False, "50", None])
-def test_invalid_request_limit_preserves_settings(
-    tmp_path: Path, value: object
-) -> None:
+def test_invalid_request_limit_preserves_settings(tmp_path: Path) -> None:
     data = tmp_path / "data"
     original = {"request_limit": 75, "token_limit": 1000}
     with closing(SqliteStore(data / "fora.sqlite3")) as store:
         SqliteAgentStore(store._db).set_settings("agent", original)
-    frames, code, stderr = drive(
-        data,
-        [
-            {
-                "id": 1,
-                "method": "settings.update",
-                "params": {"section": "agent", "values": {"request_limit": value}},
-            },
-            {"id": 2, "method": "settings.get", "params": {"section": "agent"}},
-        ],
-    )
-    assert code == 0, stderr
-    assert response(frames, 1)["error"]["code"] == "invalid_parameter"
-    assert response(frames, 2)["result"] == {**asdict(AgentParameters()), **original}
-    with closing(SqliteStore(data / "fora.sqlite3")) as store:
-        assert SqliteAgentStore(store._db).get_settings("agent") == original
+    with Kernel(data) as kernel:
+        with kernel.connect() as connection:
+            client = Client(connection)
+            for index, value in enumerate((-1, 1.5, True, False, "50", None)):
+                request_id = index * 2 + 1
+                rejected = client.call(
+                    {
+                        "id": request_id,
+                        "method": "settings.update",
+                        "params": {
+                            "section": "agent",
+                            "values": {"request_limit": value},
+                        },
+                    }
+                )
+                assert rejected["error"]["code"] == "invalid_parameter"
+                settings = client.call(
+                    {
+                        "id": request_id + 1,
+                        "method": "settings.get",
+                        "params": {"section": "agent"},
+                    }
+                )
+                assert settings["result"] == {**asdict(AgentParameters()), **original}
+                with closing(SqliteStore(data / "fora.sqlite3")) as store:
+                    assert SqliteAgentStore(store._db).get_settings("agent") == original
+        assert kernel.shutdown() == 0, kernel.stderr
+        assert kernel.stdout == b"", kernel.stdout
 
 
 @pytest.mark.parametrize(

@@ -602,13 +602,17 @@ describe("History connection recovery", () => {
       }
       const scroll = dialog.querySelector('[class~="overflow-y-auto"]');
       if (!scroll) throw new Error("Missing scroll region");
+      const requests = testing.within(dialog).getByRole("tablist", {
+        name: "Model requests",
+      });
+      const requestTabs = testing.within(requests);
       scroll.scrollTop = 300;
       let delayed: Sent | undefined;
       if (recovery === "Retry") {
         vi.useFakeTimers();
         await testing.act(async () =>
           testing.fireEvent.click(
-            testing.screen.getByRole("tab", { name: /^Request 2pending$/ }),
+            requestTabs.getByRole("tab", { name: /^Request 2pending$/ }),
           ),
         );
         await testing.act(async () => vi.advanceTimersByTimeAsync(0));
@@ -641,13 +645,19 @@ describe("History connection recovery", () => {
       expect(testing.within(windowPanel).getAllByRole("listitem")).toHaveLength(
         Math.min(60, windowCount),
       );
-      expect(testing.screen.getAllByRole("tab")).toHaveLength(
+      expect(requests.isConnected).toBe(true);
+      expect(requests).toBe(
+        testing.within(dialog).getByRole("tablist", {
+          name: "Model requests",
+        }),
+      );
+      expect(requestTabs.getAllByRole("tab")).toHaveLength(
         Math.min(60, requestCount),
       );
       for (const source of ["input", "response", "related"])
         expect(testing.screen.getByText(`${source}-2-tail`)).toBeTruthy();
       expect(
-        testing.screen
+        requestTabs
           .getByRole("tab", { name: /^Request 2pending$/ })
           .getAttribute("aria-selected"),
       ).toBe("true");
@@ -655,7 +665,7 @@ describe("History connection recovery", () => {
         testing.screen.getByText(`Window ${Math.min(60, windowCount)}`),
       ).toBeTruthy();
       expect(
-        testing.screen.getByRole("tab", {
+        requestTabs.getByRole("tab", {
           name: `Request ${Math.min(60, requestCount)}pending`,
         }),
       ).toBeTruthy();
@@ -669,7 +679,7 @@ describe("History connection recovery", () => {
         );
         expect(testing.screen.getByText("input-2-tail")).toBeTruthy();
         expect(
-          testing.screen
+          requestTabs
             .getByRole("tab", { name: /^Request 2pending$/ })
             .getAttribute("aria-selected"),
         ).toBe("true");
@@ -699,7 +709,7 @@ describe("History connection recovery", () => {
           paginatedHistory(windowCount, requestCount, 0, 60),
         );
         expect(
-          testing.screen.getByRole("tab", {
+          requestTabs.getByRole("tab", {
             name: `Request ${requestCount}pending`,
           }),
         ).toBeTruthy();
