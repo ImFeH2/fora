@@ -183,35 +183,20 @@ def test_control_slow_connection_isolated(monkeypatch) -> None:
         assert not value.responses and not value.items
 
 
-def test_control_heartbeat_during_large_response_and_worker(monkeypatch) -> None:
-    from aiohttp import ClientSession, WSMsgType, web
+def test_control_heartbeat_during_large_response_and_worker() -> None:
+    from aiohttp import ClientSession, TCPConnector, WSMsgType
 
-    heartbeat = 2
-    defaults = []
-    initialize = web.WebSocketResponse.__init__
-    send_str = web.WebSocketResponse.send_str
+    heartbeat = 20
     entered = threading.Event()
     release = threading.Event()
     finished = threading.Event()
-    sending = threading.Event()
-    sent = threading.Event()
 
-    def short_heartbeat(connection, *args, **kwargs):
-        defaults.append(kwargs["heartbeat"])
-        assert kwargs["heartbeat"] == 20
-        kwargs["heartbeat"] = heartbeat
-        initialize(connection, *args, **kwargs)
+    def socket_factory(address):
+        family, kind, protocol, _, _ = address
+        connection = socket.socket(family, kind, protocol)
+        connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
+        return connection
 
-    async def observe_send(connection, text, *args, **kwargs):
-        if len(text) > 32 * 1024 * 1024:
-            sending.set()
-            await send_str(connection, text, *args, **kwargs)
-            sent.set()
-        else:
-            await send_str(connection, text, *args, **kwargs)
-
-    monkeypatch.setattr(web.WebSocketResponse, "__init__", short_heartbeat)
-    monkeypatch.setattr(web.WebSocketResponse, "send_str", observe_send)
     dispatcher = Dispatcher()
     dispatcher.register("large", lambda params: "x" * (32 * 1024 * 1024))
 
@@ -235,6 +220,27 @@ def test_control_heartbeat_during_large_response_and_worker(monkeypatch) -> None
         async def large(session):
             async with session.ws_connect(address, max_msg_size=0) as connection:
                 transport = connection._response.connection.transport
+                peer = transport.get_extra_info("sockname")
+
+                async def sender_buffer_size(*, configure=False):
+                    for websocket, sender in server._control_transports.items():
+                        if sender.get_extra_info("peername") == peer:
+                            assert websocket._heartbeat == heartbeat
+                            if configure:
+                                sender.get_extra_info("socket").setsockopt(
+                                    socket.SOL_SOCKET, socket.SO_SNDBUF, 0
+                                )
+                            return sender.get_write_buffer_size()
+                    raise AssertionError("Slow connection is no longer active")
+
+                async def pending_bytes(*, configure=False):
+                    return await asyncio.wrap_future(
+                        asyncio.run_coroutine_threadsafe(
+                            sender_buffer_size(configure=configure), server._loop
+                        )
+                    )
+
+                await pending_bytes(configure=True)
                 transport.pause_reading()
                 await connection.send_json({"id": 1, "method": "large"})
 
@@ -245,17 +251,25 @@ def test_control_heartbeat_during_large_response_and_worker(monkeypatch) -> None
 
                 keepalive = asyncio.create_task(maintain_connection())
                 try:
-                    assert await asyncio.to_thread(sending.wait, 55)
-                    assert not sent.is_set()
+                    async with asyncio.timeout(10):
+                        while not await pending_bytes():
+                            await asyncio.sleep(0.01)
                     await worker_ping.wait()
                     await closed_without_pong.wait()
-                    assert not sent.is_set()
+                    assert await pending_bytes() > 0
                     assert not connection.closed
                     transport.resume_reading()
                     message = await connection.receive()
                     assert message.type == WSMsgType.TEXT
                     assert len(json.loads(message.data)["result"]) == 32 * 1024 * 1024
-                    assert sent.is_set()
+                    await connection.send_json({"id": 3, "method": "ping"})
+                    message = await connection.receive()
+                    assert message.type == WSMsgType.TEXT
+                    assert json.loads(message.data) == {
+                        "type": "response",
+                        "id": 3,
+                        "result": {"pong": None},
+                    }
                 finally:
                     transport.resume_reading()
                     keepalive.cancel()
@@ -295,7 +309,8 @@ def test_control_heartbeat_during_large_response_and_worker(monkeypatch) -> None
                 assert heartbeat * 1.45 <= time.monotonic() - started < heartbeat * 1.8
                 closed_without_pong.set()
 
-        async with ClientSession() as session, asyncio.timeout(55):
+        connector = TCPConnector(socket_factory=socket_factory)
+        async with ClientSession(connector=connector) as session, asyncio.timeout(55):
             tasks = [
                 asyncio.create_task(large(session)),
                 asyncio.create_task(long_worker(session)),
@@ -315,7 +330,6 @@ def test_control_heartbeat_during_large_response_and_worker(monkeypatch) -> None
         release.set()
         server.stop()
     assert entered.is_set() and finished.is_set()
-    assert defaults == [20, 20, 20]
     assert not server._handlers and not dispatcher._sinks
 
 
