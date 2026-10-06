@@ -8,6 +8,41 @@ import pytest
 from fora.adapters.sqlite.agent import SqliteAgentStore
 from fora.adapters.sqlite.store import SqliteStore
 from fora.core.errors import DomainError
+from fora.locking import LockLevel, OrderedRLock
+
+
+@pytest.mark.parametrize("use_reader", [False, True])
+def test_member_and_database_lock_order_with_selected_connections(
+    tmp_path: Path, use_reader: bool
+):
+    store = SqliteStore(tmp_path / "ordered.sqlite3")
+    member = store.create_member("agent", "Before")
+    member_lock = OrderedRLock(LockLevel.MEMBER)
+    try:
+        with member_lock:
+            context = store._db.read() if use_reader else store._db
+            with context:
+                selected = store._db.current
+                assert store._db.lock is selected._lock
+                assert isinstance(store._db.lock, OrderedRLock)
+                assert (selected is not store._db) is use_reader
+                assert store.get_member(member.id).name == "Before"
+                with store._db.read(), store._db.lock:
+                    assert store._db.current is selected
+        context = store._db.read() if use_reader else store._db
+        with (
+            context,
+            pytest.raises(RuntimeError, match="Lock order violation"),
+            member_lock,
+        ):
+            pytest.fail("Reverse database and member lock order was accepted")
+        assert store._db.current is store._db
+        assert store._db._readers.borrowed == 0
+        with member_lock:
+            store.rename_member(member.id, "After")
+        assert store.get_member(member.id).name == "After"
+    finally:
+        store.close()
 
 
 def test_read_connection_observes_committed_view_while_writer_runs(tmp_path: Path):

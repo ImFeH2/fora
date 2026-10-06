@@ -3092,15 +3092,16 @@ def test_model_update_and_member_status_complete_with_real_lock_interleaving(
     updating = threading.Event()
     status_done = threading.Event()
     release = threading.Event()
-    original = deps.store.list_members
+    original = deps.store._db.execute
 
-    def members(*args, **kwargs):
-        if deps.store._db._owner == threading.get_ident():
+    def query(sql, parameters=()):
+        if sql == "SELECT id FROM members WHERE type = 'agent' AND deleted = 0":
+            assert deps.store._db._owner == threading.get_ident()
             updating.set()
             assert status_done.wait(3)
-        return original(*args, **kwargs)
+        return original(sql, parameters)
 
-    monkeypatch.setattr(deps.store, "list_members", members)
+    monkeypatch.setattr(deps.store._db, "execute", query)
 
     def status():
         with scheduler.member_lock(agent.id):
