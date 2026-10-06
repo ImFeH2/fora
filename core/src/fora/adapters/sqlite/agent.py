@@ -4,7 +4,8 @@ import hashlib
 import json
 import sqlite3
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
+from dataclasses import asdict
 
 from pydantic import ValidationError
 
@@ -13,8 +14,16 @@ from fora.adapters.model.config import (
     ModelCatalog,
     thinking_options,
 )
-from fora.adapters.sqlite.store import LockedConnection, first
+from fora.adapters.sqlite.store import (
+    LockedConnection,
+    create_member,
+    delete_member,
+    first,
+)
+from fora.adapters.voice.config import VoiceConfig
 from fora.core.errors import DomainError
+from fora.core.member import name_key, validate_name
+from fora.core.parameters import validate_parameters
 from fora.core.turn import OVERFLOW_CONTEXT_BYTES, model_error_signature
 from fora.ports.agent import (
     AgentHistoryRun,
@@ -180,9 +189,10 @@ class SqliteAgentStore:
                 "SELECT agent_id, number, since_sequence, reset_at, reason, overflow_context "
                 "FROM agent_windows"
             )
-        self.update_settings(
-            "model", lambda values: ModelCatalog.restore(values).model_dump()
-        )
+        with self._db:
+            self.set_settings(
+                "model", ModelCatalog.restore(self.get_settings("model")).model_dump()
+            )
 
     def transaction(self) -> LockedConnection:
         return self._db
@@ -1302,13 +1312,10 @@ class SqliteAgentStore:
         self,
         name: str,
         model_config: object | None,
-        create_member: Callable[[str], dict[str, object]],
     ) -> dict[str, object]:
-        result: dict[str, object] = {}
-
-        def update(stored: dict[str, object] | None) -> dict[str, object]:
-            nonlocal result
-            catalog = ModelCatalog.restore(stored)
+        name = validate_name(name)
+        with self._db:
+            catalog = ModelCatalog.restore(self.get_settings("model"))
             try:
                 selection = AgentModelConfig.model_validate(
                     {} if model_config is None else model_config
@@ -1318,12 +1325,23 @@ class SqliteAgentStore:
                     "invalid_model_config", "Invalid Agent model configuration"
                 ) from None
             catalog.validate_selection(selection, "New Agent")
-            result = create_member(name)
-            catalog.agent_configs[str(result["id"])] = selection
-            return catalog.model_dump()
+            if self._db.execute(
+                "SELECT 1 FROM members WHERE name_key = ?", (name_key(name),)
+            ):
+                raise DomainError("duplicate_name", "Member names must be unique")
+            member = create_member(self._db, "agent", name)
+            catalog.agent_configs[str(member.id)] = selection
+            self.set_settings("model", catalog.model_dump())
+            return {"id": member.id, "name": member.name, "state": member.state}
 
-        self.update_settings("model", update)
-        return result
+    def delete_agent_with_model(self, agent_id: int) -> None:
+        with self._db:
+            delete_member(self._db, agent_id)
+            values = self.get_settings("model") or {}
+            selections = values.get("agent_configs")
+            if isinstance(selections, dict):
+                selections.pop(str(agent_id), None)
+            self.set_settings("model", values)
 
     def model_catalog(self) -> dict[str, object]:
         catalog = ModelCatalog.restore(self.get_settings("model"))
@@ -1360,16 +1378,38 @@ class SqliteAgentStore:
     def update_settings(
         self,
         section: str,
-        update: Callable[[dict[str, object] | None], dict[str, object]],
+        values: dict[str, object],
     ) -> dict[str, object]:
         with self._db:
-            values = update(self.get_settings(section))
-            self._db.execute(
-                "INSERT INTO settings (section, values_json) VALUES (?, ?)"
-                " ON CONFLICT (section) DO UPDATE SET values_json = excluded.values_json",
-                (section, json.dumps(values, ensure_ascii=False, sort_keys=True)),
-            )
-            return values
+            stored = self.get_settings(section)
+            if section == "model":
+                agent_ids = {
+                    int(row["id"])
+                    for row in self._db.execute(
+                        "SELECT id FROM members WHERE type = 'agent' AND deleted = 0"
+                    )
+                }
+                updated = (
+                    ModelCatalog.restore(stored).apply(values, agent_ids).model_dump()
+                )
+            else:
+                updated = {**(stored or {}), **values}
+                if section == "agent":
+                    validate_parameters(values)
+                    validate_parameters(updated)
+                elif section == "voice":
+                    if values.keys() - {"address", "model", "api_key"}:
+                        raise DomainError("voice_config", "Unknown voice setting")
+                    model = values.get("model")
+                    if "model" in values and (
+                        not isinstance(model, str) or not model.strip()
+                    ):
+                        raise DomainError(
+                            "voice_config", "A transcription model is required"
+                        )
+                    updated = asdict(VoiceConfig.restore(updated))
+            self.set_settings(section, updated)
+            return updated
 
     def set_settings(self, section: str, values: dict[str, object]) -> None:
         with self._db:

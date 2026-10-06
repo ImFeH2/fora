@@ -14,7 +14,7 @@ from fora.adapters.model.history import (
 )
 from fora.adapters.voice.config import VoiceConfig
 from fora.core.errors import DomainError
-from fora.core.parameters import agent_parameters, validate_parameters
+from fora.core.parameters import agent_parameters
 from fora.core.turn import idle_streak
 from fora.runtime.scheduler import Scheduler
 from fora.runtime_info import RuntimeInfo
@@ -801,9 +801,7 @@ class Api:
                 return ModelCatalog.restore(values).redacted()
             if section == "voice":
                 if "mode" in values:
-                    values = settings.update_settings(
-                        "voice", lambda stored: asdict(VoiceConfig.restore(stored))
-                    )
+                    values = settings.update_settings("voice", {})
                 return VoiceConfig.restore(values).public()
             if section == "agent":
                 return asdict(agent_parameters(values))
@@ -824,48 +822,16 @@ class Api:
                 raise DomainError(
                     "invalid_setting", "Settings values must be an object"
                 )
-            if section == "model":
-
-                def update_model(stored: dict[str, object] | None) -> dict[str, object]:
-                    agent_ids = {
-                        int(member["id"])
-                        for member in self._human().list_members()
-                        if member["type"] == "agent"
-                    }
-                    return (
-                        ModelCatalog.restore(stored)
-                        .apply(values, agent_ids)
-                        .model_dump()
-                    )
-
-                updated = settings.update_settings("model", update_model)
-                self._dispatcher.emit("settings.updated", {"section": section})
-                return ModelCatalog.restore(updated).redacted()
-            if section == "agent":
-                values = validate_parameters(values)
             if section == "execution":
                 result = self._scheduler.execution.configure(
                     values, lambda stored: settings.set_settings("execution", stored)
                 )
                 self._dispatcher.emit("settings.updated", {"section": section})
                 return result
-            merged = {**(settings.get_settings(section) or {}), **values}
-            if section == "agent":
-                validate_parameters(merged)
-            if section == "voice":
-                unknown = values.keys() - {"address", "model", "api_key"}
-                if unknown:
-                    raise DomainError("voice_config", "Unknown voice setting")
-                model = values.get("model")
-                if "model" in values and (
-                    not isinstance(model, str) or not model.strip()
-                ):
-                    raise DomainError(
-                        "voice_config", "A transcription model is required"
-                    )
-                merged = asdict(VoiceConfig.restore(merged))
-            settings.set_settings(section, merged)
+            updated = settings.update_settings(section, values)
             self._dispatcher.emit("settings.updated", {"section": section})
+            if section == "model":
+                return ModelCatalog.restore(updated).redacted()
             return settings_get({"section": section})
 
         def settings_list_models(params: dict[str, Any]) -> Any:

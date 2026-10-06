@@ -573,27 +573,21 @@ def test_model_catalog_migration_preserves_identity_across_restarts(tmp_path) ->
 
 
 def test_settings_updates_preserve_concurrent_changes(agent_store) -> None:
-    def increment(_: int) -> None:
-        def update(values):
-            return {"count": (values or {}).get("count", 0) + 1}
-
-        agent_store.update_settings("counter", update)
+    def update(index: int) -> None:
+        agent_store.update_settings("custom", {str(index): index})
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        list(pool.map(increment, range(100)))
-    assert agent_store.get_settings("counter") == {"count": 100}
+        list(pool.map(update, range(100)))
+    assert agent_store.get_settings("custom") == {
+        str(index): index for index in range(100)
+    }
 
 
 def test_rejected_settings_update_preserves_stored_value(agent_store) -> None:
-    agent_store.set_settings("counter", {"count": 1})
-
-    def reject(values):
-        values["count"] = 2
-        raise ValueError("Rejected update")
-
-    with pytest.raises(ValueError, match="Rejected update"):
-        agent_store.update_settings("counter", reject)
-    assert agent_store.get_settings("counter") == {"count": 1}
+    agent_store.set_settings("agent", {"token_limit": 100})
+    with pytest.raises(DomainError, match="must be a non-negative integer"):
+        agent_store.update_settings("agent", {"token_limit": -1})
+    assert agent_store.get_settings("agent") == {"token_limit": 100}
 
 
 def test_settings_round_trip_without_a_directory_table(

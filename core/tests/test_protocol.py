@@ -723,6 +723,46 @@ def test_concurrent_creation_and_model_updates_preserve_every_selection(server) 
     assert all(selection["thinking"] == "default" for selection in selections.values())
 
 
+def test_agent_deletion_and_model_configuration_are_atomic(server) -> None:
+    dispatcher, output, deps = server
+    created = call(dispatcher, output, "organization.create_agent", name="Retained")[
+        "result"
+    ]
+    room = call(
+        dispatcher,
+        output,
+        "discussion.create",
+        topic="Shared",
+        member_ids=[created["id"]],
+    )["result"]
+    before_members = deps.store.list_members()
+    before_settings = deps.settings.get_settings("model")
+    db = deps.store._db
+    db.executescript(
+        "CREATE TRIGGER reject_model_config BEFORE UPDATE ON settings "
+        "WHEN NEW.section = 'model' BEGIN "
+        "SELECT RAISE(ABORT, 'model configuration rejected'); END;"
+    )
+    try:
+        rejected = call(
+            dispatcher, output, "organization.delete_agent", agent_id=created["id"]
+        )
+        assert "error" in rejected
+        assert deps.store.list_members() == before_members
+        assert deps.settings.get_settings("model") == before_settings
+        assert created["id"] in deps.store.get_discussion(room["id"]).member_ids
+    finally:
+        db.execute("DROP TRIGGER reject_model_config")
+    deleted = call(
+        dispatcher, output, "organization.delete_agent", agent_id=created["id"]
+    )
+    assert deleted["result"]["deleted"]
+    assert (
+        str(created["id"]) not in deps.settings.get_settings("model")["agent_configs"]
+    )
+    assert created["id"] not in deps.store.get_discussion(room["id"]).member_ids
+
+
 def test_agent_creation_and_model_configuration_are_atomic(server) -> None:
     dispatcher, output, deps = server
     db = deps.store._db

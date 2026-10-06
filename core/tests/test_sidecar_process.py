@@ -847,6 +847,65 @@ def test_startup_has_no_workspace_or_working_directory_setting(
     assert not (target / "workspace").exists()
 
 
+def test_concurrent_model_changes_and_member_queries_allow_shutdown(
+    tmp_path: Path,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    with Kernel(tmp_path) as kernel:
+        ready = threading.Barrier(3)
+
+        def requests(kind: str) -> None:
+            with kernel.connect() as connection:
+                client = Client(connection)
+
+                def call(method: str, **params: Any) -> Any:
+                    frame = client.call({"id": 1, "method": method, "params": params})
+                    assert "result" in frame, frame
+                    return frame["result"]
+
+                ready.wait(timeout=10)
+                for index in range(10):
+                    if kind == "settings":
+                        call(
+                            "settings.update",
+                            section="model",
+                            values={
+                                "action": "set_defaults",
+                                "values": {"model_id": None, "thinking": "default"},
+                            },
+                        )
+                    elif kind == "members":
+                        member = call(
+                            "organization.create_agent", name=f"Concurrent {index}"
+                        )
+                        call("organization.delete_agent", agent_id=member["id"])
+                    else:
+                        organization = call("organization.get")
+                        assert all(
+                            "reasons" in member
+                            for member in organization["members"]
+                            if member["type"] == "agent"
+                        )
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [
+                pool.submit(requests, kind)
+                for kind in ("settings", "members", "queries")
+            ]
+            for future in futures:
+                future.result(timeout=TIMEOUT)
+        with kernel.connect() as connection:
+            client = Client(connection)
+            model = client.call(
+                {"id": 1, "method": "settings.get", "params": {"section": "model"}}
+            )
+            assert model["result"]["agent_configs"] == {}
+        assert kernel.shutdown() == 0
+        assert not (tmp_path / "run.json").exists()
+        assert "Lock order violation" not in kernel.stderr
+
+
 def test_run_file_lives_only_while_the_kernel_runs(tmp_path: Path) -> None:
     data = tmp_path / "data"
     run_file = data / "run.json"

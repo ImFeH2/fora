@@ -86,6 +86,86 @@ def mention(deps: Dependencies, body: str = "@Main please help") -> int:
     return room.id
 
 
+def test_model_settings_update_does_not_wait_for_member_status(world) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    from fora.adapters.jsonl.api import Api
+    from fora.adapters.jsonl.protocol import Dispatcher
+    from fora.adapters.model.runner import PydanticModelRunner
+
+    scheduler = Scheduler(world, PydanticModelRunner(world.settings))
+    dispatcher = Dispatcher()
+    Api(scheduler, dispatcher)
+    started = Event()
+    responses = []
+
+    def update() -> None:
+        started.set()
+        dispatcher.receive(
+            json.dumps(
+                {
+                    "id": 1,
+                    "method": "settings.update",
+                    "params": {
+                        "section": "model",
+                        "values": {
+                            "action": "set_defaults",
+                            "values": {"model_id": None, "thinking": "default"},
+                        },
+                    },
+                }
+            ),
+            responses.append,
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool, scheduler.member_lock(MAIN):
+            future = pool.submit(update)
+            assert started.wait(5)
+            future.result(timeout=5)
+            assert len(responses) == 1 and "result" in responses[0]
+            assert scheduler.agent_status(MAIN)["state"] == "blocked"
+    finally:
+        scheduler.stop()
+
+
+def test_database_transaction_cannot_enter_scheduler_status(world) -> None:
+    from fora.adapters.model.runner import PydanticModelRunner
+
+    scheduler = Scheduler(world, PydanticModelRunner(world.settings))
+    try:
+        with (
+            world.history.transaction(),
+            pytest.raises(RuntimeError, match="Lock order violation"),
+        ):
+            scheduler.agent_status(MAIN)
+        assert scheduler.agent_status(MAIN)["state"] == "blocked"
+    finally:
+        scheduler.stop()
+
+
+def test_member_records_are_separate_from_runtime_status(world) -> None:
+    from fora.adapters.model.runner import PydanticModelRunner
+    from fora.tools.authorize import Actor
+
+    scheduler = Scheduler(world, PydanticModelRunner(world.settings))
+    human = scheduler.tools_for_actor(Actor(HUMAN, False))
+    try:
+        with world.history.transaction():
+            members = human.list_member_records()
+            assert {member["id"] for member in members} == {HUMAN, MAIN, HELPER}
+            assert all("reasons" not in member for member in members)
+            with pytest.raises(RuntimeError, match="Lock order violation"):
+                human.list_members()
+        members = human.list_members()
+        assert all(
+            "reasons" in member for member in members if member["type"] == "agent"
+        )
+    finally:
+        scheduler.stop()
+
+
 def test_unavailable_execution_blocks_new_turns(world) -> None:
     room = mention(world)
     world.execution.close()

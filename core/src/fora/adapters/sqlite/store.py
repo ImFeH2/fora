@@ -7,7 +7,6 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import RLock
 from types import TracebackType
 from typing import Any, Self, cast
 
@@ -22,6 +21,7 @@ from fora.core.discussion import Discussion, Message, MessageMention, validate_b
 from fora.core.errors import DomainError
 from fora.core.member import AgentState, Member, MemberType, name_key
 from fora.core.mention import Mention, build_mentions
+from fora.locking import LockLevel, OrderedRLock
 from fora.ports.store import DiscussionPage, PendingAcknowledgement
 
 SCHEMA = """
@@ -248,12 +248,12 @@ def now() -> str:
 class LockedConnection:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self._connection = connection
-        self._lock = RLock()
+        self._lock = OrderedRLock(LockLevel.DATABASE)
         self._depth = 0
         self._rollback_only = False
 
     @property
-    def lock(self) -> RLock:
+    def lock(self) -> OrderedRLock:
         return self._lock
 
     def execute(self, sql: str, parameters: Sequence[Any] = ()) -> list[sqlite3.Row]:
@@ -348,6 +348,32 @@ class Transaction:
         traceback: TracebackType | None,
     ) -> None:
         self._connection.__exit__(exc_type, exc, traceback)
+
+
+def member_from_row(row: sqlite3.Row) -> Member:
+    return Member(
+        id=int(row["id"]),
+        type=cast(MemberType, str(row["type"])),
+        name=str(row["name"]),
+        deleted=bool(row["deleted"]),
+        state=cast(AgentState, str(row["state"])),
+    )
+
+
+def create_member(db: LockedConnection, member_type: MemberType, name: str) -> Member:
+    with db:
+        row = db.execute(
+            "INSERT INTO members (id, type, name, name_key)"
+            " SELECT COALESCE(MAX(id), 0) + 1, ?, ?, ? FROM members RETURNING *",
+            (member_type, name, name_key(name)),
+        )[0]
+        return member_from_row(row)
+
+
+def delete_member(db: LockedConnection, member_id: int) -> None:
+    with db:
+        db.execute("UPDATE members SET deleted = 1 WHERE id = ?", (member_id,))
+        db.execute("DELETE FROM discussion_members WHERE member_id = ?", (member_id,))
 
 
 class SqliteStore:
@@ -699,31 +725,18 @@ class SqliteStore:
         with self._db as connection:
             yield connection
 
-    def _next_id(self, table: str) -> int:
-        rows = self._db.execute(f"SELECT COALESCE(MAX(id), 0) + 1 AS v FROM {table}")
-        return int(rows[0]["v"])
-
-    def _member(self, row: sqlite3.Row) -> Member:
-        return Member(
-            id=int(row["id"]),
-            type=cast(MemberType, str(row["type"])),
-            name=str(row["name"]),
-            deleted=bool(row["deleted"]),
-            state=cast(AgentState, str(row["state"])),
-        )
-
     def list_members(self, *, include_deleted: bool = False) -> tuple[Member, ...]:
         sql = "SELECT * FROM members"
         if not include_deleted:
             sql += " WHERE deleted = 0"
         sql += " ORDER BY id"
-        return tuple(self._member(row) for row in self._db.execute(sql))
+        return tuple(member_from_row(row) for row in self._db.execute(sql))
 
     def get_member(self, member_id: int) -> Member | None:
         row = first(
             self._db.execute("SELECT * FROM members WHERE id = ?", (member_id,))
         )
-        return self._member(row) if row else None
+        return member_from_row(row) if row else None
 
     def name_taken(self, name: str) -> bool:
         row = first(
@@ -734,15 +747,7 @@ class SqliteStore:
         return row is not None
 
     def create_member(self, member_type: MemberType, name: str) -> Member:
-        member_id = self._next_id("members")
-        with self._write() as db:
-            db.execute(
-                "INSERT INTO members (id, type, name, name_key) VALUES (?, ?, ?, ?)",
-                (member_id, member_type, name, name_key(name)),
-            )
-        member = self.get_member(member_id)
-        assert member is not None
-        return member
+        return create_member(self._db, member_type, name)
 
     def rename_member(self, member_id: int, name: str) -> Member:
         with self._write() as db:
@@ -759,11 +764,7 @@ class SqliteStore:
             db.execute("UPDATE members SET state = ? WHERE id = ?", (state, agent_id))
 
     def delete_member(self, member_id: int) -> None:
-        with self._write() as db:
-            db.execute("UPDATE members SET deleted = 1 WHERE id = ?", (member_id,))
-            db.execute(
-                "DELETE FROM discussion_members WHERE member_id = ?", (member_id,)
-            )
+        delete_member(self._db, member_id)
 
     def _discussion(self, row: sqlite3.Row) -> Discussion:
         members = self._db.execute(

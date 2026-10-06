@@ -9,6 +9,7 @@ from typing import Any
 
 from fora.core.errors import DomainError
 from fora.core.parameters import AgentParameters, agent_parameters
+from fora.locking import LockLevel, OrderedRLock
 from fora.ports.agent import (
     AgentLifecycle,
     AgentRun,
@@ -139,7 +140,7 @@ class Scheduler:
         self._authorizer = authorizer or Authorizer()
         self._threads: dict[int, threading.Thread] = {}
         self._lock = threading.RLock()
-        self._member_locks: dict[int, Any] = {}
+        self._member_locks: dict[int, OrderedRLock] = {}
         self._active: dict[int, AgentRun] = {}
         self._reserved: set[int] = set()
         self._failures: dict[int, FailedFinalization] = {}
@@ -240,9 +241,11 @@ class Scheduler:
                 continue
             thread.join(timeout=5)
 
-    def member_lock(self, agent_id: int) -> Any:
+    def member_lock(self, agent_id: int) -> OrderedRLock:
         with self._lock:
-            return self._member_locks.setdefault(agent_id, threading.RLock())
+            return self._member_locks.setdefault(
+                agent_id, OrderedRLock(LockLevel.MEMBER)
+            )
 
     def _require_agent(self, agent_id: int) -> None:
         member = self.store.get_member(agent_id)

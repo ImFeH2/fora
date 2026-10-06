@@ -105,7 +105,9 @@ class AgentTools:
         if member is None or not member.is_agent or member.deleted:
             raise DomainError("not_found", f"Agent {agent_id} does not exist")
 
-    def list_members(self, include_deleted: bool = False) -> list[dict[str, Any]]:
+    def list_member_records(
+        self, include_deleted: bool = False
+    ) -> list[dict[str, Any]]:
         self._check("organization.list_members")
         return [
             {
@@ -113,29 +115,24 @@ class AgentTools:
                 "type": item.type,
                 "name": item.name,
                 "state": item.state,
-                **(
-                    self._agent_status(item.id)
-                    if item.is_agent and self._agent_status is not None
-                    else {}
-                ),
             }
             for item in self._deps.store.list_members(include_deleted=include_deleted)
         ]
 
-    def _create_agent_member(self, name: str) -> dict[str, object]:
-        if self._deps.store.name_taken(name):
-            raise DomainError("duplicate_name", "Member names must be unique")
-        member = self._deps.store.create_member("agent", name)
-        return {"id": member.id, "name": member.name, "state": member.state}
+    def list_members(self, include_deleted: bool = False) -> list[dict[str, Any]]:
+        members = self.list_member_records(include_deleted)
+        if self._agent_status is not None:
+            for member in members:
+                if member["type"] == "agent":
+                    member.update(self._agent_status(member["id"]))
+        return members
 
     def create_agent(
         self, name: str, model_config: object | None = None
     ) -> dict[str, Any]:
         self._check("organization.create_agent")
         validated = validate_name(name)
-        result = self._deps.settings.create_agent_with_model(
-            validated, model_config, self._create_agent_member
-        )
+        result = self._deps.settings.create_agent_with_model(validated, model_config)
         return self._changed("member.created", result)
 
     def list_models(self) -> dict[str, object]:
@@ -214,17 +211,7 @@ class AgentTools:
                 "agent_running",
                 "Pause the Agent and let its Turn finish before deleting",
             )
-        self._deps.store.delete_member(agent_id)
-
-        def remove_selection(values: dict[str, object] | None) -> dict[str, object]:
-            if values is None:
-                return {}
-            selections = values.get("agent_configs")
-            if isinstance(selections, dict):
-                selections.pop(str(agent_id), None)
-            return values
-
-        self._deps.settings.update_settings("model", remove_selection)
+        self._deps.settings.delete_agent_with_model(agent_id)
         return {"id": agent_id, "deleted": True}
 
     def create_discussion(
