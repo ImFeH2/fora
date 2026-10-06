@@ -228,7 +228,9 @@ def test_control_heartbeat_during_large_response_and_worker() -> None:
                             assert websocket._heartbeat == heartbeat
                             if configure:
                                 sender.get_extra_info("socket").setsockopt(
-                                    socket.SOL_SOCKET, socket.SO_SNDBUF, 0
+                                    socket.SOL_SOCKET,
+                                    socket.SO_SNDBUF,
+                                    0 if sys.platform == "win32" else 256 * 1024,
                                 )
                             return sender.get_write_buffer_size()
                     raise AssertionError("Slow connection is no longer active")
