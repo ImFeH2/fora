@@ -1,10 +1,10 @@
 [project]
 name = "fora-web"
-version = "0.0.8"
+version = "0.0.9"
 description = "Browser interface for Fora."
 requires-python = ">=3.13"
 authors = [{ name = "ImFeH2", email = "i@feh2.im" }]
-dependencies = ["fora==0.0.8"]
+dependencies = ["fora==0.0.9"]
 
 [project.scripts]
 fora-web = "fora_web.__main__:run"

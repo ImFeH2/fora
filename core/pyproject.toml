@@ -1,6 +1,6 @@
 [project]
 name = "fora"
-version = "0.0.8"
+version = "0.0.9"
 description = "Run your own organization of agents."
 requires-python = ">=3.13"
 authors = [{ name = "ImFeH2", email = "i@feh2.im" }]
