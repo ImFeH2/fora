@@ -727,6 +727,7 @@ def test_metadata_queries_cover_history_and_preserve_records(agent_store, size) 
         )
         for run in agent_store.runs(AGENT)
     )
+    expected_history = agent_store.history_runs(AGENT)
     connection = agent_store._db._connection
     statements = []
 
@@ -746,6 +747,14 @@ def test_metadata_queries_cover_history_and_preserve_records(agent_store, size) 
         assert agent_store.run_summaries(AGENT, limit=1) == expected[:1]
         assert agent_store.run_summaries(AGENT, limit=0) == ()
         assert agent_store.run_summaries(999) == ()
+        assert agent_store.history_runs(AGENT) == expected_history
+        assert agent_store.history_runs(AGENT, limit=1) == expected_history[:1]
+        assert agent_store.history_runs(AGENT, before=4) == expected_history[1:]
+        assert agent_store.history_runs(999) == ()
+        assert agent_store.history_run(AGENT, 4) == expected_history[0]
+        assert agent_store.history_run(AGENT, 1) == expected_history[-1]
+        assert agent_store.history_run(AGENT, 999) is None
+        assert agent_store.history_run(999, 1) is None
         assert agent_store.usage_total(AGENT)["total_tokens"] == 360
         assert agent_store.no_tool_streak(AGENT) == 1
         assert agent_store.last_reminder(AGENT) == frozenset({(1, 2)})
@@ -757,7 +766,10 @@ def test_metadata_queries_cover_history_and_preserve_records(agent_store, size) 
         if not sql.startswith("SELECT") or "FROM agent_runs" not in sql:
             continue
         plan = connection.execute("EXPLAIN QUERY PLAN " + sql).fetchall()
-        assert any("COVERING INDEX agent_runs_summary" in row[3] for row in plan)
+        assert any("COVERING INDEX agent_runs_summary" in row[3] for row in plan), (
+            sql,
+            [tuple(row) for row in plan],
+        )
     assert agent_store.latest_messages(AGENT) == payload
     assert agent_store.runs(AGENT)[1].messages_json == payload
 

@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -14,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Self, cast
 
+import psutil
 import pytest
 from aiohttp import ClientSession, WSMsgType, WSServerHandshakeError
 from pydantic_ai import BinaryContent, ModelMessagesTypeAdapter
@@ -1244,6 +1246,67 @@ def test_summary_paths_read_only_metadata(server) -> None:
     member = next(item for item in organization["members"] if item["id"] == agent_id)
     assert member["tokens"] == 3840
     assert deps.history.latest_messages(agent_id) == payload
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux read_chars counters")
+@pytest.mark.parametrize("size", [0, 65536, 2097152])
+def test_complete_detail_and_history_metadata_have_bounded_read_volume(
+    server, monkeypatch, size: int
+) -> None:
+    dispatcher, output, deps = server
+    agent_id = call(
+        dispatcher, output, "organization.create_agent", name="Read volume"
+    )["result"]["id"]
+    monkeypatch.setattr(deps.history, "_now", lambda: "2026-10-06T13:00:00Z")
+    payload = json.dumps([{"text": "x" * size}])
+    for sequence in range(1, 65):
+        run = deps.history.start_run(agent_id, run_id=f"run-{sequence}")
+        deps.history.finish_run(
+            agent_id,
+            run.sequence,
+            status="completed",
+            messages_json=payload,
+            usage_json='{"input_tokens":10,"output_tokens":2,"tool_calls":1}',
+        )
+        deps.history.record_effect(agent_id, run.sequence, "send", "saved")
+    connection = deps.store._db._connection
+    connection.execute("PRAGMA mmap_size=0")
+    connection.execute("PRAGMA cache_size=16")
+    connection.execute("ANALYZE")
+    process = psutil.Process()
+    operations = (
+        lambda: deps.history.history_runs(agent_id, limit=30),
+        lambda: deps.history.history_run(agent_id, 64),
+        lambda: call(dispatcher, output, "agent.history", agent_id=agent_id)["result"],
+        lambda: call(dispatcher, output, "agent.detail", agent_id=agent_id)["result"],
+    )
+    results = []
+    for operation in operations:
+        connection.execute("PRAGMA shrink_memory")
+        statements = []
+        connection.set_trace_callback(statements.append)
+        before = process.io_counters().read_chars
+        try:
+            result = operation()
+            read_bytes = process.io_counters().read_chars - before
+        finally:
+            connection.set_trace_callback(None)
+        assert 0 < read_bytes < 512 * 1024, (size, read_bytes)
+        history_queries = [
+            sql for sql in statements if sql.startswith("SELECT r.sequence, r.run_id")
+        ]
+        assert len(history_queries) == 1
+        plan = connection.execute("EXPLAIN QUERY PLAN " + history_queries[0]).fetchall()
+        assert any("COVERING INDEX agent_runs_summary" in row[3] for row in plan)
+        results.append(result)
+    history, single, page, detail = results
+    assert len(history) == 30
+    assert single.sequence == 64
+    assert page["runs"][0]["run_id"] == "run-64"
+    assert [run["sequence"] for run in detail["runs"]] == list(range(64, 34, -1))
+    assert detail["usage"]["total_tokens"] == 768
+    assert detail["runs"][0]["last_saved_at"] == "2026-10-06T13:00:00Z"
+    assert deps.history.run_messages(agent_id, 64) == payload
 
 
 def test_agent_detail_reports_runs(server) -> None:

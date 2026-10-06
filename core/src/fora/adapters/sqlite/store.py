@@ -561,11 +561,30 @@ class SqliteStore:
                     )
                 for statement in PENDING_REVISION_SCHEMA:
                     self._db.execute(statement)
-                self._db.execute(
-                    "CREATE INDEX IF NOT EXISTS agent_runs_summary ON agent_runs"
-                    " (agent_id, sequence, status, started_at, completed_at,"
-                    " usage_json, error, reminded_json, pending_revision)"
+                summary_columns = (
+                    "agent_id",
+                    "sequence",
+                    "status",
+                    "started_at",
+                    "completed_at",
+                    "usage_json",
+                    "error",
+                    "reminded_json",
+                    "pending_revision",
+                    "run_id",
+                    "last_saved_at",
+                    "window_number",
                 )
+                indexed_columns = tuple(
+                    row["name"]
+                    for row in self._db.execute("PRAGMA index_info(agent_runs_summary)")
+                )
+                if indexed_columns != summary_columns:
+                    self._db.execute("DROP INDEX IF EXISTS agent_runs_summary")
+                    self._db.execute(
+                        "CREATE INDEX agent_runs_summary ON agent_runs"
+                        f" ({', '.join(summary_columns)})"
+                    )
             cleanup.pop_all()
 
     def close(self) -> None:

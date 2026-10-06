@@ -853,7 +853,8 @@ class SqliteAgentStore:
                 "  LIMIT 1) AS window_reason,"
                 " (SELECT COUNT(*) FROM agent_model_requests m"
                 "  WHERE m.agent_id = r.agent_id AND m.sequence = r.sequence) AS request_count"
-                " FROM agent_runs r WHERE r.agent_id = ? AND r.sequence = ?",
+                " FROM agent_runs r INDEXED BY agent_runs_summary"
+                " WHERE r.agent_id = ? AND r.sequence = ?",
                 (agent_id, sequence),
             )
         )
@@ -882,7 +883,7 @@ class SqliteAgentStore:
             "  LIMIT 1) AS window_reason,"
             " (SELECT COUNT(*) FROM agent_model_requests m"
             "  WHERE m.agent_id = r.agent_id AND m.sequence = r.sequence) AS request_count"
-            " FROM agent_runs r WHERE r.agent_id = ?"
+            " FROM agent_runs r INDEXED BY agent_runs_summary WHERE r.agent_id = ?"
             f"{clause} ORDER BY r.sequence DESC LIMIT ?",
             (*parameters, limit),
         )

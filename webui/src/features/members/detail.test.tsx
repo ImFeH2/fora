@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { type ReactNode, StrictMode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   afterAll,
@@ -22,6 +22,7 @@ import {
   WorkspaceContent,
   WorkspaceSection,
 } from "@/features/members/detail";
+import * as saver from "@/features/settings/saver";
 import {
   type AgentDetail,
   type AgentHistoryRead,
@@ -33,6 +34,11 @@ import {
   type HistoryText,
   type LibraryEntry,
 } from "@/lib/backend";
+import { formatTime } from "@/lib/format";
+
+vi.mock("@/features/settings/model", () => ({
+  AgentModelPanel: () => null,
+}));
 
 vi.mock("@/components/ui/dialog", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/components/ui/dialog")>()),
@@ -207,6 +213,7 @@ describe("Agent history", () => {
 });
 
 describe("Agent history request fields", () => {
+  let act: typeof import("@testing-library/react").act;
   let cleanup: typeof import("@testing-library/react").cleanup;
   let fireEvent: typeof import("@testing-library/react").fireEvent;
   let render: typeof import("@testing-library/react").render;
@@ -240,6 +247,7 @@ describe("Agent history request fields", () => {
     vi.stubGlobal("requestAnimationFrame", dom.window.requestAnimationFrame);
     vi.stubGlobal("cancelAnimationFrame", dom.window.cancelAnimationFrame);
     const testing = await import("@testing-library/react");
+    act = testing.act;
     cleanup = testing.cleanup;
     fireEvent = testing.fireEvent;
     render = testing.render;
@@ -253,6 +261,289 @@ describe("Agent history request fields", () => {
     closeDom?.();
     vi.unstubAllGlobals();
   });
+
+  function page(id: number, strict = false) {
+    const content = (
+      <TooltipProvider>
+        <RouterProvider>
+          <OrganizationProvider
+            value={{
+              members: [
+                { id: 2, name: "Alpha", type: "agent", state: "idle" },
+                { id: 3, name: "Beta", type: "agent", state: "idle" },
+              ],
+              humanId: 1,
+              discussions: [],
+              refresh: async () => {},
+            }}
+          >
+            <MemberPage id={id} />
+          </OrganizationProvider>
+        </RouterProvider>
+      </TooltipProvider>
+    );
+    return strict ? <StrictMode>{content}</StrictMode> : content;
+  }
+
+  function pendingDetail() {
+    let resolve!: (value: AgentDetail) => void;
+    let reject!: (reason: unknown) => void;
+    const promise = new Promise<AgentDetail>((yes, no) => {
+      resolve = yes;
+      reject = no;
+    });
+    return { promise, resolve, reject };
+  }
+
+  function events() {
+    const listeners = new Set<Parameters<typeof backend.onEvent>[0]>();
+    const stops = vi.fn();
+    vi.spyOn(backend, "onEvent").mockImplementation((listener) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+        stops();
+      };
+    });
+    return {
+      listeners,
+      stops,
+      emit: (event: Parameters<Parameters<typeof backend.onEvent>[0]>[0]) => {
+        for (const listener of listeners) listener(event);
+      },
+    };
+  }
+
+  function tokens(value: number, id = 2): AgentDetail {
+    return {
+      ...detail,
+      id,
+      usage: { ...detail.usage, total_tokens: value },
+    };
+  }
+
+  it("filters unrelated events and merges bursts while publishing every completed read", async () => {
+    const stream = events();
+    const first = pendingDetail();
+    const second = pendingDetail();
+    const third = pendingDetail();
+    const read = vi
+      .spyOn(backend, "agentDetail")
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise)
+      .mockImplementationOnce(() => third.promise);
+    render(page(2));
+    await act(async () => {});
+    expect(read).toHaveBeenCalledExactlyOnceWith(2);
+    await act(async () => {
+      for (let index = 0; index < 20; index += 1)
+        stream.emit({ type: "turn.progress", agent_id: 3 });
+    });
+    expect(read).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      for (let index = 0; index < 20; index += 1)
+        stream.emit({ type: "turn.progress", agent_id: 2 });
+      stream.emit({ type: "settings.updated" });
+      stream.emit({ type: "organization.changed" });
+    });
+    expect(read).toHaveBeenCalledTimes(1);
+    await act(async () => first.resolve(tokens(101)));
+    expect(screen.getByText("101")).toBeTruthy();
+    expect(read).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      for (let index = 0; index < 20; index += 1)
+        stream.emit({ type: "turn.progress", agent_id: 2 });
+      second.resolve(tokens(202));
+    });
+    expect(screen.getByText("202")).toBeTruthy();
+    expect(read).toHaveBeenCalledTimes(3);
+    const finalRun: AgentRun = {
+      sequence: 4,
+      run_id: "run-4",
+      status: "failed",
+      started_at: "2026-10-06T13:00:00Z",
+      completed_at: "2026-10-06T13:02:00Z",
+      last_saved_at: "2026-10-06T13:01:59Z",
+      usage: null,
+      error: "Final Turn error",
+      effects: [],
+    };
+    await act(async () => third.resolve({ ...tokens(303), runs: [finalRun] }));
+    expect(screen.getByText("303")).toBeTruthy();
+    expect(screen.getByText("Final Turn error")).toBeTruthy();
+    expect(screen.getByText("failed")).toBeTruthy();
+    expect(
+      screen.getByText(`Saved ${formatTime(finalRun.last_saved_at as string)}`),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(
+        `Finished ${formatTime(finalRun.completed_at as string)}`,
+      ),
+    ).toBeTruthy();
+    expect(read).toHaveBeenCalledTimes(3);
+    await act(async () => stream.emit({ type: "turn.completed", agent_id: 3 }));
+    expect(read).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([false, true])(
+    "isolates late results after switching Agent (failure=%s)",
+    async (failure) => {
+      const stream = events();
+      const old = pendingDetail();
+      const current = pendingDetail();
+      const report = vi
+        .spyOn(saver, "reportLoadFailure")
+        .mockImplementation(() => {});
+      const read = vi
+        .spyOn(backend, "agentDetail")
+        .mockResolvedValueOnce(tokens(101))
+        .mockImplementationOnce(() => old.promise)
+        .mockImplementationOnce(() => current.promise);
+      const view = render(page(2));
+      await act(async () => {});
+      expect(screen.getByText("101")).toBeTruthy();
+      await act(async () =>
+        stream.emit({ type: "turn.progress", agent_id: 2 }),
+      );
+      view.rerender(page(3));
+      await act(async () => {});
+      expect(screen.queryByText("101")).toBeNull();
+      expect(read.mock.calls.map(([id]) => id)).toEqual([2, 2, 3]);
+      await act(async () => {
+        if (failure) old.reject(new Error("stale Agent failure"));
+        else old.resolve(tokens(999));
+        current.resolve(tokens(303, 3));
+      });
+      expect(screen.getByText("303")).toBeTruthy();
+      expect(screen.queryByText("999")).toBeNull();
+      expect(report).not.toHaveBeenCalled();
+      expect(stream.listeners.size).toBe(1);
+    },
+  );
+
+  it("recovers an initial failure through Retry and displays empty history", async () => {
+    events();
+    let retry: (() => void) | undefined;
+    vi.spyOn(saver, "reportLoadFailure").mockImplementation(
+      (_id, _error, action) => {
+        retry = action;
+      },
+    );
+    const read = vi
+      .spyOn(backend, "agentDetail")
+      .mockRejectedValueOnce(new Error("initial failure"))
+      .mockResolvedValueOnce(tokens(101));
+    render(page(2));
+    await act(async () => {});
+    expect(screen.queryByText("No Turns yet")).toBeNull();
+    expect(retry).toBeDefined();
+    await act(async () => retry?.());
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("101")).toBeTruthy();
+    expect(screen.getByText("No Turns yet")).toBeTruthy();
+  });
+
+  it("retains content on failure and merges Retry through the same refresh lifecycle", async () => {
+    const stream = events();
+    const recovery = pendingDetail();
+    let retry: (() => void) | undefined;
+    const report = vi
+      .spyOn(saver, "reportLoadFailure")
+      .mockImplementation((_id, _error, action) => {
+        retry = action;
+      });
+    const read = vi
+      .spyOn(backend, "agentDetail")
+      .mockResolvedValueOnce(tokens(101))
+      .mockRejectedValueOnce(new Error("read failed"))
+      .mockImplementationOnce(() => recovery.promise)
+      .mockResolvedValueOnce(tokens(303));
+    render(page(2));
+    await act(async () => {});
+    await act(async () => stream.emit({ type: "turn.failed", agent_id: 2 }));
+    expect(screen.getByText("101")).toBeTruthy();
+    expect(report).toHaveBeenCalledWith(
+      "agent-load:2",
+      expect.any(Error),
+      expect.any(Function),
+    );
+    await act(async () => {
+      retry?.();
+      retry?.();
+      stream.emit({ type: "turn.progress", agent_id: 2 });
+    });
+    expect(read).toHaveBeenCalledTimes(3);
+    await act(async () => recovery.resolve(tokens(202)));
+    expect(screen.getByText("303")).toBeTruthy();
+    expect(read).toHaveBeenCalledTimes(4);
+  });
+
+  it.each([false, true])(
+    "isolates the old connection during reconnect (failure=%s)",
+    async (failure) => {
+      const stream = events();
+      const old = pendingDetail();
+      const current = pendingDetail();
+      const followup = pendingDetail();
+      const report = vi
+        .spyOn(saver, "reportLoadFailure")
+        .mockImplementation(() => {});
+      const read = vi
+        .spyOn(backend, "agentDetail")
+        .mockImplementationOnce(() => old.promise)
+        .mockImplementationOnce(() => current.promise)
+        .mockImplementationOnce(() => followup.promise);
+      render(page(2));
+      await act(async () => {});
+      await act(async () => {
+        stream.emit({ type: "connection.closed" });
+        stream.emit({ type: "turn.progress", agent_id: 2 });
+      });
+      expect(read).toHaveBeenCalledTimes(1);
+      await act(async () => stream.emit({ type: "connection.restored" }));
+      expect(read).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        stream.emit({ type: "turn.progress", agent_id: 2 });
+        if (failure) old.reject(new Error("old connection failure"));
+        else old.resolve(tokens(999));
+      });
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(screen.queryByText("999")).toBeNull();
+      expect(report).not.toHaveBeenCalled();
+      await act(async () => current.resolve(tokens(202)));
+      expect(screen.getByText("202")).toBeTruthy();
+      expect(read).toHaveBeenCalledTimes(3);
+      await act(async () => followup.resolve(tokens(303)));
+      expect(screen.getByText("303")).toBeTruthy();
+    },
+  );
+
+  it.each([false, true])(
+    "cleans StrictMode subscriptions and ignores completion after unmount (failure=%s)",
+    async (failure) => {
+      const stream = events();
+      const pending = pendingDetail();
+      const report = vi
+        .spyOn(saver, "reportLoadFailure")
+        .mockImplementation(() => {});
+      const read = vi
+        .spyOn(backend, "agentDetail")
+        .mockImplementation(() => pending.promise);
+      const view = render(page(2, true));
+      await act(async () => {});
+      expect(read).toHaveBeenCalledExactlyOnceWith(2);
+      expect(stream.listeners.size).toBe(1);
+      view.unmount();
+      expect(stream.listeners.size).toBe(0);
+      expect(stream.stops).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        if (failure) pending.reject(new Error("unmounted failure"));
+        else pending.resolve(tokens(999));
+      });
+      expect(report).not.toHaveBeenCalled();
+      expect(read).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("resets long request fields before continuing the selected request", async () => {
     const summary = (ordinal: number): AgentHistoryRequestSummary => ({

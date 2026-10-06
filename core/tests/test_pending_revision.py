@@ -116,7 +116,7 @@ def test_migration_failure_rolls_back_and_reopens(tmp_path, monkeypatch, stage):
         if sql in PENDING_REVISION_SCHEMA or sql.startswith(
             (
                 "ALTER TABLE agent_runs ADD COLUMN pending_revision",
-                "CREATE INDEX IF NOT EXISTS agent_runs_summary",
+                "CREATE INDEX agent_runs_summary",
             )
         ):
             seen.append(sql)

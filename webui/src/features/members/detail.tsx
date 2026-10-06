@@ -91,7 +91,7 @@ export function MemberPage({ id }: { id: number }) {
   }, [agent, navigate]);
 
   if (!agent) return null;
-  return <AgentPage member={agent} refresh={refresh} />;
+  return <AgentPage key={agent.id} member={agent} refresh={refresh} />;
 }
 
 function AgentPage({
@@ -106,31 +106,66 @@ function AgentPage({
   const [doomed, setDoomed] = useState(false);
   const paused = canResume(member);
 
-  const load = useCallback(async () => {
-    try {
-      setDetail(await backend.agentDetail(member.id));
-      dismissToast(`agent-load:${member.id}`);
-    } catch (failure) {
-      reportLoadFailure(`agent-load:${member.id}`, failure, () => void load());
-    }
-  }, [member.id]);
-
   useEffect(() => {
-    void load();
-    return () => dismissToast(`agent-load:${member.id}`);
-  }, [load, member.id]);
-
-  useEffect(() => {
-    return backend.onEvent((event) => {
+    let active = true;
+    let connected = true;
+    let generation = 0;
+    let pending = false;
+    let dirty = false;
+    const toastId = `agent-load:${member.id}`;
+    const load = async () => {
+      if (!active || !connected) return;
+      dirty = true;
+      if (pending) return;
+      pending = true;
+      dirty = false;
+      const current = generation;
+      try {
+        const result = await backend.agentDetail(member.id);
+        if (!active || current !== generation) return;
+        setDetail(result);
+        dismissToast(toastId);
+      } catch (failure) {
+        if (!active || current !== generation) return;
+        reportLoadFailure(toastId, failure, () => void load());
+      } finally {
+        if (active && current === generation) {
+          pending = false;
+          if (dirty) void load();
+        }
+      }
+    };
+    const stop = backend.onEvent((event) => {
+      if (event.type === "connection.closed") {
+        generation += 1;
+        connected = false;
+        pending = false;
+        dirty = false;
+        dismissToast(toastId);
+        return;
+      }
+      if (event.type === "connection.restored") {
+        generation += 1;
+        connected = true;
+        pending = false;
+        dirty = false;
+        void load();
+        return;
+      }
       if (
-        event.type.startsWith("turn.") ||
+        (event.type.startsWith("turn.") && event.agent_id === member.id) ||
         event.type === "organization.changed" ||
-        event.type === "settings.updated" ||
-        event.type === "connection.restored"
+        event.type === "settings.updated"
       )
         void load();
     });
-  }, [load]);
+    queueMicrotask(() => void load());
+    return () => {
+      active = false;
+      stop();
+      dismissToast(toastId);
+    };
+  }, [member.id]);
 
   return (
     <Page>

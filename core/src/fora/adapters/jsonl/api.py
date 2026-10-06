@@ -874,13 +874,13 @@ class Api:
             status = self._scheduler.agent_status(agent_id)
             with self._reading():
                 self._human().authorize_agent_history(agent_id)
-                runs = self._scheduler.history.run_summaries(agent_id, limit=30)
-                history_runs = {
-                    run.sequence: run
-                    for run in self._scheduler.history.history_runs(agent_id, limit=30)
-                }
-                effects = self._scheduler.history.effects(
-                    agent_id, sequences=[run.sequence for run in runs]
+                runs = self._scheduler.history.history_runs(agent_id, limit=30)
+                effects = (
+                    self._scheduler.history.effects(
+                        agent_id, sequences=[run.sequence for run in runs]
+                    )
+                    if runs
+                    else ()
                 )
                 window = self._scheduler.history.window(agent_id)
                 usage = self._scheduler.history.usage_total(agent_id)
@@ -917,27 +917,15 @@ class Api:
                 "runs": [
                     {
                         "sequence": run.sequence,
-                        "run_id": history_runs[run.sequence].run_id
-                        if run.sequence in history_runs
-                        else None,
+                        "run_id": run.run_id,
                         "status": run.status,
                         "started_at": run.started_at,
                         "completed_at": run.completed_at,
-                        "last_saved_at": history_runs[run.sequence].last_saved_at
-                        if run.sequence in history_runs
-                        else None,
-                        "window_number": history_runs[run.sequence].window_number
-                        if run.sequence in history_runs
-                        else None,
-                        "window_reset_at": history_runs[run.sequence].window_reset_at
-                        if run.sequence in history_runs
-                        else None,
-                        "window_reason": history_runs[run.sequence].window_reason
-                        if run.sequence in history_runs
-                        else None,
-                        "request_count": history_runs[run.sequence].request_count
-                        if run.sequence in history_runs
-                        else 0,
+                        "last_saved_at": run.last_saved_at,
+                        "window_number": run.window_number,
+                        "window_reset_at": run.window_reset_at,
+                        "window_reason": run.window_reason,
+                        "request_count": run.request_count,
                         "usage": run.usage_json,
                         "error": run.error,
                         "effects": produced.get(run.sequence, []),
