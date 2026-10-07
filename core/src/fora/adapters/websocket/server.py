@@ -68,6 +68,7 @@ class OutgoingFrame:
     text: str
     cost: int
     completion: asyncio.Future[None] | None
+    on_sent: Callable[[], None] | None = None
 
 
 class ControlOutbox:
@@ -120,6 +121,7 @@ class ControlOutbox:
         self,
         payload: dict[str, Any],
         completion: asyncio.Future[None] | None = None,
+        on_sent: Callable[[], None] | None = None,
     ) -> None:
         reserved = 0
         counted = False
@@ -164,7 +166,7 @@ class ControlOutbox:
                         self.closed = True
                         self._wake_locked()
                         return
-                    frame = OutgoingFrame(text, cost, completion)
+                    frame = OutgoingFrame(text, cost, completion, on_sent)
                     text = None
                     if completion is None:
                         self.used += cost - reserved
@@ -211,7 +213,23 @@ class ControlOutbox:
     async def send(self, connection: web.WebSocketResponse) -> None:
         while (frame := await self.take()) is not None:
             try:
-                await connection.send_str(frame.text)
+                if frame.on_sent is None:
+                    await connection.send_str(frame.text)
+                else:
+                    sending = asyncio.Task(
+                        connection.send_str(frame.text),
+                        loop=self.loop,
+                        eager_start=True,
+                    )
+                    try:
+                        if sending.done():
+                            sending.result()
+                        frame.on_sent()
+                        await sending
+                    finally:
+                        if not sending.done():
+                            sending.cancel()
+                            await asyncio.gather(sending, return_exceptions=True)
                 if frame.completion is not None:
                     self.complete(frame.completion)
             finally:
@@ -597,12 +615,19 @@ class WebServer:
                 completion = outbox.register_response()
                 responded = False
 
+                def delivered() -> None:
+                    if (
+                        record.identifier is not None
+                        and identifiers.get(record.identifier) is record
+                    ):
+                        identifiers.pop(record.identifier, None)
+
                 def response(payload: dict[str, Any]) -> None:
                     nonlocal responded
                     if responded:
                         raise RuntimeError("Request already responded")
                     responded = True
-                    outbox.put(payload, completion)
+                    outbox.put(payload, completion, delivered)
 
                 def operation() -> None:
                     if failure is None:
@@ -648,7 +673,10 @@ class WebServer:
             record.business.set()
             records.discard(record)
             self._requests.discard(record)
-            if record.identifier is not None:
+            if (
+                record.identifier is not None
+                and identifiers.get(record.identifier) is record
+            ):
                 identifiers.pop(record.identifier, None)
             record.task = None
             if not task.cancelled() and (error := task.exception()) is not None:

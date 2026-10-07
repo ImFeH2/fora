@@ -11,6 +11,7 @@ import time
 import uuid
 from dataclasses import asdict
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Self, cast
@@ -1218,7 +1219,15 @@ def test_summary_paths_read_only_metadata(server) -> None:
         )
         deps.history.record_effect(agent_id, run.sequence, "send", "message")
     scheduler = Scheduler(deps, PydanticModelRunner(deps.history))
-    connection = deps.store._db._connection
+    database = deps.store._db
+    with database.read():
+        database.execute("SELECT 1")
+    readers = database._readers
+    assert readers is not None
+    connections = [
+        database._connection,
+        *(db._connection for db in readers.connections),
+    ]
 
     def authorize(action, table, column, database, source):
         if (
@@ -1229,13 +1238,15 @@ def test_summary_paths_read_only_metadata(server) -> None:
             return sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK
 
-    connection.set_authorizer(authorize)
+    for connection in connections:
+        connection.set_authorizer(authorize)
     try:
         detail = call(dispatcher, output, "agent.detail", agent_id=agent_id)["result"]
         organization = call(dispatcher, output, "organization.get")["result"]
         assert scheduler.preparation_due(agent_id)
     finally:
-        connection.set_authorizer(None)
+        for connection in connections:
+            connection.set_authorizer(None)
     assert len(detail["runs"]) == 30
     assert [run["sequence"] for run in detail["runs"]] == list(range(32, 2, -1))
     assert detail["runs"][0]["effects"] == [
@@ -1269,10 +1280,19 @@ def test_complete_detail_and_history_metadata_have_bounded_read_volume(
             usage_json='{"input_tokens":10,"output_tokens":2,"tool_calls":1}',
         )
         deps.history.record_effect(agent_id, run.sequence, "send", "saved")
-    connection = deps.store._db._connection
-    connection.execute("PRAGMA mmap_size=0")
-    connection.execute("PRAGMA cache_size=16")
-    connection.execute("ANALYZE")
+    database = deps.store._db
+    database._connection.execute("ANALYZE")
+    with database.read():
+        database.execute("SELECT 1")
+    readers = database._readers
+    assert readers is not None
+    connections = [
+        database._connection,
+        *(db._connection for db in readers.connections),
+    ]
+    for connection in connections:
+        connection.execute("PRAGMA mmap_size=0")
+        connection.execute("PRAGMA cache_size=16")
     process = psutil.Process()
     operations = (
         lambda: deps.history.history_runs(agent_id, limit=30),
@@ -1280,23 +1300,32 @@ def test_complete_detail_and_history_metadata_have_bounded_read_volume(
         lambda: call(dispatcher, output, "agent.history", agent_id=agent_id)["result"],
         lambda: call(dispatcher, output, "agent.detail", agent_id=agent_id)["result"],
     )
+
+    def trace(connection, statements, sql):
+        statements.append((connection, sql))
+
     results = []
     for operation in operations:
-        connection.execute("PRAGMA shrink_memory")
         statements = []
-        connection.set_trace_callback(statements.append)
+        for connection in connections:
+            connection.execute("PRAGMA shrink_memory")
+            connection.set_trace_callback(partial(trace, connection, statements))
         before = process.io_counters().read_chars
         try:
             result = operation()
             read_bytes = process.io_counters().read_chars - before
         finally:
-            connection.set_trace_callback(None)
+            for connection in connections:
+                connection.set_trace_callback(None)
         assert 0 < read_bytes < 512 * 1024, (size, read_bytes)
         history_queries = [
-            sql for sql in statements if sql.startswith("SELECT r.sequence, r.run_id")
+            (connection, sql)
+            for connection, sql in statements
+            if sql.startswith("SELECT r.sequence, r.run_id")
         ]
         assert len(history_queries) == 1
-        plan = connection.execute("EXPLAIN QUERY PLAN " + history_queries[0]).fetchall()
+        connection, sql = history_queries[0]
+        plan = connection.execute("EXPLAIN QUERY PLAN " + sql).fetchall()
         assert any("COVERING INDEX agent_runs_summary" in row[3] for row in plan)
         results.append(result)
     history, single, page, detail = results

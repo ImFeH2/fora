@@ -116,8 +116,8 @@ def test_control_slow_connection_isolated(monkeypatch) -> None:
     references = []
     original = module.OutgoingFrame
 
-    def frame(text, cost, completion):
-        value = original(text, cost, completion)
+    def frame(text, cost, completion, on_sent=None):
+        value = original(text, cost, completion, on_sent)
         references.append(weakref.ref(value))
         return value
 
@@ -369,8 +369,8 @@ def test_control_owner_cancellation(mode: str, monkeypatch) -> None:
         outboxes.append(value)
         return value
 
-    def frame(text, cost, completion):
-        value = original_frame(text, cost, completion)
+    def frame(text, cost, completion, on_sent=None):
+        value = original_frame(text, cost, completion, on_sent)
         references.append(weakref.ref(value))
         return value
 
