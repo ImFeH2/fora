@@ -14,7 +14,7 @@ from pydantic_ai.messages import (
     ToolReturnPart,
 )
 from pydantic_ai.models.function import FunctionModel
-from test_runtime import HELPER, HUMAN, MAIN, RecordingRunner, mention
+from test_runtime import HELPER, HUMAN, MAIN, RecordingRunner, mention, turn_thread
 
 pytest_plugins = ("test_runtime",)
 
@@ -213,15 +213,15 @@ def test_pause_allows_current_model_and_tool_to_finish(model_settings):
         assert scheduler.tick() == ()
         world.store.append_message(room, HUMAN, "@Main next turn")
         release.set()
-        scheduler._threads[MAIN].join(5)
-        assert not scheduler._threads[MAIN].is_alive()
+        turn_thread(scheduler, MAIN).join(5)
+        assert not turn_thread(scheduler, MAIN).is_alive()
         assert len(calls) == 2
         assert world.store.messages(room)[-1].body == "real effect"
         assert scheduler.agent_status(MAIN)["state"] == "paused"
         assert world.history.runs(MAIN)[0].status == "completed"
         assert MAIN not in scheduler._reserved
         assert scheduler.tick() == (HELPER,)
-        scheduler._threads[HELPER].join(5)
+        turn_thread(scheduler, HELPER).join(5)
         assert scheduler.resume(MAIN)["state"] == "idle"
         assert MAIN in scheduler.runnable_agents()
         history = ModelMessagesTypeAdapter.validate_json(
@@ -263,7 +263,7 @@ def test_resume_during_running_turn_clears_intent_and_preserves_effects(world):
         assert scheduler.resume(MAIN) == state
         assert MAIN in scheduler._reserved
         release.set()
-        scheduler._threads[MAIN].join(5)
+        turn_thread(scheduler, MAIN).join(5)
         assert scheduler.agent_status(MAIN)["state"] == "idle"
         assert world.store.messages(room)[-1].body == "continued"
     finally:
@@ -420,7 +420,7 @@ def test_pause_and_resume_storage_failures_preserve_intent(world):
         assert MAIN in scheduler._reserved
         world.store._db.execute("DROP TRIGGER reject_intent")
         release.set()
-        scheduler._threads[MAIN].join(5)
+        turn_thread(scheduler, MAIN).join(5)
         assert scheduler.agent_status(MAIN)["state"] == "paused"
         assert world.history.lifecycle(MAIN).pause_requested
         assert MAIN not in scheduler._reserved

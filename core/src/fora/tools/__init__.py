@@ -61,6 +61,7 @@ class AgentTools:
         pause: Callable[[int], dict[str, Any]] | None = None,
         resume: Callable[[int, bool], dict[str, Any]] | None = None,
         member_guard: Callable[[int], AbstractContextManager[object]] | None = None,
+        member_deleted: Callable[[int], None] | None = None,
     ) -> None:
         self._deps = deps
         self._actor = actor
@@ -71,6 +72,7 @@ class AgentTools:
         self._pause = pause
         self._resume = resume
         self._member_guard = member_guard
+        self._member_deleted = member_deleted
 
     def _changed(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
         self._on_change(name, payload)
@@ -213,6 +215,8 @@ class AgentTools:
                 "Pause the Agent and let its Turn finish before deleting",
             )
         self._deps.settings.delete_agent_with_model(agent_id)
+        if self._member_deleted is not None:
+            self._member_deleted(agent_id)
         return {"id": agent_id, "deleted": True}
 
     def create_discussion(

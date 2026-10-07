@@ -117,11 +117,15 @@ export class DraftController {
   #cancellationRecovery: Promise<void> | null = null;
   #errorVersion = 0;
   #cancellationTransportFeedback: number | null = null;
+  #operations = 0;
+  #savedDraft: Draft | null;
 
   constructor(
     readonly discussionId: number,
     draft: Draft,
+    readonly onIdle: () => void = () => {},
   ) {
+    this.#savedDraft = draft;
     this.#view = {
       draft,
       busy: false,
@@ -137,6 +141,7 @@ export class DraftController {
     this.#listeners.add(listener);
     return () => {
       this.#listeners.delete(listener);
+      this.onIdle();
     };
   };
   #notify(update: Partial<DraftView>) {
@@ -145,29 +150,57 @@ export class DraftController {
     for (const listener of this.#listeners) listener();
   }
 
+  canRelease() {
+    return (
+      this.#listeners.size === 0 &&
+      this.#operations === 0 &&
+      this.#view.draft === this.#savedDraft &&
+      this.#view.storageError === null &&
+      !(
+        this.#view.draft.pending &&
+        this.#view.submissionResult?.id === this.#view.draft.pending.id
+      )
+    );
+  }
+
+  async #runOperation<T>(operation: () => Promise<T>): Promise<T> {
+    this.#operations += 1;
+    try {
+      return await operation();
+    } finally {
+      this.#operations -= 1;
+      this.onIdle();
+    }
+  }
+
   #persist(draft: Draft): Promise<boolean> {
     const number = ++this.#writeNumber;
     draft = { ...draft, updatedAt: Date.now() };
+    this.#savedDraft = null;
     this.#notify({ draft, saving: true });
-    const operation = this.#writes.then(async () => {
-      try {
-        const db = await database();
+    const operation = this.#runOperation(() =>
+      this.#writes.then(async () => {
         try {
-          await db.put("drafts", draft);
-        } finally {
-          db.close();
+          const db = await database();
+          try {
+            await db.put("drafts", draft);
+          } finally {
+            db.close();
+          }
+          if (number === this.#writeNumber) {
+            this.#savedDraft = draft;
+            this.#notify({ saving: false, storageError: null });
+          }
+          return true;
+        } catch (error) {
+          this.#notify({
+            saving: false,
+            storageError: `Draft not saved: ${error instanceof Error ? error.message : String(error)}`,
+          });
+          return false;
         }
-        if (number === this.#writeNumber)
-          this.#notify({ saving: false, storageError: null });
-        return true;
-      } catch (error) {
-        this.#notify({
-          saving: false,
-          storageError: `Draft not saved: ${error instanceof Error ? error.message : String(error)}`,
-        });
-        return false;
-      }
-    });
+      }),
+    );
     this.#writes = operation;
     return operation;
   }
@@ -332,7 +365,10 @@ export class DraftController {
     void this.#completeCancellation();
   }
 
-  async #completeCancellation(): Promise<void> {
+  #completeCancellation = () =>
+    this.#runOperation(() => this.#recoverCancellation());
+
+  async #recoverCancellation(): Promise<void> {
     const pending = this.#view.draft.pending;
     if (!pending?.cancelRequested) return;
     if (this.#view.busy) {
@@ -439,7 +475,9 @@ export class DraftController {
     });
   }
 
-  async checkResult() {
+  checkResult = () => this.#runOperation(() => this.#checkResult());
+
+  async #checkResult() {
     const pending = this.#view.draft.pending;
     if (pending?.cancelRequested) {
       await this.#completeCancellation();
@@ -484,7 +522,9 @@ export class DraftController {
     }
   }
 
-  async discardAttempt() {
+  discardAttempt = () => this.#runOperation(() => this.#discardAttempt());
+
+  async #discardAttempt() {
     const pending = this.#view.draft.pending;
     if (pending?.cancelRequested) {
       await this.#completeCancellation();
@@ -516,7 +556,9 @@ export class DraftController {
     }
   }
 
-  async send(onSend: SendDraft) {
+  send = (onSend: SendDraft) => this.#runOperation(() => this.#send(onSend));
+
+  async #send(onSend: SendDraft) {
     if (this.#view.busy) return;
     const draft = this.#view.draft;
     if (draft.pending?.cancelRequested) {
@@ -656,75 +698,120 @@ export class DraftController {
   }
 }
 
-const controllers = new Map<number, Promise<DraftController>>();
-function controllerFor(discussion: number) {
-  const existing = controllers.get(discussion);
-  if (existing) return existing;
-  const pending = (async () => {
-    const organization = await backend.organization();
-    const tab = await tabId();
-    const prefix = `${organization.uuid}:${organization.human_id}:${discussion}:`;
-    const key = `${prefix}${tab}`;
-    const db = await database();
-    let stored: Draft | undefined;
-    try {
-      stored = await db.get("drafts", key);
-      if (!stored) {
-        const candidates = (await db.getAll("drafts"))
-          .filter(
-            (entry) =>
-              entry.key.startsWith(prefix) &&
-              (entry.body || entry.files.length || entry.pending),
-          )
-          .sort((a, b) => b.updatedAt - a.updatedAt);
-        for (const candidate of candidates) {
-          stored = await navigator.locks.request(
-            `fora-draft-tab:${candidate.key.slice(prefix.length)}`,
-            { ifAvailable: true },
-            async (lock) => {
-              if (!lock) return undefined;
-              const transaction = db.transaction("drafts", "readwrite");
-              const current = await transaction.store.get(candidate.key);
-              if (!current) {
-                await transaction.done;
-                return undefined;
-              }
-              const recovered = { ...current, key };
-              await transaction.store.put(recovered);
-              await transaction.store.delete(candidate.key);
+type ControllerEntry = {
+  users: number;
+  pending: Promise<DraftController>;
+  controller?: DraftController;
+};
+const controllers = new Map<number, ControllerEntry>();
+
+function releaseIdleController(discussion: number, entry: ControllerEntry) {
+  if (
+    controllers.get(discussion) === entry &&
+    entry.users === 0 &&
+    entry.controller?.canRelease()
+  )
+    controllers.delete(discussion);
+}
+
+async function loadController(discussion: number, onIdle: () => void) {
+  const organization = await backend.organization();
+  const tab = await tabId();
+  const prefix = `${organization.uuid}:${organization.human_id}:${discussion}:`;
+  const key = `${prefix}${tab}`;
+  const db = await database();
+  let stored: Draft | undefined;
+  try {
+    stored = await db.get("drafts", key);
+    if (!stored) {
+      const candidates = (await db.getAll("drafts"))
+        .filter(
+          (entry) =>
+            entry.key.startsWith(prefix) &&
+            (entry.body || entry.files.length || entry.pending),
+        )
+        .sort((a, b) => b.updatedAt - a.updatedAt);
+      for (const candidate of candidates) {
+        stored = await navigator.locks.request(
+          `fora-draft-tab:${candidate.key.slice(prefix.length)}`,
+          { ifAvailable: true },
+          async (lock) => {
+            if (!lock) return undefined;
+            const transaction = db.transaction("drafts", "readwrite");
+            const current = await transaction.store.get(candidate.key);
+            if (!current) {
               await transaction.done;
-              return recovered;
-            },
-          );
-          if (stored) break;
-        }
+              return undefined;
+            }
+            const recovered = { ...current, key };
+            await transaction.store.put(recovered);
+            await transaction.store.delete(candidate.key);
+            await transaction.done;
+            return recovered;
+          },
+        );
+        if (stored) break;
       }
-    } finally {
-      db.close();
     }
-    const controller = new DraftController(
-      discussion,
-      stored ?? {
-        key,
-        updatedAt: Date.now(),
-        body: "",
-        bodyRevision: 0,
-        files: [],
-        pending: null,
-      },
-    );
-    void controller.checkResult();
-    return controller;
-  })();
-  controllers.set(discussion, pending);
-  void pending.catch(() => {
-    if (controllers.get(discussion) === pending) controllers.delete(discussion);
-  });
-  return pending;
+  } finally {
+    db.close();
+  }
+  const controller = new DraftController(
+    discussion,
+    stored ?? {
+      key,
+      updatedAt: Date.now(),
+      body: "",
+      bodyRevision: 0,
+      files: [],
+      pending: null,
+    },
+    onIdle,
+  );
+  return controller;
+}
+
+function controllerFor(discussion: number) {
+  let entry = controllers.get(discussion);
+  if (!entry) {
+    const created: ControllerEntry = {
+      users: 0,
+      pending: loadController(discussion, () =>
+        releaseIdleController(discussion, created),
+      ),
+    };
+    created.pending = created.pending.then((controller) => {
+      created.controller = controller;
+      void controller.checkResult();
+      return controller;
+    });
+    controllers.set(discussion, created);
+    void created.pending.catch(() => {
+      if (controllers.get(discussion) === created)
+        controllers.delete(discussion);
+    });
+    entry = created;
+  }
+  const acquired = entry;
+  acquired.users += 1;
+  let released = false;
+  return {
+    pending: acquired.pending,
+    release: () => {
+      if (released) return;
+      released = true;
+      acquired.users -= 1;
+      releaseIdleController(discussion, acquired);
+    },
+  };
 }
 
 export function useDraft(discussion: number) {
-  const [controller, setController] = useState<DraftController | null>(null);
+  const [loadedController, setController] = useState<DraftController | null>(
+    null,
+  );
+  const controller =
+    loadedController?.discussionId === discussion ? loadedController : null;
   const [error, setError] = useState<string | null>(null);
   const [retryNumber, setRetryNumber] = useState(0);
   useEffect(() => {
@@ -732,6 +819,8 @@ export function useDraft(discussion: number) {
     let loading: Promise<void> | null = null;
     let retryAfterLoading = false;
     let current: DraftController | null = null;
+    let acquired: ReturnType<typeof controllerFor> | null = null;
+    setController(null);
     const load = () => {
       if (!live || current) return;
       if (loading) {
@@ -739,7 +828,9 @@ export function useDraft(discussion: number) {
         return;
       }
       setError(null);
-      const attempt = controllerFor(discussion).then(
+      acquired?.release();
+      acquired = controllerFor(discussion);
+      const attempt = acquired.pending.then(
         (value) => {
           if (!live) return;
           current = value;
@@ -784,6 +875,7 @@ export function useDraft(discussion: number) {
     return () => {
       live = false;
       off();
+      acquired?.release();
     };
   }, [discussion, retryNumber]);
   const view = useSyncExternalStore(

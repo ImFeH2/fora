@@ -6,6 +6,7 @@ requires-python = ">=3.13"
 authors = [{ name = "ImFeH2", email = "i@feh2.im" }]
 dependencies = [
   "aiohttp>=3.12.0",
+  "anyio>=4.15.1",
   "httpx>=0.28.1",
   "numpy>=2.5.3",
   "opentelemetry-exporter-otlp-proto-http>=1.44.0",

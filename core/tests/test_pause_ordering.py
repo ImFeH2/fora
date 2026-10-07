@@ -1,7 +1,7 @@
 import threading
 
 import pytest
-from test_runtime import HELPER, HUMAN, MAIN, RecordingRunner, mention
+from test_runtime import HELPER, HUMAN, MAIN, RecordingRunner, mention, turn_thread
 
 pytest_plugins = ("test_runtime",)
 
@@ -61,7 +61,7 @@ def test_pause_after_commit_before_thread_execution(world, monkeypatch, resume, 
         release.set()
         launcher.join(5)
         model_release.set()
-        scheduler._threads[MAIN].join(5)
+        turn_thread(scheduler, MAIN).join(5)
         assert starts == [(MAIN,)]
         assert calls == [MAIN]
         assert world.store.messages(room)[-1].body == "finished current work"
@@ -95,7 +95,7 @@ def test_operation_after_finalization_uses_committed_state(world, resume):
         if resume:
             scheduler.pause(MAIN)
         release.set()
-        scheduler._threads[MAIN].join(5)
+        turn_thread(scheduler, MAIN).join(5)
         assert MAIN not in scheduler._active
         result = scheduler.resume(MAIN) if resume else scheduler.pause(MAIN)
         assert result["state"] == ("idle" if resume else "paused")

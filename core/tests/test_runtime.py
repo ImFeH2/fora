@@ -4,6 +4,7 @@ import json
 import sqlite3
 import sys
 from pathlib import Path
+from threading import Thread
 
 import pytest
 
@@ -77,13 +78,23 @@ def world(tmp_path: Path):
         ),
     )
     yield deps
-    store.close()
+    deps.store.close()
 
 
 def mention(deps: Dependencies, body: str = "@Main please help") -> int:
     room = deps.store.create_discussion("work", [HUMAN, MAIN])
     deps.store.append_message(room.id, HUMAN, body)
     return room.id
+
+
+def turn_thread(scheduler: Scheduler, agent_id: int) -> Thread:
+    threads = [
+        thread
+        for thread in scheduler._threads
+        if thread.name == f"fora-agent-{agent_id}"
+    ]
+    assert len(threads) == 1
+    return threads[0]
 
 
 def test_model_settings_update_does_not_wait_for_member_status(world) -> None:
@@ -594,8 +605,8 @@ def test_overflow_resets_and_automatically_continues_pending_mentions(
         pending_before = scheduler.pending_keys(MAIN)
         assert pending_before
         assert scheduler.tick() == (MAIN,)
-        scheduler._threads[MAIN].join(timeout=5)
-        assert not scheduler._threads[MAIN].is_alive()
+        turn_thread(scheduler, MAIN).join(timeout=5)
+        assert not turn_thread(scheduler, MAIN).is_alive()
         following = runner.requests[-1]
         assert following.sequence == failed_run.sequence + 1
         assert following.history_json == "[]"
@@ -654,8 +665,8 @@ def test_repeated_overflow_in_new_window_keeps_error_without_another_reset(
     reset = world.history.window(MAIN)
     assert reset.reason == "overflow"
     assert scheduler.tick() == (MAIN,)
-    scheduler._threads[MAIN].join(timeout=5)
-    assert not scheduler._threads[MAIN].is_alive()
+    turn_thread(scheduler, MAIN).join(timeout=5)
+    assert not turn_thread(scheduler, MAIN).is_alive()
     assert scheduler.agent_status(MAIN)["state"] == "error"
     assert world.history.lifecycle(MAIN).error == "too long"
     assert world.history.window(MAIN) == reset
@@ -781,8 +792,8 @@ def test_overflow_continuation_respects_scheduler_gates(world, gate) -> None:
         assert calls == 1
         scheduler.resume(MAIN)
     assert scheduler.tick() == (MAIN,)
-    scheduler._threads[MAIN].join(timeout=5)
-    assert not scheduler._threads[MAIN].is_alive()
+    turn_thread(scheduler, MAIN).join(timeout=5)
+    assert not turn_thread(scheduler, MAIN).is_alive()
     assert calls == 2
     assert world.history.runs(MAIN)[1].status == "failed"
     assert scheduler.tick() == ()
@@ -1133,8 +1144,8 @@ def test_sdk_overflow_restores_pending_and_persisted_diagnostics(
         phase = "recovery"
         pending = scheduler.pending_keys(MAIN)
         assert scheduler.tick() == (MAIN,)
-        scheduler._threads[MAIN].join(timeout=5)
-        assert not scheduler._threads[MAIN].is_alive()
+        turn_thread(scheduler, MAIN).join(timeout=5)
+        assert not turn_thread(scheduler, MAIN).is_alive()
         recovery = runner.requests[-1]
         assert recovery.sequence == failed.sequence + 1
         assert recovery.history_json == "[]"
@@ -2299,7 +2310,7 @@ def test_a_failed_turn_is_not_restarted_on_the_same_pending(world) -> None:
     scheduler = Scheduler(world, failing)
     try:
         assert scheduler.tick() == (MAIN,)
-        scheduler._threads[MAIN].join(timeout=5)
+        turn_thread(scheduler, MAIN).join(timeout=5)
         runs = world.history.runs(MAIN)
         assert [run.status for run in runs] == ["failed"]
         assert scheduler.agent_status(MAIN)["state"] == "error"
@@ -2574,17 +2585,17 @@ def test_concurrency_follows_the_current_parameter(world, fail) -> None:
 
         world.settings.set_settings("agent", {"max_concurrent_turns": 1})
         assert scheduler.tick() == ()
-        assert all(thread.is_alive() for thread in scheduler._threads.values())
+        assert all(thread.is_alive() for thread in scheduler._threads)
         release[MAIN].set()
-        scheduler._threads[MAIN].join(timeout=5)
-        assert not scheduler._threads[MAIN].is_alive()
+        turn_thread(scheduler, MAIN).join(timeout=5)
+        assert not turn_thread(scheduler, MAIN).is_alive()
         world.store.append_message(room.id, HUMAN, "@Main next")
         assert scheduler.runnable_agents() == (MAIN,)
         assert scheduler.tick() == ()
 
         release[HELPER].set()
-        scheduler._threads[HELPER].join(timeout=5)
-        assert not scheduler._threads[HELPER].is_alive()
+        turn_thread(scheduler, HELPER).join(timeout=5)
+        assert not turn_thread(scheduler, HELPER).is_alive()
         release[MAIN].clear()
         assert scheduler.tick() == (MAIN,)
     finally:
@@ -2598,7 +2609,7 @@ def test_stop_is_safe_while_a_turn_is_being_started(world) -> None:
 
     scheduler = Scheduler(world, RecordingRunner())
     never_started = threading.Thread(target=lambda: None)
-    scheduler._threads[MAIN] = never_started
+    scheduler._threads.add(never_started)
     scheduler.stop()
 
 
@@ -2704,7 +2715,7 @@ def test_invalid_parameters_prevent_scheduling(world, pending, method) -> None:
         with pytest.raises(DomainError, match="token_limit"):
             getattr(scheduler, method)()
     assert scheduler._loop is None
-    assert scheduler._threads == {}
+    assert scheduler._threads == set()
     assert runner.requests == []
     assert world.history.runs(MAIN) == ()
     assert world.store.get_member(MAIN).state == "idle"
@@ -2840,8 +2851,8 @@ def test_scheduler_failure_logs_and_finishes_inflight_turns(
         assert world.store.get_member(HELPER).state == "idle"
         assert world.history.runs(HELPER) == ()
         release.set()
-        scheduler._threads[MAIN].join(5)
-        assert not scheduler._threads[MAIN].is_alive()
+        turn_thread(scheduler, MAIN).join(5)
+        assert not turn_thread(scheduler, MAIN).is_alive()
         assert world.history.runs(MAIN)[0].status == "failed"
         assert world.history.pause_reason(MAIN) is None
         assert scheduler.agent_status(MAIN)["state"] == "blocked"
@@ -3319,8 +3330,8 @@ def test_preparation_model_failure_streak_resets_and_tick_reminds(
         assert sum(name == "window.reset" for name, _ in events) == 1
         state["phase"] = "recovery"
         assert scheduler.tick() == (MAIN,)
-        scheduler._threads[MAIN].join(timeout=5)
-        assert not scheduler._threads[MAIN].is_alive()
+        turn_thread(scheduler, MAIN).join(timeout=5)
+        assert not turn_thread(scheduler, MAIN).is_alive()
         recovered = runner.requests[-1]
         assert recovered.history_json == "[]" and recovered.reminder is not None
         assert {
@@ -3595,8 +3606,8 @@ def test_missing_usage_preserves_stage_and_actual_calls(
             assert not scheduler.preparation_due(MAIN)
             state["phase"] = "recovery"
             assert scheduler.tick() == (MAIN,)
-            scheduler._threads[MAIN].join(timeout=5)
-            assert not scheduler._threads[MAIN].is_alive()
+            turn_thread(scheduler, MAIN).join(timeout=5)
+            assert not turn_thread(scheduler, MAIN).is_alive()
             assert runner.requests[-1].reminder is not None
             assert runner.requests[-1].history_json == "[]"
             assert world.store.pending(MAIN) == pending

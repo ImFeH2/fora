@@ -6,6 +6,7 @@ import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
+from weakref import WeakValueDictionary
 
 from fora.core.errors import DomainError
 from fora.core.parameters import AgentParameters, agent_parameters
@@ -138,9 +139,13 @@ class Scheduler:
         self._deps = deps
         self._runner = runner
         self._authorizer = authorizer or Authorizer()
-        self._threads: dict[int, threading.Thread] = {}
+        self._threads: set[threading.Thread] = set()
+        self._starting_threads: set[threading.Thread] = set()
         self._lock = threading.RLock()
-        self._member_locks: dict[int, OrderedRLock] = {}
+        self._thread_condition = threading.Condition(self._lock)
+        self._member_locks: WeakValueDictionary[int, OrderedRLock] = (
+            WeakValueDictionary()
+        )
         self._active: dict[int, AgentRun] = {}
         self._reserved: set[int] = set()
         self._failures: dict[int, FailedFinalization] = {}
@@ -233,19 +238,39 @@ class Scheduler:
         self._loop = None
         if loop is not None and loop.ident is not None:
             loop.join(timeout=5)
-        with self._lock:
-            running = list(self._threads.values())
+        with self._thread_condition:
+            self._thread_condition.wait_for(lambda: not self._starting_threads)
+            running = tuple(self._threads)
         self._deps.execution.close()
         for thread in running:
             if thread.ident is None:
                 continue
             thread.join(timeout=5)
+        self._reap_threads()
+
+    def _reap_threads(self) -> None:
+        with self._lock:
+            self._threads.difference_update(
+                thread
+                for thread in tuple(self._threads)
+                if thread not in self._starting_threads
+                and thread.ident is not None
+                and not thread.is_alive()
+            )
 
     def member_lock(self, agent_id: int) -> OrderedRLock:
         with self._lock:
-            return self._member_locks.setdefault(
-                agent_id, OrderedRLock(LockLevel.MEMBER)
-            )
+            lock = self._member_locks.get(agent_id)
+            if lock is None:
+                lock = OrderedRLock(LockLevel.MEMBER)
+                self._member_locks[agent_id] = lock
+            return lock
+
+    def member_deleted(self, agent_id: int) -> None:
+        with self.member_lock(agent_id):
+            self._failures.pop(agent_id, None)
+            self._blocked.pop(agent_id, None)
+            self._pause_requested.discard(agent_id)
 
     def _require_agent(self, agent_id: int) -> None:
         member = self.store.get_member(agent_id)
@@ -548,6 +573,7 @@ class Scheduler:
             pause=self.pause,
             resume=self.resume,
             member_guard=self.member_lock,
+            member_deleted=self.member_deleted,
         )
 
     @property
@@ -938,6 +964,7 @@ class Scheduler:
         return TurnRecord(agent_id, run.sequence, status, error)
 
     def tick(self) -> tuple[int, ...]:
+        self._reap_threads()
         self.parameters()
         if self._scheduler_stopped is not None or self._stop.is_set():
             return ()
@@ -962,8 +989,18 @@ class Scheduler:
                     target=work, name=f"fora-agent-{agent_id}", daemon=True
                 )
                 with self._lock:
-                    self._threads[agent_id] = thread
-                thread.start()
+                    if self._stop.is_set():
+                        raise RuntimeError("Scheduler stopped before Thread startup")
+                    self._threads.add(thread)
+                    self._starting_threads.add(thread)
+                try:
+                    thread.start()
+                finally:
+                    with self._thread_condition:
+                        self._starting_threads.discard(thread)
+                        if thread.ident is None:
+                            self._threads.discard(thread)
+                        self._thread_condition.notify_all()
             except Exception as error:
                 self._execute(prepared, error)
                 raise
