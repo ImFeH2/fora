@@ -13,7 +13,6 @@ from fora.core.attachment import (
     ViewedImage,
     identifier,
 )
-from fora.core.context import advance_watermark, context_window
 from fora.core.discussion import Discussion, Message, validate_body, validate_topic
 from fora.core.errors import DomainError
 from fora.core.member import validate_name
@@ -26,6 +25,7 @@ from fora.services.library import Library
 from fora.services.uploads import Uploads
 from fora.services.workspace import Workspace
 from fora.tools.authorize import Actor, Authorizer
+from fora.tools.discussion_read import DiscussionReader, integer, read_position
 
 
 @dataclass
@@ -279,84 +279,49 @@ class AgentTools:
         *,
         before: int | None = None,
         after: int | None = None,
+        max_chars: int | None = None,
+        section: str = "messages",
+        cursor: str | None = None,
+        _result_size: Callable[[dict[str, Any]], int] | None = None,
     ) -> dict[str, Any]:
         self._check("discussion.read", discussion_id)
-        self._require_membership(discussion_id)
-        for name, value, minimum in (
-            ("before", before, 0),
-            ("after", after, 0),
-            ("limit", limit, 1),
-        ):
-            if value is not None and (type(value) is not int or value < minimum):
-                raise DomainError(
-                    "invalid_pagination", f"{name} must be an integer >= {minimum}"
-                )
-        if message_id is not None and (before is not None or after is not None):
-            raise DomainError(
-                "invalid_pagination",
-                "message_id cannot be combined with before or after",
-            )
-        store = self._deps.store
-        discussion = self._discussion(discussion_id)
-        read_before = store.watermark(discussion_id, self._actor.member_id)
-
-        if message_id is None:
-            selected = store.messages(
-                discussion_id,
-                before=before,
-                after=after,
-                limit=limit,
-                latest=after is None and limit is not None,
-            )
-        else:
-            everything = store.messages(discussion_id)
-            mentions = store.mentions_by_message(discussion_id)
-            try:
-                selected = context_window(
-                    everything,
-                    message_id,
-                    self._actor.member_id,
-                    mentions,
-                    read_before,
-                )
-            except ValueError as error:
-                raise DomainError(
-                    "not_found", f"Message {message_id} is not in this Discussion"
-                ) from error
-
-        if selected:
-            store.set_watermark(
-                discussion_id,
-                self._actor.member_id,
-                advance_watermark(
-                    store.watermark(discussion_id, self._actor.member_id), selected
-                ),
-            )
-
-        members = {
-            item.id: item.name for item in store.list_members(include_deleted=True)
-        }
-        awaiting = tuple(
-            item.message_id
-            for item in store.pending(self._actor.member_id)
-            if item.discussion_id == discussion_id
+        integer("discussion_id", discussion_id, 1)
+        effective_limit = integer("limit", 20 if limit is None else limit, 1, 100)
+        budget = integer(
+            "max_chars", 16000 if max_chars is None else max_chars, 2048, 64000
         )
-        return {
-            "id": discussion.id,
-            "topic": discussion.topic,
-            "read_through": read_before,
-            "awaiting_ack": list(awaiting),
-            "acknowledged": list(
-                store.acknowledged(discussion_id, self._actor.member_id)
-            ),
-            "members": [
-                {"id": item, "name": members.get(item, f"Member {item}")}
-                for item in sorted(discussion.member_ids)
-            ],
-            "total_messages": store.message_count(discussion_id),
-            "archived": discussion.archived,
-            "messages": [self._message(item) for item in selected],
-        }
+        store = self._deps.store
+        member_id = self._actor.member_id
+        with self._deps.reading():
+            summary = store.read_summary(discussion_id, member_id)
+            position = read_position(
+                summary, member_id, store, section, message_id, before, after, cursor
+            )
+            reader = DiscussionReader(
+                store,
+                summary,
+                member_id,
+                effective_limit,
+                budget,
+                (lambda attachment_id: self._uploads().files.path(attachment_id))
+                if self._actor.is_agent
+                else None,
+                _result_size,
+            )
+            result = (
+                reader.messages(position)
+                if section == "messages"
+                else reader.metadata(position)
+            )
+            reader.require_budget(result)
+            complete = [
+                item["id"]
+                for item in result.get("messages", [])
+                if item["body_complete"]
+            ]
+            through = max(complete) if complete else None
+        store.finish_read(discussion_id, member_id, through)
+        return result
 
     def _message(self, item: Message) -> dict[str, Any]:
         return {

@@ -247,13 +247,15 @@ class Api:
             )
 
         def discussion_read(params: dict[str, Any]) -> Any:
-            message_id = params.get("message_id")
             return self._human().read_discussion(
-                int(params["discussion_id"]),
-                int(message_id) if message_id is not None else None,
+                params["discussion_id"],
+                params.get("message_id"),
                 params.get("limit"),
                 before=params.get("before"),
                 after=params.get("after"),
+                max_chars=params.get("max_chars"),
+                section=params.get("section", "messages"),
+                cursor=params.get("cursor"),
             )
 
         def discussion_page(params: dict[str, Any]) -> Any:

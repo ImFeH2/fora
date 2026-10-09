@@ -475,7 +475,7 @@ def test_discussion_list_rejects_invalid_limits(world, limit) -> None:
         ({"after": 1, "before": 6, "limit": 2}, [2, 3]),
         ({"before": 1}, []),
         ({"after": 6}, []),
-        ({"message_id": 3, "limit": 1}, [1, 2, 3, 4, 5, 6]),
+        ({"message_id": 3, "limit": 1}, [3]),
     ],
 )
 def test_reading_pages_keeps_order_and_exclusive_boundaries(

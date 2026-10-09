@@ -16,7 +16,7 @@ from traceback import walk_tb
 from typing import Any, Literal, NotRequired, TypedDict, cast, get_type_hints
 
 import pydantic_ai
-from pydantic import TypeAdapter
+from pydantic import StrictInt, TypeAdapter
 from pydantic_ai import (
     Agent,
     BinaryContent,
@@ -789,8 +789,17 @@ class PydanticModelRunner:
             description=(
                 "Manage discussions and messages. List returns discussions ordered by last message time "
                 "newest first, empty discussions last; limit defaults to 20 and must be positive. "
-                "Read with message_id for full semantic context; "
-                "do not combine it with before/after. Pagination uses exclusive message ID bounds "
+                "Read defaults to 20 messages and 16000 characters for the complete result; "
+                "limit is 1..100 and max_chars is 2048..64000. message_id includes the target and bounded "
+                "semantic context; do not combine it with before/after. Follow the complete parameter "
+                "objects in continuations for remaining context or body segments. cursor cannot be "
+                "combined with message_id/before/after. section selects messages, members, awaiting_ack, "
+                "acknowledged, mentions or attachments; the last two initially require message_id. "
+                "Metadata sections never mark read. Partial bodies mark read only on the last segment. "
+                "Ack lists on message pages cover returned_messages only; whole-discussion counts and "
+                "metadata continuations are provided. Each array has total/complete information: "
+                "an incomplete mentions or attachments array must be continued before concluding it is empty. "
+                "Pagination uses exclusive message ID bounds "
                 "and a positive limit: nearest messages after the lower bound, or before the upper "
                 "bound, returned oldest first. Without bounds, limit selects the latest messages. "
                 "Archive is reversible and is the only way to put a Discussion away. "
@@ -812,18 +821,28 @@ class PydanticModelRunner:
                 "archive",
                 "unarchive",
             ],
-            discussion_id: int | None = None,
-            message_id: int | None = None,
+            discussion_id: StrictInt | None = None,
+            message_id: StrictInt | None = None,
             message_ids: list[int] | None = None,
             topic: str | None = None,
             member_ids: list[int] | None = None,
             body: str | None = None,
             query: str | None = None,
             include_archived: bool = False,
-            before: int | None = None,
-            after: int | None = None,
-            limit: int | None = None,
+            before: StrictInt | None = None,
+            after: StrictInt | None = None,
+            limit: StrictInt | None = None,
             sender_id: int | None = None,
+            max_chars: StrictInt | None = None,
+            section: Literal[
+                "messages",
+                "members",
+                "awaiting_ack",
+                "acknowledged",
+                "mentions",
+                "attachments",
+            ] = "messages",
+            cursor: str | None = None,
         ) -> Any:
             tools = ctx.deps
             if action == "create":
@@ -847,6 +866,12 @@ class PydanticModelRunner:
                         limit,
                         before=before,
                         after=after,
+                        max_chars=max_chars,
+                        section=section,
+                        cursor=cursor,
+                        _result_size=lambda result: len(
+                            ToolReturnPart("discussion", result).model_response_str()
+                        ),
                     )
                 )
             if action == "send":

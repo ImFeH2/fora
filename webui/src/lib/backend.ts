@@ -115,6 +115,98 @@ export type DiscussionDetail = {
   messages: Message[];
 };
 
+export type ReadSection =
+  | "messages"
+  | "members"
+  | "awaiting_ack"
+  | "acknowledged"
+  | "mentions"
+  | "attachments";
+
+export type DiscussionReadRequest = {
+  action?: "read";
+  discussion_id?: number;
+  message_id?: number | null;
+  before?: number | null;
+  after?: number | null;
+  limit?: number | null;
+  max_chars?: number | null;
+  section?: ReadSection;
+  cursor?: string | null;
+};
+
+export type ArrayReadInfo = {
+  total: number;
+  complete: boolean;
+  realtime?: boolean;
+  continuation: DiscussionReadRequest | null;
+};
+
+export type ReadMessage = Message & {
+  body_offset: number;
+  body_end: number;
+  body_length: number;
+  body_complete: boolean;
+  mention_position_scope: "complete_body";
+  mentions_info: ArrayReadInfo;
+  attachments_info: ArrayReadInfo;
+};
+
+export type DiscussionReadBase = {
+  id: number;
+  topic: string;
+  archived: boolean;
+  read_through: number;
+  total_messages: number;
+  continuations: DiscussionReadRequest[];
+};
+
+export type DiscussionReadMessages = DiscussionReadBase & {
+  section: "messages";
+  messages: ReadMessage[];
+  members: { id: number; name: string }[];
+  members_info: ArrayReadInfo;
+  awaiting_ack: number[];
+  acknowledged: number[];
+  awaiting_ack_count: number;
+  acknowledged_count: number;
+  awaiting_ack_info: ArrayReadInfo;
+  acknowledged_info: ArrayReadInfo;
+  ack_scope: "returned_messages";
+  direction: "before" | "after";
+  snapshot_max_id: number;
+  context_target: number | null;
+};
+
+export type DiscussionReadMetadata = DiscussionReadBase & {
+  total: number;
+  offset: number;
+  complete: boolean;
+  realtime: boolean;
+} & (
+    | { section: "members"; members: { id: number; name: string }[] }
+    | { section: "awaiting_ack"; awaiting_ack: number[] }
+    | { section: "acknowledged"; acknowledged: number[] }
+    | {
+        section: "mentions";
+        mentions: MessageMention[];
+        message_id: number;
+        sender_id: number;
+        sender_name: string;
+      }
+    | {
+        section: "attachments";
+        attachments: Attachment[];
+        message_id: number;
+        sender_id: number;
+        sender_name: string;
+      }
+  );
+
+export type DiscussionReadResult =
+  | DiscussionReadMessages
+  | DiscussionReadMetadata;
+
 export type DiscussionPage = {
   id: number;
   messages: Message[];
@@ -954,10 +1046,16 @@ export class Backend {
     });
   }
 
-  readDiscussion(discussion_id: number, message_id?: number) {
-    return this.call<DiscussionDetail>("discussion.read", {
+  readDiscussion(
+    discussion_id: number,
+    request: number | DiscussionReadRequest = {},
+  ) {
+    const params =
+      typeof request === "number" ? { message_id: request } : request;
+    const { action: _action, discussion_id: _discussionId, ...page } = params;
+    return this.call<DiscussionReadResult>("discussion.read", {
+      ...page,
       discussion_id,
-      message_id,
     });
   }
 

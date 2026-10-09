@@ -6,6 +6,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
+from dataclasses import asdict
 from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
@@ -25,7 +26,7 @@ from fora.core.errors import DomainError
 from fora.core.member import AgentState, Member, MemberType, name_key
 from fora.core.mention import Mention, build_mentions
 from fora.locking import LockLevel, OrderedRLock
-from fora.ports.store import DiscussionPage, PendingAcknowledgement
+from fora.ports.store import DiscussionPage, PendingAcknowledgement, ReadSummary
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS members (
@@ -1202,6 +1203,209 @@ class SqliteStore:
             if mark_read:
                 self._advance_read(discussion_id, sender_id, message_id)
             return message, mentions, True
+
+    def _read_access(self, discussion_id: int, member_id: int) -> sqlite3.Row:
+        row = first(
+            self._db.execute(
+                "SELECT d.*, EXISTS (SELECT 1 FROM discussion_members dm"
+                " JOIN members m ON m.id = dm.member_id WHERE dm.discussion_id = d.id"
+                " AND dm.member_id = ? AND m.deleted = 0) AS allowed"
+                " FROM discussions d WHERE d.id = ?",
+                (member_id, discussion_id),
+            )
+        )
+        if row is None:
+            raise DomainError("not_found", "Discussion does not exist")
+        if not row["allowed"]:
+            raise DomainError("not_a_member", "You do not belong to this Discussion")
+        return row
+
+    @reading
+    def read_summary(self, discussion_id: int, member_id: int) -> ReadSummary:
+        row = self._read_access(discussion_id, member_id)
+        counts = self._db.execute(
+            "SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS latest"
+            " FROM messages WHERE discussion_id = ?",
+            (discussion_id,),
+        )[0]
+        pending, _ = self._pending_summary(discussion_id, member_id, counts["latest"])
+        acked = self._db.execute(
+            "SELECT COUNT(*) AS n FROM acks WHERE discussion_id = ? AND member_id = ?",
+            (discussion_id, member_id),
+        )[0]["n"]
+        members = self._db.execute(
+            "SELECT COUNT(*) AS n FROM discussion_members WHERE discussion_id = ?",
+            (discussion_id,),
+        )[0]["n"]
+        return ReadSummary(
+            discussion_id,
+            str(row["topic"]),
+            bool(row["archived"]),
+            self.watermark(discussion_id, member_id),
+            int(counts["latest"]),
+            int(counts["n"]),
+            int(members),
+            pending,
+            int(acked),
+        )
+
+    @reading
+    def read_context_bounds(
+        self, discussion_id: int, message_id: int, member_id: int, watermark: int
+    ) -> tuple[int, int]:
+        self._require_message(discussion_id, message_id)
+        low = self._db.execute(
+            "SELECT COALESCE(MAX(m.id), 0) AS id FROM messages m"
+            " WHERE m.discussion_id = ? AND m.id < ? AND m.id > ?"
+            " AND EXISTS (SELECT 1 FROM mentions n WHERE n.discussion_id = m.discussion_id"
+            " AND n.message_id = m.id) AND NOT EXISTS (SELECT 1 FROM mentions n"
+            " WHERE n.discussion_id = m.discussion_id AND n.message_id = m.id AND n.member_id = ?)",
+            (discussion_id, message_id, watermark, member_id),
+        )[0]["id"]
+        next_sender = first(
+            self._db.execute(
+                "SELECT id FROM messages WHERE discussion_id = ? AND id > ? AND sender_id !="
+                " (SELECT sender_id FROM messages WHERE discussion_id = ? AND id = ?)"
+                " ORDER BY id LIMIT 1",
+                (discussion_id, message_id, discussion_id, message_id),
+            )
+        )
+        high = self._db.execute(
+            "SELECT COALESCE(MAX(id), 0) AS id FROM messages WHERE discussion_id = ?"
+            " AND (? IS NULL OR id < ?)",
+            (
+                discussion_id,
+                next_sender["id"] if next_sender else None,
+                next_sender["id"] if next_sender else None,
+            ),
+        )[0]["id"]
+        return int(low) + 1, int(high)
+
+    @reading
+    def read_message_ids(
+        self, discussion_id: int, low: int, high: int, *, limit: int, reverse: bool
+    ) -> tuple[int, ...]:
+        order = "DESC" if reverse else "ASC"
+        return tuple(
+            int(row["id"])
+            for row in self._db.execute(
+                "SELECT id FROM messages WHERE discussion_id = ? AND id BETWEEN ? AND ?"
+                f" ORDER BY id {order} LIMIT ?",
+                (discussion_id, low, high, limit),
+            )
+        )
+
+    @reading
+    def read_message(self, discussion_id: int, message_id: int) -> Message:
+        row = first(
+            self._db.execute(
+                "SELECT * FROM messages WHERE discussion_id = ? AND id = ?",
+                (discussion_id, message_id),
+            )
+        )
+        if row is None:
+            raise DomainError("not_found", "Message is not in this Discussion")
+        return Message(
+            discussion_id,
+            int(row["id"]),
+            int(row["sender_id"]),
+            str(row["sender_name"]),
+            str(row["body"]),
+            str(row["created_at"]),
+        )
+
+    @reading
+    def read_metadata(
+        self,
+        discussion_id: int,
+        member_id: int,
+        section: str,
+        *,
+        message_id: int | None = None,
+        offset: int = 0,
+        limit: int,
+    ) -> tuple[int, tuple[object, ...]]:
+        params: list[object] = [discussion_id]
+        if section == "members":
+            source = "members m JOIN discussion_members dm ON dm.member_id = m.id WHERE dm.discussion_id = ?"
+            fields, order = "m.id, m.name", "m.id"
+        elif section == "awaiting_ack":
+            source = (
+                "mentions n JOIN discussions d ON d.id = n.discussion_id"
+                " JOIN discussion_members dm ON dm.discussion_id = n.discussion_id AND dm.member_id = n.member_id"
+                " WHERE n.discussion_id = ? AND n.member_id = ? AND d.archived = 0"
+                " AND NOT EXISTS (SELECT 1 FROM acks a WHERE a.discussion_id = n.discussion_id"
+                " AND a.message_id = n.message_id AND a.member_id = n.member_id)"
+            )
+            params.append(member_id)
+            fields, order = "n.message_id", "n.message_id"
+        elif section == "acknowledged":
+            source = "acks WHERE discussion_id = ? AND member_id = ?"
+            params.append(member_id)
+            fields, order = "message_id", "message_id"
+        elif section == "mentions":
+            self._require_message(discussion_id, cast(int, message_id))
+            source = "mentions WHERE discussion_id = ? AND message_id = ?"
+            params.append(message_id)
+            fields, order = "member_id, position, length", "position, member_id"
+        elif section == "attachments":
+            self._require_message(discussion_id, cast(int, message_id))
+            source = "uploads u JOIN message_attachments a ON a.attachment_id = u.id WHERE a.discussion_id = ? AND a.message_id = ?"
+            params.append(message_id)
+            fields, order = "u.*", "a.ordinal"
+        else:
+            raise DomainError("invalid_pagination", "Unknown metadata section")
+        total = int(
+            self._db.execute(f"SELECT COUNT(*) AS n FROM {source}", params)[0]["n"]
+        )
+        rows = self._db.execute(
+            f"SELECT {fields} FROM {source} ORDER BY {order} LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        )
+        if section == "attachments":
+            items: tuple[object, ...] = tuple(
+                asdict(self._attachment(row)) for row in rows
+            )
+        elif section in ("awaiting_ack", "acknowledged"):
+            items = tuple(int(row["message_id"]) for row in rows)
+        else:
+            items = tuple(dict(row) for row in rows)
+        return total, items
+
+    @reading
+    def read_ack_flags(
+        self, discussion_id: int, member_id: int, message_ids: Sequence[int]
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        if not message_ids:
+            return (), ()
+        slots = ",".join("?" for _ in message_ids)
+        rows = self._db.execute(
+            "SELECT m.id, a.message_id AS acked, n.message_id AS mentioned, d.archived"
+            " FROM messages m JOIN discussions d ON d.id = m.discussion_id"
+            " LEFT JOIN acks a ON a.discussion_id = m.discussion_id AND a.message_id = m.id AND a.member_id = ?"
+            " LEFT JOIN mentions n ON n.discussion_id = m.discussion_id AND n.message_id = m.id AND n.member_id = ?"
+            f" WHERE m.discussion_id = ? AND m.id IN ({slots}) ORDER BY m.id",
+            [member_id, member_id, discussion_id, *message_ids],
+        )
+        return (
+            tuple(
+                int(row["id"])
+                for row in rows
+                if row["acked"] is None
+                and row["mentioned"] is not None
+                and not row["archived"]
+            ),
+            tuple(int(row["id"]) for row in rows if row["acked"] is not None),
+        )
+
+    def finish_read(
+        self, discussion_id: int, member_id: int, message_id: int | None
+    ) -> None:
+        with self._write():
+            self._read_access(discussion_id, member_id)
+            if message_id is not None:
+                self._require_message(discussion_id, message_id)
+                self._advance_read(discussion_id, member_id, message_id)
 
     @reading
     def messages(

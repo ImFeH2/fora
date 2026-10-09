@@ -32,7 +32,51 @@ class PendingAcknowledgement:
     pending_count: int
 
 
+@dataclass(frozen=True)
+class ReadSummary:
+    id: int
+    topic: str
+    archived: bool
+    read_through: int
+    latest_id: int
+    total_messages: int
+    members_count: int
+    awaiting_ack_count: int
+    acknowledged_count: int
+
+
 class OrganizationStore(Protocol):
+    def read_summary(self, discussion_id: int, member_id: int) -> ReadSummary: ...
+
+    def read_context_bounds(
+        self, discussion_id: int, message_id: int, member_id: int, watermark: int
+    ) -> tuple[int, int]: ...
+
+    def read_message_ids(
+        self, discussion_id: int, low: int, high: int, *, limit: int, reverse: bool
+    ) -> tuple[int, ...]: ...
+
+    def read_message(self, discussion_id: int, message_id: int) -> Message: ...
+
+    def read_metadata(
+        self,
+        discussion_id: int,
+        member_id: int,
+        section: str,
+        *,
+        message_id: int | None = None,
+        offset: int = 0,
+        limit: int,
+    ) -> tuple[int, tuple[object, ...]]: ...
+
+    def read_ack_flags(
+        self, discussion_id: int, member_id: int, message_ids: Sequence[int]
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]: ...
+
+    def finish_read(
+        self, discussion_id: int, member_id: int, message_id: int | None
+    ) -> None: ...
+
     def organization_uuid(self) -> str: ...
 
     def submit_message(

@@ -376,7 +376,7 @@ def test_model_can_manage_discussions_and_page_messages(world, monkeypatch) -> N
     assert [item["id"] for item in returned[3]] == [2]
     assert returned[4]["member_ids"] == [HUMAN, MAIN]
     assert returned[5]["archived"] is True
-    assert [item["id"] for item in returned[6]["messages"]] == [1, 2, 3]
+    assert [item["id"] for item in returned[6]["messages"]] == [2]
     assert returned[7]["archived"] is False
     assert len(returned) == 8
     assert world.store.get_discussion(room) is not None

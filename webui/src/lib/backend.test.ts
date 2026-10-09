@@ -4,7 +4,7 @@ import {
   BackendError,
   type Connection,
   connectionFrom,
-  type DiscussionDetail,
+  type DiscussionReadMessages,
   type FoundMessage,
   type Frame,
   resolveConnection,
@@ -658,9 +658,20 @@ describe("Backend", () => {
       method: "discussion.read",
       params: { discussion_id: 1 },
     });
-    const result: DiscussionDetail = {
+    const result: DiscussionReadMessages = {
       id: 1,
       topic: "Release",
+      section: "messages",
+      continuations: [],
+      direction: "before",
+      snapshot_max_id: 4,
+      context_target: null,
+      ack_scope: "returned_messages",
+      awaiting_ack_count: 0,
+      acknowledged_count: 0,
+      awaiting_ack_info: { total: 0, complete: true, continuation: null },
+      acknowledged_info: { total: 0, complete: true, continuation: null },
+      members_info: { total: 0, complete: true, continuation: null },
       members: [],
       total_messages: 1,
       archived: false,
@@ -673,6 +684,13 @@ describe("Backend", () => {
           sender_id: 1,
           sender_name: "You",
           body: "hi @Main",
+          body_offset: 0,
+          body_end: 8,
+          body_length: 8,
+          body_complete: true,
+          mention_position_scope: "complete_body",
+          mentions_info: { total: 1, complete: true, continuation: null },
+          attachments_info: { total: 0, complete: true, continuation: null },
           created_at: "2026-01-01T00:00:00Z",
           mentions: [{ member_id: 2, position: 3, length: 5 }],
           attachments: [],
@@ -681,6 +699,63 @@ describe("Backend", () => {
     };
     socket.reply({ type: "response", id: socket.sent[0].id, result });
     await expect(promise).resolves.toEqual(result);
+  });
+
+  it("forwards bounded read and complete continuation parameters", async () => {
+    const { backend, connected } = harness();
+    const socket = await connected();
+    const promise = backend.readDiscussion(1, {
+      action: "read",
+      discussion_id: 1,
+      section: "mentions",
+      cursor: "encoded-position",
+      limit: 7,
+      max_chars: 4096,
+    });
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1));
+    expect(socket.sent[0]).toMatchObject({
+      method: "discussion.read",
+      params: {
+        discussion_id: 1,
+        section: "mentions",
+        cursor: "encoded-position",
+        limit: 7,
+        max_chars: 4096,
+      },
+    });
+    expect(socket.sent[0].params).not.toHaveProperty("action");
+    const result = {
+      id: 1,
+      topic: "Read",
+      archived: false,
+      section: "mentions",
+      read_through: 0,
+      total_messages: 1,
+      message_id: 1,
+      sender_id: 1,
+      sender_name: "You",
+      total: 1,
+      offset: 0,
+      complete: true,
+      realtime: false,
+      mentions: [{ member_id: 2, position: 5, length: 5 }],
+      continuations: [],
+    };
+    socket.reply({ type: "response", id: socket.sent[0].id, result });
+    await expect(promise).resolves.toEqual(result);
+  });
+
+  it("keeps the numeric message selection in readDiscussion", async () => {
+    const { backend, connected } = harness();
+    const socket = await connected();
+    const promise = backend.readDiscussion(1, 7);
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1));
+    expect(socket.sent[0]).toMatchObject({
+      method: "discussion.read",
+      params: { discussion_id: 1, message_id: 7 },
+    });
+    socket.reply({ type: "response", id: socket.sent[0].id, result: {} });
+    await promise;
   });
 
   it("keeps archiving and Agent deletion but exposes no Discussion deletion", async () => {

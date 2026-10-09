@@ -369,7 +369,7 @@ def test_discussion_management_and_pagination_survive_the_pipe(tmp_path: Path) -
     assert response(frames, 2)["result"]["messages"][0]["mentions"] == expected_mentions
     assert response(frames, 2)["result"]["messages"][1]["mentions"] == []
     assert [item["id"] for item in response(frames, 7)["result"]] == [2]
-    assert [item["id"] for item in response(frames, 8)["result"]["messages"]] == [1, 2]
+    assert [item["id"] for item in response(frames, 8)["result"]["messages"]] == [2]
     assert response(frames, 9)["result"]["member_ids"] == [1, 3]
     assert response(frames, 10)["result"]["archived"] is False
     assert [item["discussion_id"] for item in response(frames, 11)["result"]] == [1]
@@ -382,10 +382,23 @@ def test_discussion_management_and_pagination_survive_the_pipe(tmp_path: Path) -
             {"id": 2, "method": "discussion.delete", "params": {"discussion_id": 1}},
             {"id": 3, "method": "discussion.read", "params": {"discussion_id": 1}},
             {"id": 4, "method": "discussion.search", "params": {"query": "needle"}},
+            {
+                "id": 5,
+                "method": "discussion.read",
+                "params": {"discussion_id": 1, "section": "members"},
+            },
         ],
     )
     assert code == 0, stderr
-    assert [item["id"] for item in response(frames, 1)["result"]["members"]] == [1, 3]
+    assert [item["id"] for item in response(frames, 1)["result"]["members"]] == [1]
+    assert response(frames, 1)["result"]["members_info"]["total"] == 2
+    assert response(frames, 1)["result"]["members_info"]["complete"] is False
+    assert (
+        response(frames, 1)["result"]["members_info"]["continuation"]["section"]
+        == "members"
+    )
+    assert [item["id"] for item in response(frames, 5)["result"]["members"]] == [1, 3]
+    assert response(frames, 5)["result"]["complete"] is True
     assert len(response(frames, 1)["result"]["messages"]) == 4
     assert response(frames, 2)["error"]["code"] == "unknown_method"
     assert (
