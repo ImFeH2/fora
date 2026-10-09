@@ -31,6 +31,7 @@ def command_tree(directory: Path, *, detached: bool = False) -> list[str]:
     child = (
         "import os,time; from pathlib import Path; "
         f"Path({str(directory / 'pid')!r}).write_text(str(os.getpid())); "
+        f"Path({str(directory / 'ready')!r}).touch(); "
         "time.sleep(3); "
         f"Path({str(directory / 'late')!r}).write_text('late'); time.sleep(30)"
     )
@@ -47,9 +48,69 @@ def command_tree(directory: Path, *, detached: bool = False) -> list[str]:
 
 
 @pytest.mark.parametrize("enforce", [False, True])
-def test_timeout_terminates_descendants_after_parent_exit(tmp_path, enforce):
+def test_timeout_terminates_descendants_after_parent_exit(
+    tmp_path, monkeypatch, enforce
+):
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.IsProcessInJob.argtypes = [
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    kernel.IsProcessInJob.restype = wintypes.BOOL
+    kernel.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        *[ctypes.POINTER(wintypes.FILETIME)] * 4,
+    ]
+    kernel.GetProcessTimes.restype = wintypes.BOOL
+
+    def require(value):
+        if not value:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def creation_time():
+        values = [wintypes.FILETIME() for _ in range(4)]
+        require(
+            kernel.GetProcessTimes(handle, *(ctypes.byref(value) for value in values))
+        )
+        return values[0].dwHighDateTime, values[0].dwLowDateTime
+
     environment = LocalExecution([str(tmp_path)], enforce=enforce)
-    started = time.monotonic()
+    backend = environment._backend
+    original = backend.communicate
+    handle = None
+    identity = None
+    observed = None
+    started = None
+
+    def communicate(process, data, timeout):
+        nonlocal handle, identity, observed, started
+        wait_for(tmp_path / "ready")
+        pid = int((tmp_path / "pid").read_text())
+        handle = kernel.OpenProcess(0x100000 | 0x1000, False, pid)
+        require(handle)
+        identity = creation_time()
+        observed = backend._results[process]
+        belongs = wintypes.BOOL()
+        require(
+            kernel.IsProcessInJob(handle, observed.job.handle, ctypes.byref(belongs))
+        )
+        assert belongs.value
+        assert kernel.WaitForSingleObject(handle, 0) == 258
+        assert process.wait(timeout=5) == 0
+        started = time.monotonic()
+        return original(process, data, timeout)
+
+    monkeypatch.setattr(backend, "communicate", communicate)
     try:
         with pytest.raises(DomainError) as error:
             result = environment.run(
@@ -57,13 +118,32 @@ def test_timeout_terminates_descendants_after_parent_exit(tmp_path, enforce):
             )
             pytest.fail(repr(result))
         assert error.value.code == "timeout"
-        assert time.monotonic() - started < 3
-        assert not psutil.pid_exists(int((tmp_path / "pid").read_text()))
+        assert started is not None and time.monotonic() - started < 3
+        assert observed.execution_stopped and observed.active_processes == 0
+        assert observed.released and observed.io_done.is_set()
+        assert observed.job.handle is None and observed.executor is None
+        assert observed.process._handle.closed
+        assert all(
+            stream is None or stream.closed
+            for stream in (
+                observed.process.stdin,
+                observed.process.stdout,
+                observed.process.stderr,
+            )
+        )
+        assert not backend._jobs and not backend._records and not backend._pending
+        assert not backend._results
+        assert kernel.WaitForSingleObject(handle, 5000) == 0
+        assert creation_time() == identity
         time.sleep(2.2)
         assert not (tmp_path / "late").exists()
-        assert environment._backend._jobs == {}
     finally:
-        environment.close()
+        try:
+            environment.close()
+            assert not backend._windows
+        finally:
+            if handle is not None:
+                require(kernel.CloseHandle(handle))
 
 
 @pytest.mark.parametrize("enforce", [False, True])

@@ -1,7 +1,9 @@
 import asyncio
+import errno
 import json
 import secrets
 import socket
+import sys
 import threading
 import time
 from contextlib import ExitStack
@@ -294,14 +296,29 @@ def test_control_response_delivery_and_identifier_lifetime(scenario):
         assert state["sending"].cancelled()
     assert server._socket.fileno() == -1
     deadline = time.monotonic() + 10
-    while any(
-        item.status == psutil.CONN_LISTEN and item.laddr.port == server.port
-        for item in psutil.net_connections(kind="tcp")
-    ):
-        assert time.monotonic() < deadline
-        time.sleep(0.01)
-    with socket.socket() as probe:
-        assert probe.connect_ex(("127.0.0.1", server.port)) != 0
+    refused = errno.WSAECONNREFUSED if sys.platform == "win32" else errno.ECONNREFUSED
+    listening = None
+    error_code = None
+    port_closed = False
+    while time.monotonic() < deadline:
+        listening = any(
+            item.status == psutil.CONN_LISTEN and item.laddr.port == server.port
+            for item in psutil.Process().net_connections(kind="tcp")
+        )
+        with socket.socket() as probe:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            probe.settimeout(remaining)
+            error_code = probe.connect_ex(("127.0.0.1", server.port))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if not listening and error_code == refused:
+            port_closed = True
+            break
+        time.sleep(min(0.01, remaining))
+    assert port_closed, f"LISTEN={listening}, connect_ex={error_code}"
     if queued or duplicate or scenario == "write_failure":
         assert state["releases"] == 0
         assert business == [1]

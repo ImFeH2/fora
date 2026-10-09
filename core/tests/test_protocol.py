@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import json
+import socket
 import sqlite3
 import sys
 import threading
@@ -18,7 +19,7 @@ from typing import Any, Self, cast
 
 import psutil
 import pytest
-from aiohttp import ClientSession, WSMsgType, WSServerHandshakeError
+from aiohttp import ClientSession, TCPConnector, WSMsgType, WSServerHandshakeError
 from pydantic_ai import BinaryContent, ModelMessagesTypeAdapter
 from pydantic_ai.messages import (
     ModelRequest,
@@ -2653,6 +2654,12 @@ def test_control_slow_connection_keeps_positions_and_other_connections_run(
         outboxes.append(value)
         return value
 
+    def socket_factory(address):
+        family, kind, protocol, _, _ = address
+        connection = socket.socket(family, kind, protocol)
+        connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
+        return connection
+
     monkeypatch.setattr(module, "ControlOutbox", outbox)
     dispatcher.register(
         "large",
@@ -2664,47 +2671,128 @@ def test_control_slow_connection_keeps_positions_and_other_connections_run(
 
     async def exercise():
         address = f"http://127.0.0.1:{web.port}/ws?token=test-token"
+        connector = TCPConnector(socket_factory=socket_factory)
         async with (
-            ClientSession() as session,
+            ClientSession(connector=connector) as session,
             session.ws_connect(address, max_msg_size=0) as slow,
             session.ws_connect(address) as normal,
         ):
             transport = slow._response.connection.transport
+            peer = transport.get_extra_info("sockname")
+            last_state = None
+
+            async def inspect(*, configure=False):
+                sender = next(
+                    value
+                    for value in web._control_transports.values()
+                    if value.get_extra_info("peername") == peer
+                )
+                if configure:
+                    sender.get_extra_info("socket").setsockopt(
+                        socket.SOL_SOCKET,
+                        socket.SO_SNDBUF,
+                        0 if sys.platform == "win32" else 256 * 1024,
+                    )
+                outbox = outboxes[0]
+                with outbox.lock:
+                    return {
+                        "requests": {
+                            record.identifier: {
+                                "business": record.business.is_set(),
+                                "thread_started": record.thread is not None,
+                                "thread_done": record.thread is not None
+                                and record.thread.done(),
+                                "task_pending": record.task is not None
+                                and not record.task.done(),
+                            }
+                            for record in web._requests
+                            if record.identifier is not None and record.identifier < 17
+                        },
+                        "responses": len(outbox.responses),
+                        "responses_pending": all(
+                            not value.done() for value in outbox.responses
+                        ),
+                        "queued": len(outbox.items),
+                        "producers": outbox.producers,
+                        "buffer": sender.get_write_buffer_size(),
+                    }
+
+            async def read_state(*, configure=False):
+                nonlocal last_state
+                last_state = await asyncio.wrap_future(
+                    asyncio.run_coroutine_threadsafe(
+                        inspect(configure=configure), web._loop
+                    )
+                )
+                return last_state
+
+            await read_state(configure=True)
             transport.pause_reading()
             try:
                 sizes = [32 * 1024 * 1024] * 2 + [65536] * 15
-                for number, size in enumerate(sizes):
-                    await slow.send_json(
-                        {"id": number, "method": "large", "params": {"size": size}}
-                    )
-                async with asyncio.timeout(10):
-                    while True:
-                        records = [
-                            record
-                            for record in web._requests
-                            if record.identifier is not None and record.identifier < 17
-                        ]
-                        if (
-                            len(records) == 17
-                            and sum(
-                                record.thread is not None and record.thread.done()
-                                for record in records
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 10
+                stage = "first_response"
+
+                try:
+                    async with asyncio.timeout_at(deadline):
+                        await slow.send_json(
+                            {"id": 0, "method": "large", "params": {"size": sizes[0]}}
+                        )
+                        while True:
+                            state = await read_state()
+                            first = state["requests"].get(0)
+                            if (
+                                first is not None
+                                and first["business"]
+                                and first["task_pending"]
+                                and state["responses"] == 1
+                                and state["responses_pending"]
+                                and state["buffer"] > 0
+                            ):
+                                break
+                            await asyncio.sleep(0.001)
+                        stage = "execution_positions"
+                        for number, size in enumerate(sizes[1:], 1):
+                            await slow.send_json(
+                                {
+                                    "id": number,
+                                    "method": "large",
+                                    "params": {"size": size},
+                                }
                             )
-                            == 16
-                        ):
-                            break
-                        await asyncio.sleep(0.001)
-                assert len(outboxes[0].responses) == 16
-                assert (
-                    next(record for record in records if record.identifier == 16).thread
-                    is None
-                )
+                        while True:
+                            state = await read_state()
+                            records = state["requests"]
+                            if (
+                                len(records) == 17
+                                and sum(
+                                    value["thread_done"] for value in records.values()
+                                )
+                                == 16
+                                and all(
+                                    records[number]["business"]
+                                    and records[number]["task_pending"]
+                                    for number in range(16)
+                                )
+                                and state["responses"] == 16
+                                and state["responses_pending"]
+                                and not records[16]["thread_started"]
+                            ):
+                                break
+                            await asyncio.sleep(0.001)
+                except TimeoutError as error:
+                    error.add_note(f"stage={stage}, state={last_state}")
+                    raise
+                assert state["responses"] == 16
+                assert not records[16]["thread_started"]
                 for number, method in [(100, "ping"), (101, "discussion.list")]:
                     await normal.send_json({"id": number, "method": method})
                     async with asyncio.timeout(3):
                         frame = await normal.receive_json()
                     assert frame["id"] == number and "result" in frame
-                assert len(outboxes[0].responses) == 16
+                state = await read_state()
+                assert state["responses"] == 16
                 transport.resume_reading()
                 responses = {}
                 async with asyncio.timeout(15):
@@ -2943,14 +3031,62 @@ def test_control_disconnect_during_socket_send_preserves_committed_message(
 
     monkeypatch.setitem(dispatcher._handlers, "discussion.send", send)
     monkeypatch.setattr(module, "ControlOutbox", outbox)
+
+    def socket_factory(address):
+        family, kind, protocol, _, _ = address
+        connection = socket.socket(family, kind, protocol)
+        connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
+        return connection
+
     web = WebServer(dispatcher, "test-token", None)
     web.start()
 
     async def exercise():
         address = f"http://127.0.0.1:{web.port}/ws?token=test-token"
-        async with ClientSession() as session:
+        connector = TCPConnector(socket_factory=socket_factory)
+        async with ClientSession(connector=connector) as session:
             async with session.ws_connect(address, max_msg_size=0) as connection:
                 transport = connection._response.connection.transport
+                peer = transport.get_extra_info("sockname")
+
+                async def sending(*, configure=False):
+                    sender = next(
+                        value
+                        for value in web._control_transports.values()
+                        if value.get_extra_info("peername") == peer
+                    )
+                    if configure:
+                        sender.get_extra_info("socket").setsockopt(
+                            socket.SOL_SOCKET,
+                            socket.SO_SNDBUF,
+                            0 if sys.platform == "win32" else 256 * 1024,
+                        )
+                        return False
+                    record = next(
+                        (item for item in web._requests if item.identifier == 1), None
+                    )
+                    outbox = outboxes[0]
+                    with outbox.lock:
+                        return (
+                            record is not None
+                            and record.business.is_set()
+                            and record.task is not None
+                            and not record.task.done()
+                            and len(outbox.responses) == 1
+                            and not next(iter(outbox.responses)).done()
+                            and not outbox.items
+                            and outbox.producers == 0
+                            and sender.get_write_buffer_size() > 0
+                        )
+
+                async def pending(*, configure=False):
+                    return await asyncio.wrap_future(
+                        asyncio.run_coroutine_threadsafe(
+                            sending(configure=configure), web._loop
+                        )
+                    )
+
+                await pending(configure=True)
                 transport.pause_reading()
                 try:
                     await connection.send_json(
@@ -2965,33 +3101,22 @@ def test_control_disconnect_during_socket_send_preserves_committed_message(
                         }
                     )
                     async with asyncio.timeout(5):
-                        while True:
-                            record = next(
-                                (
-                                    item
-                                    for item in web._requests
-                                    if item.identifier == 1
-                                ),
-                                None,
-                            )
-                            if (
-                                record is not None
-                                and record.business.is_set()
-                                and len(outboxes[0].responses) == 1
-                                and not outboxes[0].items
-                                and outboxes[0].producers == 0
-                            ):
-                                break
+                        while not await pending():
                             await asyncio.sleep(0.001)
                     assert (
                         deps.store.message_receipt(room.id, HUMAN_ID, receipt)
                         is not None
                     )
-                    assert record.task is not None and not record.task.done()
                 finally:
                     transport.abort()
+
+            async def active():
+                return bool(web._requests or web._handlers)
+
             async with asyncio.timeout(7):
-                while web._requests or web._handlers:
+                while await asyncio.wrap_future(
+                    asyncio.run_coroutine_threadsafe(active(), web._loop)
+                ):
                     await asyncio.sleep(0.001)
             async with session.ws_connect(address) as connection:
                 await connection.send_json(
