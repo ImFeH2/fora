@@ -983,7 +983,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "fora-app"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "serde_json",
  "tauri",
@@ -993,7 +993,7 @@ dependencies = [
 
 [[package]]
 name = "fora-cli"
-version = "0.0.9"
+version = "0.0.10"
 
 [[package]]
 name = "foreign-types"
